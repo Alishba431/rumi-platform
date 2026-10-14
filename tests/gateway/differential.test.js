@@ -945,6 +945,123 @@ describe('Webhook Ingestion Gateway Differential Verification Runner', () => {
       expect(legacy.dispatchCalls.length).toBe(0);
       expect(legacy.serviceCalls.isProcessed.length).toBe(0);
     });
+
+    it('WA-POST-13: Inbound audio message returns 200 and dispatches message with side-effects', async () => {
+      const payload = buildWhatsAppEnvelope({
+        from: SENDER_PHONE,
+        id: 'wamid.AUDIO_001',
+        timestamp: Math.floor(Date.now() / 1000).toString(),
+        type: 'audio',
+        audio: { id: 'media_audio_id_99', mime_type: 'audio/ogg; codecs=opus' },
+      });
+
+      const { legacy } = await runDifferentialTest({
+        path: '/webhook',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        expectedStatus: 200,
+        expectedBody: 'EVENT_RECEIVED',
+      });
+
+      expect(legacy.serviceCalls.isProcessed).toEqual([['wamid.AUDIO_001']]);
+      expect(legacy.serviceCalls.markAsProcessed).toEqual([['wamid.AUDIO_001']]);
+      expect(legacy.dispatchCalls.length).toBe(1);
+    });
+
+    it('WA-POST-14: Inbound document message returns 200 and dispatches message with side-effects', async () => {
+      const payload = buildWhatsAppEnvelope({
+        from: SENDER_PHONE,
+        id: 'wamid.DOC_001',
+        timestamp: Math.floor(Date.now() / 1000).toString(),
+        type: 'document',
+        document: { id: 'media_doc_id_99', filename: 'grade5_plan.pdf', mime_type: 'application/pdf' },
+      });
+
+      const { legacy } = await runDifferentialTest({
+        path: '/webhook',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        expectedStatus: 200,
+        expectedBody: 'EVENT_RECEIVED',
+      });
+
+      expect(legacy.serviceCalls.isProcessed).toEqual([['wamid.DOC_001']]);
+      expect(legacy.serviceCalls.markAsProcessed).toEqual([['wamid.DOC_001']]);
+      expect(legacy.dispatchCalls.length).toBe(1);
+    });
+
+    it('WA-POST-15: Inbound reaction message returns 200 and dispatches reaction with side-effects', async () => {
+      const payload = buildWhatsAppEnvelope({
+        from: SENDER_PHONE,
+        id: 'wamid.REACT_001',
+        timestamp: Math.floor(Date.now() / 1000).toString(),
+        type: 'reaction',
+        reaction: { message_id: 'wamid.TARGET_MSG', emoji: '👍' },
+      });
+
+      const { legacy } = await runDifferentialTest({
+        path: '/webhook',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        expectedStatus: 200,
+        expectedBody: 'EVENT_RECEIVED',
+      });
+
+      expect(legacy.serviceCalls.isProcessed).toEqual([['wamid.REACT_001']]);
+      expect(legacy.serviceCalls.markAsProcessed).toEqual([['wamid.REACT_001']]);
+      expect(legacy.dispatchCalls.length).toBe(1);
+    });
+
+    it('WA-POST-16: Inbound contacts message returns 200 and dispatches contacts with side-effects', async () => {
+      const payload = buildWhatsAppEnvelope({
+        from: SENDER_PHONE,
+        id: 'wamid.CONTACTS_001',
+        timestamp: Math.floor(Date.now() / 1000).toString(),
+        type: 'contacts',
+        contacts: [{ name: { formatted_name: 'Principal Ali' }, phones: [{ phone: '923009999999' }] }],
+      });
+
+      const { legacy } = await runDifferentialTest({
+        path: '/webhook',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        expectedStatus: 200,
+        expectedBody: 'EVENT_RECEIVED',
+      });
+
+      expect(legacy.serviceCalls.isProcessed).toEqual([['wamid.CONTACTS_001']]);
+      expect(legacy.serviceCalls.markAsProcessed).toEqual([['wamid.CONTACTS_001']]);
+      expect(legacy.dispatchCalls.length).toBe(1);
+    });
+
+    it('WA-POST-17: Multilingual Urdu and Emoji message returns 200 and dispatches identically', async () => {
+      const payload = buildWhatsAppEnvelope({
+        from: SENDER_PHONE,
+        id: 'wamid.UNICODE_001',
+        timestamp: Math.floor(Date.now() / 1000).toString(),
+        type: 'text',
+        text: { body: 'اردو سبق کی تیاری: ریاضی جماعت پنجم — 🍎 📐 ✏️ 🚀' },
+      });
+
+      const { legacy } = await runDifferentialTest({
+        path: '/webhook',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        expectedStatus: 200,
+        expectedBody: 'EVENT_RECEIVED',
+      });
+
+      expect(legacy.serviceCalls.isProcessed).toEqual([['wamid.UNICODE_001']]);
+      expect(legacy.dispatchCalls.length).toBe(1);
+      expect(legacy.dispatchCalls[0].body.entry[0].changes[0].value.messages[0].text.body).toBe(
+        'اردو سبق کی تیاری: ریاضی جماعت پنجم — 🍎 📐 ✏️ 🚀'
+      );
+    });
   });
 
   // =======================================================================
@@ -1203,6 +1320,230 @@ describe('Webhook Ingestion Gateway Differential Verification Runner', () => {
         expectedBody: 'Bad request body',
       });
     });
+
+    it('SLACK-EVT-12: Tampered body string with valid HMAC for original body returns 401 Invalid signature', async () => {
+      const originalBody = JSON.stringify({ type: 'url_verification', challenge: 'orig_token' });
+      const tamperedBody = JSON.stringify({ type: 'url_verification', challenge: 'tampered_token' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const signature = signSlackRequest(timestamp, originalBody);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': signature,
+        },
+        body: tamperedBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-13: Mismatched signing secret returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'secret_mismatch' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const signature = signSlackRequest(timestamp, rawBody, 'attacker_different_secret');
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': signature,
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-14: Corrupted signature with wrong prefix (v1=) returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'prefix_mismatch' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const invalidSignature = 'v1=' + 'a'.repeat(64);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': invalidSignature,
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-15: Non-hex corrupted signature returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'non_hex_sig' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const invalidSignature = 'v0=' + 'Z'.repeat(64);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': invalidSignature,
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-16: Empty signature string returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'empty_sig' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': '',
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-17: Truncated signature buffer returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'short_sig' });
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const shortSignature = 'v0=' + 'a'.repeat(32);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': shortSignature,
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-18: Boundary timestamp: exact past boundary (now - 300s) returns 200', async () => {
+      const fixedNow = 1710000000000;
+      const dateSpy = jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+      try {
+        const challenge = 'ts_exact_past_300';
+        const rawBody = JSON.stringify({ type: 'url_verification', challenge });
+        const timestamp = String(Math.floor(fixedNow / 1000) - 300);
+        const signature = signSlackRequest(timestamp, rawBody);
+
+        await runDifferentialTest({
+          path: '/api/slack/events',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-slack-request-timestamp': timestamp,
+            'x-slack-signature': signature,
+          },
+          body: rawBody,
+          expectedStatus: 200,
+          expectedBody: { challenge },
+        });
+      } finally {
+        dateSpy.mockRestore();
+      }
+    });
+
+    it('SLACK-EVT-19: Boundary timestamp: exact future boundary (now + 300s) returns 200', async () => {
+      const fixedNow = 1710000000000;
+      const dateSpy = jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+      try {
+        const challenge = 'ts_exact_future_300';
+        const rawBody = JSON.stringify({ type: 'url_verification', challenge });
+        const timestamp = String(Math.floor(fixedNow / 1000) + 300);
+        const signature = signSlackRequest(timestamp, rawBody);
+
+        await runDifferentialTest({
+          path: '/api/slack/events',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-slack-request-timestamp': timestamp,
+            'x-slack-signature': signature,
+          },
+          body: rawBody,
+          expectedStatus: 200,
+          expectedBody: { challenge },
+        });
+      } finally {
+        dateSpy.mockRestore();
+      }
+    });
+
+    it('SLACK-EVT-20: Extreme negative timestamp (-1000s) returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'neg_ts' });
+      const timestamp = '-1000';
+      const signature = signSlackRequest(timestamp, rawBody);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': signature,
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-21: Extreme far future timestamp (9999999999s) returns 401 Invalid signature', async () => {
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge: 'future_ts' });
+      const timestamp = '9999999999';
+      const signature = signSlackRequest(timestamp, rawBody);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': signature,
+        },
+        body: rawBody,
+        expectedStatus: 401,
+        expectedBody: 'Invalid signature',
+      });
+    });
+
+    it('SLACK-EVT-22: Non-numeric timestamp string evaluates identically on both pipelines', async () => {
+      const challenge = 'non_num_ts_token';
+      const rawBody = JSON.stringify({ type: 'url_verification', challenge });
+      const timestamp = 'invalid_not_a_number';
+      const signature = signSlackRequest(timestamp, rawBody);
+
+      await runDifferentialTest({
+        path: '/api/slack/events',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-slack-request-timestamp': timestamp,
+          'x-slack-signature': signature,
+        },
+        body: rawBody,
+        expectedStatus: 200,
+        expectedBody: { challenge },
+      });
+    });
   });
 
   // =======================================================================
@@ -1399,6 +1740,158 @@ describe('Webhook Ingestion Gateway Differential Verification Runner', () => {
         expectedStatus: 404,
         expectedBody: /Cannot POST \/api\/slack/,
       });
+    });
+  });
+
+  // =======================================================================
+  // Category 7: Concurrency & Rapid-Fire Ingress
+  // =======================================================================
+  describe('Category 7: Concurrency & Rapid-Fire Ingress', () => {
+    it('CONC-01: 10 concurrent identical messages are deduplicated with exactly 1 dispatch on both pipelines', async () => {
+      const msgId = 'wamid.CONC_DUP_001';
+      const envelope = buildWhatsAppEnvelope({
+        from: SENDER_PHONE,
+        id: msgId,
+        timestamp: Math.floor(Date.now() / 1000).toString(),
+        type: 'text',
+        text: { body: 'Concurrent identical message' },
+      });
+
+      // Execute on Legacy
+      resetMockState();
+      const legacyPromises = Array.from({ length: 10 }).map(() =>
+        executePipeline(legacyBaseUrl, {
+          path: '/webhook',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: envelope,
+        }, legacyDispatchCalls, legacyBroadcastCalls)
+      );
+      const legacyRawResults = await Promise.all(legacyPromises);
+      const legacyNormalized = legacyRawResults.map(normalizeResult);
+      const legacyDispatchedCount = legacyDispatchCalls.length;
+
+      // Execute on Gateway
+      resetMockState();
+      const gatewayPromises = Array.from({ length: 10 }).map(() =>
+        executePipeline(gatewayBaseUrl, {
+          path: '/webhook',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: envelope,
+        }, gatewayDispatchCalls, gatewayBroadcastCalls)
+      );
+      const gatewayRawResults = await Promise.all(gatewayPromises);
+      const gatewayNormalized = gatewayRawResults.map(normalizeResult);
+      const gatewayDispatchedCount = gatewayDispatchCalls.length;
+
+      // Both pipelines must respond with 200 EVENT_RECEIVED to all 10 requests
+      expect(legacyNormalized.every((r) => r.status === 200 && r.body === 'EVENT_RECEIVED')).toBe(true);
+      expect(gatewayNormalized.every((r) => r.status === 200 && r.body === 'EVENT_RECEIVED')).toBe(true);
+
+      // Both pipelines must have dispatched exactly 1 time
+      expect(legacyDispatchedCount).toBe(1);
+      expect(gatewayDispatchedCount).toBe(1);
+      expect(gatewayDispatchedCount).toBe(legacyDispatchedCount);
+    });
+
+    it('CONC-02: 20 rapid distinct messages are processed with 0 drops and equal dispatches on both pipelines', async () => {
+      const distinctEnvelopes = Array.from({ length: 20 }).map((_, i) =>
+        buildWhatsAppEnvelope({
+          from: SENDER_PHONE,
+          id: `wamid.CONC_DIST_${i}`,
+          timestamp: Math.floor(Date.now() / 1000).toString(),
+          type: 'text',
+          text: { body: `Rapid distinct message ${i}` },
+        })
+      );
+
+      // Execute on Legacy
+      resetMockState();
+      await Promise.all(
+        distinctEnvelopes.map((env) =>
+          executePipeline(legacyBaseUrl, {
+            path: '/webhook',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: env,
+          }, legacyDispatchCalls, legacyBroadcastCalls)
+        )
+      );
+      const legacyCount = legacyDispatchCalls.length;
+
+      // Execute on Gateway
+      resetMockState();
+      await Promise.all(
+        distinctEnvelopes.map((env) =>
+          executePipeline(gatewayBaseUrl, {
+            path: '/webhook',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: env,
+          }, gatewayDispatchCalls, gatewayBroadcastCalls)
+        )
+      );
+      const gatewayCount = gatewayDispatchCalls.length;
+
+      expect(legacyCount).toBe(20);
+      expect(gatewayCount).toBe(20);
+      expect(gatewayCount).toBe(legacyCount);
+    });
+
+    it('CONC-03: Interleaved WhatsApp and Slack requests sent concurrently yield 0 divergence', async () => {
+      const mixedRequests = [];
+      for (let i = 0; i < 10; i++) {
+        if (i % 2 === 0) {
+          mixedRequests.push({
+            path: '/webhook',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: buildWhatsAppEnvelope({
+              from: SENDER_PHONE,
+              id: `wamid.INTERLEAVED_${i}`,
+              timestamp: Math.floor(Date.now() / 1000).toString(),
+              type: 'text',
+              text: { body: `Interleaved WA ${i}` },
+            }),
+          });
+        } else {
+          const slackBody = JSON.stringify({
+            type: 'url_verification',
+            challenge: `challenge_interleaved_${i}`,
+          });
+          const ts = String(Math.floor(Date.now() / 1000));
+          mixedRequests.push({
+            path: '/api/slack/events',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-slack-request-timestamp': ts,
+              'x-slack-signature': signSlackRequest(ts, slackBody),
+            },
+            body: slackBody,
+          });
+        }
+      }
+
+      // Legacy
+      resetMockState();
+      const legacyRaw = await Promise.all(
+        mixedRequests.map((req) => executePipeline(legacyBaseUrl, req, legacyDispatchCalls, legacyBroadcastCalls))
+      );
+      const legacyNormalized = legacyRaw.map(normalizeResult);
+      const legacyDispatches = legacyDispatchCalls.length;
+
+      // Gateway
+      resetMockState();
+      const gatewayRaw = await Promise.all(
+        mixedRequests.map((req) => executePipeline(gatewayBaseUrl, req, gatewayDispatchCalls, gatewayBroadcastCalls))
+      );
+      const gatewayNormalized = gatewayRaw.map(normalizeResult);
+      const gatewayDispatches = gatewayDispatchCalls.length;
+
+      expect(gatewayNormalized).toEqual(legacyNormalized);
+      expect(gatewayDispatches).toBe(legacyDispatches);
     });
   });
 });
