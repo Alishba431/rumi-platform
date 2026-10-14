@@ -35,6 +35,9 @@ const supabase = require('./shared/config/supabase');
 // Import Routes (Flow encryption endpoints)
 const flowEndpointRoutes = require('./shared/routes/flow-endpoint.routes');
 
+// Import Ingress Gateway (Strangler Fig)
+const { createSlackRouter, createWhatsAppRouter } = require('./gateway');
+
 // The channel-registry map from additive-driver name -> the `channel` value
 // user_channels/getOrCreateUserByChannel expects (registry driver names are
 // per-implementation — meta/baileys both mean 'whatsapp' as an identity
@@ -59,21 +62,11 @@ function resolveChannelIdentity(from) {
 // Create Express app
 const app = express();
 
-// Slack's request signature is an HMAC over the EXACT raw bytes it sent —
-// must be captured before ANY body parser (including the global
-// express.json() below) reconstructs the body, since a reconstruction can
-// differ in whitespace/key order from the wire bytes. Mounted first, and
-// scoped to the Slack path only so every other route's body-parsing is
-// untouched.
-app.use('/api/slack', express.raw({ type: '*/*' }), (req, res, next) => {
-  req.rawBody = req.body; // a Buffer, from express.raw() above
-  next();
-});
-// handleWebhookPost is a hoisted function declaration defined further down
-// this file — safe to reference here since this code only ever RUNS at
-// require-time, after every top-level declaration has already been hoisted.
-const mountSlackRoutes = require('./shared/routes/slack-interactions.routes');
-app.use('/api/slack', mountSlackRoutes(handleWebhookPost));
+// Slack Ingestion Gateway (Strangler Fig)
+// Encapsulates raw body capture & HMAC signature verification.
+// Mounted BEFORE global express.json() to guarantee wire-byte fidelity.
+// Note: handleWebhookPost is a hoisted function declaration, safely referenced here at require-time.
+app.use('/api/slack', createSlackRouter({ dispatch: handleWebhookPost }));
 
 app.use(express.json());
 
@@ -259,26 +252,12 @@ async function trackBroadcastReply(userId) {
   }
 }
 
-/**
- * Webhook verification endpoint (GET)
- */
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  console.log('Webhook verification request received');
-  console.log('Mode:', mode);
-  console.log('Token:', token);
-
-  if (mode === 'subscribe' && token === constants.WEBHOOK_VERIFY_TOKEN) {
-    console.log('Webhook verified successfully!');
-    res.status(200).send(challenge);
-  } else {
-    console.log('Webhook verification failed');
-    res.status(403).send('Forbidden');
-  }
-});
+// WhatsApp Ingestion Gateway (Strangler Fig)
+// Handles GET verification handshake and POST incoming message ingestion.
+app.use('/webhook', createWhatsAppRouter({
+  dispatch: handleWebhookPost,
+  handleBroadcastStatus: handleBroadcastStatusWebhook,
+}));
 
 /**
  * Webhook endpoint to receive messages (POST).
@@ -368,33 +347,36 @@ async function handleWebhookPost(req, res) {
       return;
     }
 
-    // Check if already processed (Redis-backed duplicate detection)
-    const alreadyProcessed = await SessionService.isProcessed(message.id);
-    if (alreadyProcessed) {
-      logToFile('⚠️  Duplicate message detected and skipped', {
+    // Ingress deduplication & side-effects (skipped if already handled by gateway adapter)
+    if (!req._gatewayHandled) {
+      // Check if already processed (Redis-backed duplicate detection)
+      const alreadyProcessed = await SessionService.isProcessed(message.id);
+      if (alreadyProcessed) {
+        logToFile('⚠️  Duplicate message detected and skipped', {
+          messageId: message.id,
+          from,
+          timestamp: messageTimestamp
+        });
+        res.status(200).send('EVENT_RECEIVED');
+        return;
+      }
+
+      // Mark as processed
+      await SessionService.markAsProcessed(message.id);
+
+      logToFile('✅ Message accepted for processing', {
         messageId: message.id,
         from,
-        timestamp: messageTimestamp
+        type: messageType
       });
-      res.status(200).send('EVENT_RECEIVED');
-      return;
+
+      // Send appropriate reaction based on whether this is user's first message
+      const emoji = SessionService.getReactionEmoji(from);
+      await WhatsAppService.sendReaction(from, message.id, emoji);
+
+      // Show typing indicator
+      await WhatsAppService.showTypingIndicator(from, message.id);
     }
-
-    // Mark as processed
-    await SessionService.markAsProcessed(message.id);
-
-    logToFile('✅ Message accepted for processing', {
-      messageId: message.id,
-      from,
-      type: messageType
-    });
-
-    // Send appropriate reaction based on whether this is user's first message
-    const emoji = SessionService.getReactionEmoji(from);
-    await WhatsAppService.sendReaction(from, message.id, emoji);
-
-    // Show typing indicator
-    await WhatsAppService.showTypingIndicator(from, message.id);
 
     // Get or create user in database — a bare phone number goes through the
     // untouched legacy path; a prefixed additive-channel identifier
@@ -1480,7 +1462,7 @@ async function handleWebhookPost(req, res) {
   }); // End of runWithCorrelation
 }
 
-app.post('/webhook', handleWebhookPost);
+// Note: POST /webhook is now handled by WhatsApp Gateway router mounted above
 
 /**
  * Handle document messages (classroom audio or lesson plan uploads for coaching)
