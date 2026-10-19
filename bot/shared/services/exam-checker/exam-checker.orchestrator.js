@@ -176,8 +176,10 @@ class ExamCheckerOrchestrator {
       // Detect students and questions from OCR results
       const { students, questions } = await QuestionDetectorService.analyze(ocrResults);
 
-      // Update session with detected data
+      // Update session with detected data. ocr_results too: grading reads each
+      // student's answers from the saved page readings.
       await ExamSessionService.update(session.id, {
+        ocr_results: ocrResults,
         detected_students: students,
         detected_questions: questions,
         ocr_provider: ocrResults.provider,

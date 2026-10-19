@@ -111,6 +111,8 @@ describe('right after the papers are read', () => {
     const r = await say(button('ech_process_now'));
 
     expect(mockRow.status).toBe(SESSION_STATES.DETECTING_QUESTIONS);
+    // Grading reads each student's answers from the saved page readings.
+    expect(mockRow.ocr_results).toEqual({ pages: [], provider: 'gemini-3.5-flash', averageConfidence: 0.98 });
     expect(r.interactive.body.text).toContain('I found 1 question');
     expect(r.interactive.body.text).toContain('دن کا متضاد');
   });
