@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The exam-checker conversation reaches a grade.** "✅ Yes, correct" on the question list was ignored, so the step
+  repeated itself for every message the teacher sent, "hi" included; it now moves on to the answer key, and the
+  list of questions is shown (it never reached the teacher). After each answer the next question is asked (Q1 was
+  asked again, and the next reply was filed under Q2). The answer-key summary shows the answers, "✏️ Edit scheme"
+  starts the key again, and the results are delivered with the grades and marked pages just produced (delivery
+  read them from a copy of the session made before grading).
+
 - **Marked pages reach the teacher.** Delivery sent each marked page with `sendImage()`, which takes a file path or a
   media id, not a URL, so no marked page was ever sent. It now uses `sendImageFromUrl()`.
 - **The annotator reads a private bucket.** It fetched the original photo with a plain HTTP GET, which a private R2
