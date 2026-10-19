@@ -176,28 +176,10 @@ DatabaseBootstrapper.FILES = [
 
 module.exports = { DatabaseBootstrapper };
 
-function loadRepoEnv() {
-  const repoRoot = path.resolve(__dirname, '../..');
-  const envPath = path.join(repoRoot, '.env');
-  
-  // Manually load .env since dotenv isn't in this package's dependencies
-  try {
-    const fs = require('fs');
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    envContent.split('\n').forEach(line => {
-      const match = line.match(/^([^#=]+)=(.*)$/);
-      if (match && !process.env[match[1]]) {
-        process.env[match[1]] = match[2].replace(/^["']|["']$/g, '');
-      }
-    });
-  } catch {
-    // .env might not exist yet
-  }
-}
-
 // ── CLI entrypoint ──
 if (require.main === module) {
-  loadRepoEnv();
+  // Manually load .env since dotenv isn't in this package's dependencies
+  require('./repo-env').loadRepoEnv();
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
