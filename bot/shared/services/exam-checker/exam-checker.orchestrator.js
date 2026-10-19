@@ -170,7 +170,7 @@ class ExamCheckerOrchestrator {
     logToFile('⏳ Starting OCR processing', { sessionId: session.id, imageCount: session.original_images?.length });
 
     try {
-      // Extract text from all images (with Mistral → Chandra fallback)
+      // Read every page with the exam-vision engine (a hard page is read again on the stronger model)
       const ocrResults = await OCRService.extractBatch(session.original_images);
 
       // Detect students and questions from OCR results

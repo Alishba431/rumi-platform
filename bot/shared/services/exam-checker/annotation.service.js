@@ -188,7 +188,7 @@ class AnnotationService {
       // Calculate position - use bbox if available, otherwise use relative positioning
       let x, y;
       if (bbox && bbox.x !== undefined && bbox.y !== undefined) {
-        // Use Surya bounding box coordinates (normalized 0-1)
+        // The answer box's position from the vision engine (normalized 0-1)
         x = width * bbox.x;
         y = height * bbox.y;
       } else {

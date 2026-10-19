@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**The exam checker reads and grades with one vision model, in two calls, and needs no key of its own.**
+
+> **Upgrade notes.** Existing Supabase deployments: run `node infrastructure/scripts/migrate.js` (migration
+> `V2.11.6__exam_ocr_provider_any_model.sql`, safe to re-run). Installs that applied the legacy
+> `bot/database/migrations/015_exam_checker.sql` have a CHECK on `exam_check_sessions.ocr_provider` that would reject
+> the new model name; the migration drops it, and only that one. `MISTRAL_API_KEY`, `CHANDRA_API_KEY`,
+> `CHANDRA_API_URL`, `SURYA_API_URL` and `DATALAB_API_KEY` are no longer read and can be removed from `.env`. New
+> optional settings: `EXAM_CHECKER_MODEL` (default `google/gemini-3.5-flash`) and `EXAM_CHECKER_HARD_MODEL` (default
+> `google/gemini-2.5-pro`). The exam checker is now on wherever the core LLM key is set; `EXAM_CHECKER_ENABLED=false`
+> or `RUMI_FEATURE_EXAM_OCR=off` still turns it off.
+
+### Changed
+
+- **A new exam-vision engine replaces Mistral, Chandra, Surya and GPT-4o.** Call A reads each page and copies every
+  answer exactly, with a box around it, and is never shown the answer key: a model that reads and grades in one pass
+  quietly corrects a wrong answer ("2x3=5" becomes 6) and then marks it right. Call B grades the copied text against
+  the key. Both are model-registry jobs (`exam.read`, `exam.readHard`, `exam.grade`) and go through `llm-client`.
+- **A hard page is read twice.** When more than a quarter of a page's answers (and at least two) come back below 0.6
+  confidence, it is read again on the stronger `exam.readHard` model.
+- **A question the model cannot mark from the page is not marked.** Dictation, "the word your teacher reads out", a
+  picture it cannot see: these come back `cannot_grade`, worth 0/0, and drop out of the student's total instead of
+  counting as wrong.
+- **One grading call per student**, not one per question, and the total is always the sum of the per-question marks,
+  never the model's own total. A mark is capped at the question's maximum.
+- **Ticks and crosses land on the answer.** The answer boxes from Call A now reach the annotator, which before drew
+  every mark down the right-hand margin.
+- **The dry-run script** (`bot/scripts/exam-checker-dry-run.js`) runs both calls on any image and prints what each
+  returned.
+
+### Removed
+
+- `surya.service.js` and the Mistral / Chandra code paths, and the "Read handwriting on exam papers" step in
+  `rumi setup`, which only asked for the Mistral key.
+
 ## [2.11.5] - 2026-10-05
 
 **Patch: two people sending or receiving at the same moment each get their own file.** This affects every deployment
