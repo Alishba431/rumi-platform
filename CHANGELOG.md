@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`bot/temp/exam_checker/`) and sent from there, like voice notes and reading reports. A Meta-driver deployment
   still needs R2, and a warning says so.
 
+- **A fresh install gets every migration.** `npm run bootstrap:db` (and `rumi setup`) now ends by applying every
+  `infrastructure/supabase/migrations/V*.sql` in version order and recording each in `schema_versions`. A change not
+  yet folded into `00_complete-schema.sql` (V2.11.7) reaches new installs, and the first `migrate.js` run no longer
+  re-applies every migration as "pending". It stops at a failing migration and does not record it.
+
 ### Fixed
 
 - **The exam-checker conversation reaches a grade.** "✅ Yes, correct" on the question list was ignored, so the step
