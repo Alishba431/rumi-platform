@@ -15,9 +15,10 @@
  * Without it, the grader works out each correct answer itself.
  */
 
-require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+// The repo keeps one .env at its root, as bot/whatsapp-bot.js reads it.
+require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
 const examVision = require('../shared/services/exam-checker/exam-vision.service');
 const { resolveModelForJob } = require('../shared/config/model-registry');
 
