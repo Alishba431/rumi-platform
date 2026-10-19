@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The dry-run script** (`bot/scripts/exam-checker-dry-run.js`) runs both calls on any image and prints what each
   returned.
 
+- **The exam checker runs without R2.** With no `R2_*` set, every photo upload used to fail and the teacher got
+  "trouble processing that image" before anything was read. Photos and marked pages are now kept on local disk
+  (`bot/temp/exam_checker/`) and sent from there, like voice notes and reading reports. A Meta-driver deployment
+  still needs R2, and a warning says so.
+
+### Fixed
+
+- **Marked pages reach the teacher.** Delivery sent each marked page with `sendImage()`, which takes a file path or a
+  media id, not a URL, so no marked page was ever sent. It now uses `sendImageFromUrl()`.
+- **The annotator reads a private bucket.** It fetched the original photo with a plain HTTP GET, which a private R2
+  bucket refuses; it now reads through the R2 client.
+
 ### Removed
 
 - `surya.service.js` and the Mistral / Chandra code paths, and the "Read handwriting on exam papers" step in

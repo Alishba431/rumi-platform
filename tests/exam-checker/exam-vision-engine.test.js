@@ -28,6 +28,7 @@ jest.mock('../../bot/shared/config/supabase', () => ({ from: () => ({}) }));
 
 const mockDownloadFromR2 = jest.fn();
 jest.mock('../../bot/shared/storage/r2', () => ({
+  isR2Configured: () => true,
   downloadFromR2: (...args) => mockDownloadFromR2(...args),
   extractKeyFromUrl: (url) => url.split('.r2.cloudflarestorage.com/')[1],
 }));

@@ -10,7 +10,7 @@
  * Updated: 2026-10-19 (reads with the exam-vision engine)
  */
 
-const { downloadFromR2, extractKeyFromUrl } = require('../../storage/r2');
+const { readExamFile, isOwnBucketUrl } = require('./exam-storage');
 const { logToFile } = require('../../utils/logger');
 const { redactUrl } = require('../../utils/redact-url');
 const examVision = require('./exam-vision.service');
@@ -26,15 +26,14 @@ function shortProvider(model) {
 }
 
 /**
- * Turn an image reference into something the vision model can read. The R2
- * bucket is private, so the model cannot fetch a stored URL: download the bytes
+ * Turn an image reference into something the vision model can read. The model
+ * can open neither our private bucket nor a file on this machine (the photo is
+ * kept on local disk when R2 is not configured), so for those read the bytes
  * and send them inline as a data URL. Any other URL passes through untouched.
  */
 async function resolveImageForVision(imageUrl) {
-  const r2Endpoint = process.env.R2_ENDPOINT || '';
-  const isR2 = (r2Endpoint && imageUrl.startsWith(r2Endpoint)) || imageUrl.includes('.r2.cloudflarestorage.com/');
-  if (!isR2) return imageUrl;
-  const buffer = await downloadFromR2(extractKeyFromUrl(imageUrl));
+  if (!imageUrl.startsWith('file://') && !isOwnBucketUrl(imageUrl)) return imageUrl;
+  const buffer = await readExamFile(imageUrl);
   const ext = (imageUrl.split('?')[0].split('.').pop() || 'jpeg').toLowerCase();
   const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
   return examVision.toDataUrl(buffer, mime);

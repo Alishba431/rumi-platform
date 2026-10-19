@@ -37,6 +37,10 @@ Nothing beyond the core LLM key: the exam checker reads and grades through `llm-
 
 The exam checker is on unless **`EXAM_CHECKER_ENABLED`** is `false`, `0` or `off` (or `RUMI_FEATURE_EXAM_OCR=off`). Switched off, commands, phrases and captions no longer start a session and an open session ignores new messages, but `cancel` still closes it. Every page costs one or two vision calls and every student one grading call, so on a public deployment see [Running Rumi in public](../running-in-public.md).
 
+## Storage
+
+The teacher's photos and the marked pages go to R2 when `R2_*` is set. Without it they are kept on local disk under `bot/temp/exam_checker/` and sent from there, as voice notes and reading reports are — so the exam checker runs on a sandbox with no bucket. Two limits: the Meta (Cloud API) driver cannot send a file from local disk, so a Meta deployment needs R2 (a warning is logged); and the bot and the worker must share that disk (one host). Files kept locally are not cleaned up automatically.
+
 ## Models and prompts
 
 The engine is `bot/shared/services/exam-checker/exam-vision.service.js`. It makes two calls, each a job in `bot/shared/config/model-registry.js`:
