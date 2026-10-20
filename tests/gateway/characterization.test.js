@@ -160,6 +160,14 @@ jest.mock('../../bot/shared/services/messaging/slack-web-client', () => ({
   updateView: jest.fn().mockResolvedValue({ ok: true }),
 }));
 
+// Bot-only deps reached by requiring whatsapp-bot.js: CI runs root tests
+// before bot/ npm ci, so they are mocked virtually.
+jest.mock('jsonrepair', () => ({ jsonrepair: (s) => s }), { virtual: true });
+jest.mock('pdfkit', () => ({}), { virtual: true });
+jest.mock('uuid', () => ({ v4: () => 'stub-uuid' }), { virtual: true });
+jest.mock('../../bot/shared/storage/r2', () => ({}));
+jest.mock('../../bot/shared/services/queue', () => ({ queueJob: jest.fn().mockResolvedValue('job-1') }));
+
 // 3. Import legacy app after mocks and env vars are configured
 const { app } = require('../../bot/whatsapp-bot');
 
