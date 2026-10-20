@@ -60,8 +60,22 @@ class Features:
             return preferred
         return cands[0] if cands else None
 
+    def self_coaching(self, alias: str) -> str:
+        """The WHERE clause tail that keeps a coaching_sessions read to a teacher's OWN coaching. A coach's
+        observation is filed under the observed teacher (user_id) and its score is the coach's rating, so it
+        never counts as the teacher's session; a database without the column has no observations to skip."""
+        return f" AND {alias}.observation_type IS NULL" if self.col("coaching_sessions", "observation_type") else ""
+
     def active_sources(self) -> list:
-        return [s for s in ACTIVE_SOURCES if self.has(s[0]) and self.col(s[0], s[1]) and self.col(s[0], s[2])]
+        out = []
+        for table, ucol, tcol, extra in ACTIVE_SOURCES:
+            if not (self.has(table) and self.col(table, ucol) and self.col(table, tcol)):
+                continue
+            if table == "coaching_sessions" and self.self_coaching(table):
+                # being observed by a coach is not an event the teacher originated
+                extra = self.self_coaching(table)[len(" AND "):]
+            out.append((table, ucol, tcol, extra))
+        return out
 
     def feature_tables(self) -> list:
         return [t for t, _, _ in FEATURE_TABLES if self.has(t) and self.col(t, "created_at")]

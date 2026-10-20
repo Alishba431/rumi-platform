@@ -158,6 +158,21 @@ const FLOW_CONFIGS = [
     envVar: 'STUDENT_JOIN_FLOW_ID',
     categories: ['OTHER'],
   },
+  {
+    // The coach's editable observation form (/observe), Meta only: every
+    // other channel reviews the same ratings in the stepwise chat form.
+    // GENERATED from the framework pack by
+    // bot/scripts/generate-observe-flow-json.js; the shipped asset is the
+    // default TEACH pack — a deployment on another pack regenerates it.
+    // Sent only when OBSERVE_FORM_FLOW_ID is set; without it Meta coaches
+    // also get the chat form.
+    name: 'Observe Form',
+    jsonPath: path.join(FLOWS_DIR, 'observe-form-flow.json'),
+    type: 'endpoint',
+    endpointPath: '/api/flows/observe-form',
+    envVar: 'OBSERVE_FORM_FLOW_ID',
+    categories: ['OTHER'],
+  },
 ];
 
 /** The flow names that a complete setup must have registered. */

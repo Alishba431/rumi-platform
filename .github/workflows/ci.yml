@@ -12,10 +12,10 @@ jobs:
 
     strategy:
       matrix:
-        # Node 20 is the floor: the baileys sandbox driver refuses to install
-        # on 18 ("requires Node.js 20+ to run reliably"), and 18 has been
-        # end-of-life since April 2025.
-        node-version: [20, 22]
+        # Node 22 is the floor: the previous LTS reached end-of-life in April 2026 and
+        # matrix-bot-sdk requires 22. 24 is tested too because Matrix
+        # end-to-end encryption needs it.
+        node-version: [22, 24]
 
     steps:
       - name: Checkout repository
@@ -27,6 +27,12 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       - name: Install root dependencies
+        run: npm ci
+
+      - name: Install dashboard dependencies
+        # tests/portal/portal-app-session-runtime.test.js boots the dashboard's
+        # real express-session, cors and portal router.
+        working-directory: dashboard
         run: npm ci
 
       - name: Run unit tests
@@ -100,7 +106,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install root dependencies
         run: npm ci

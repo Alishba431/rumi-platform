@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS users (
     portal_last_login TIMESTAMPTZ,
     password_reset_code VARCHAR(6),
     password_reset_expires_at TIMESTAMPTZ,
+    password_reset_attempts INTEGER NOT NULL DEFAULT 0,
     language_locked BOOLEAN DEFAULT false,
     is_test_user BOOLEAN DEFAULT false,
     language_nudge_sent BOOLEAN DEFAULT false,
@@ -737,6 +738,50 @@ CREATE TABLE IF NOT EXISTS attendance_records (
     created_at TIMESTAMPTZ DEFAULT now(),
     PRIMARY KEY (id)
 );
+
+-- A school, so a head teacher's staff can be found and their attendance kept.
+-- `ext_id` is an optional external identifier (a census or district school
+-- number) for deployments that have one; nothing in the bot depends on it.
+-- One definition shared with coach observations (same columns, same DDL).
+-- users.school_id (column reconcile below) links teachers and head teachers.
+CREATE TABLE IF NOT EXISTS schools (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ext_id TEXT,
+    name TEXT NOT NULL,
+    district TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_schools_ext_id ON schools (ext_id) WHERE ext_id IS NOT NULL;
+
+-- Staff attendance: one row per (teacher, day), marked by a head teacher.
+-- Distinct from attendance_sessions/attendance_records, which are STUDENT
+-- attendance per class. Re-marking a day upserts on (teacher_id, date).
+-- status 'leave' is approved leave: the staff register counts it as neither
+-- present nor absent. leave_type is optional (casual | sick | official).
+CREATE TABLE IF NOT EXISTS teacher_attendance_records (
+    id UUID NOT NULL DEFAULT uuid_generate_v4(),
+    teacher_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    school_id UUID NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    leave_type VARCHAR(16),
+    marked_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    marked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (id),
+    UNIQUE (teacher_id, date),
+    CONSTRAINT teacher_attendance_status_valid
+        CHECK (status IN ('present', 'absent', 'leave')),
+    CONSTRAINT teacher_attendance_leave_type_valid
+        CHECK (leave_type IS NULL OR (status = 'leave' AND leave_type IN ('casual', 'sick', 'official')))
+);
+
+CREATE INDEX IF NOT EXISTS idx_teacher_attendance_school_date
+    ON teacher_attendance_records (school_id, date);
+CREATE INDEX IF NOT EXISTS idx_teacher_attendance_teacher_date
+    ON teacher_attendance_records (teacher_id, date DESC);
 
 -- ---------------------------------------------------------------------------
 -- Exam Checker
@@ -3629,17 +3674,52 @@ CREATE TABLE IF NOT EXISTS quizzes (
     grade                    TEXT,
     subject                  TEXT,
     source_content           TEXT,
+    -- Lesson quiz offer lifecycle: 'offered' = the yes/no was sent; 'declined' =
+    -- the teacher said no; 'skipped' = the lesson could not carry a quiz
+    -- (reason in meta.skip_reason).
     status                   TEXT NOT NULL DEFAULT 'generating'
-                             CHECK (status = ANY (ARRAY['generating','ready','sent','report_sent','failed','cancelled'])),
+                             CHECK (status = ANY (ARRAY['generating','ready','sent','report_sent','failed','cancelled',
+                                                        'offered','declined','skipped'])),
     total_students_sent      INTEGER DEFAULT 0,
     total_students_completed INTEGER,
     report_scheduled_at      TIMESTAMPTZ,
     report_sent_at           TIMESTAMPTZ,
     report_pdf_url           TEXT,
+    -- Lesson quiz (quiz_source transcript | lp_generated | topic): the coaching
+    -- session a transcript quiz was written from, the language its questions are
+    -- written in, and everything else the pipeline carries (digest, model, cost,
+    -- PDF key, share code, student message, lesson date, error) in meta.
+    coaching_session_id      UUID REFERENCES coaching_sessions(id) ON DELETE SET NULL,
+    language                 TEXT,
+    meta                     JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at               TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_quizzes_teacher_id ON quizzes(teacher_id);
+-- The lesson-quiz columns again, for a database whose quizzes table predates
+-- them (CREATE TABLE IF NOT EXISTS above leaves it as it was): the indexes
+-- below need coaching_session_id. Same columns as V2.9.0.
+ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS coaching_session_id UUID REFERENCES coaching_sessions(id) ON DELETE SET NULL;
+ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS language TEXT;
+ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Re-running this file over a database built before 2.9.0 skips the inline CHECK above (CREATE TABLE IF NOT
+-- EXISTS), so the full status list is re-applied here, as V2.9.0 does.
+ALTER TABLE quizzes DROP CONSTRAINT IF EXISTS quizzes_status_check;
+ALTER TABLE quizzes ADD CONSTRAINT quizzes_status_check CHECK (
+    status = ANY (ARRAY[
+      'generating', 'ready', 'sent', 'report_sent', 'failed', 'cancelled',
+      'offered', 'declined', 'skipped'
+    ])
+);
+-- /quiz lists a teacher's recent quizzes newest-first.
+CREATE INDEX IF NOT EXISTS quizzes_teacher_recent ON quizzes(teacher_id, created_at DESC);
+-- One transcript quiz per coaching session, one lesson-plan quiz per plan: the
+-- idempotency anchors. The offer job, an early trigger and a /quiz tap all
+-- INSERT, and exactly one wins (23505 for the others).
+CREATE UNIQUE INDEX IF NOT EXISTS quizzes_one_transcript_quiz_per_session
+    ON quizzes(coaching_session_id) WHERE quiz_source = 'transcript';
+CREATE UNIQUE INDEX IF NOT EXISTS quizzes_one_lesson_plan_quiz
+    ON quizzes(lesson_plan_id) WHERE quiz_source = 'lp_generated';
 CREATE INDEX IF NOT EXISTS idx_quizzes_status ON quizzes(status);
 -- One bank quiz per video. Partial-unique so ordinary /quiz rows (video_id
 -- NULL) are unaffected.
@@ -3720,7 +3800,12 @@ CREATE TABLE IF NOT EXISTS quiz_share_codes (
     invited_by_student_id UUID REFERENCES students(id),
     parent_share_code_id  UUID REFERENCES quiz_share_codes(id),
     expires_at      TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- The chat the class link was sent to (a phone on WhatsApp, a prefixed id on
+    -- Matrix/Slack/Discord), where the class report goes. Per CODE, not per quiz:
+    -- a video quiz row is shared by every teacher who is sent that video.
+    -- NULL = minted before this was recorded: users.phone_number of the teacher.
+    teacher_to      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_quiz_share_codes_teacher ON quiz_share_codes(teacher_user_id);
@@ -3899,6 +3984,10 @@ ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS error_stack TEXT;
 -- users: settings flow stores language + observation framework in a preferences JSONB.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}';
 
+-- users: wrong tries at the current portal password-reset code (V2.11.2). The
+-- code is dead once this reaches PORTAL_RESET_CODE_MAX_ATTEMPTS (default 5).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_reset_attempts INTEGER NOT NULL DEFAULT 0;
+
 -- quiz_sessions: idle-reminder cron flag.
 ALTER TABLE quiz_sessions ADD COLUMN IF NOT EXISTS idle_reminder_sent BOOLEAN DEFAULT FALSE;
 
@@ -3919,6 +4008,10 @@ ALTER TABLE quiz_sessions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 
 -- A solo run by a teacher, and a child arriving via a share link, have no
 -- roster row. The original table made student_id mandatory.
 ALTER TABLE quiz_sessions ALTER COLUMN student_id DROP NOT NULL;
+
+-- quiz_share_codes: the chat the class link was sent to (see the table above),
+-- for the same upgraded-database reason. Lesson quiz, V2.9.0.
+ALTER TABLE quiz_share_codes ADD COLUMN IF NOT EXISTS teacher_to TEXT;
 
 -- The two CHECKs that ship inline in the CREATE TABLE, added here for the same
 -- upgraded-database reason. Guarded by name: ADD CONSTRAINT has no IF NOT EXISTS.
@@ -4007,9 +4100,119 @@ ALTER TABLE users ALTER COLUMN phone_number DROP NOT NULL;
 -- for a Slack-only teacher with no phone number at all). See bot/workers/
 -- coaching-session.service.js#initiateSession, exam-session.service.js#_createSession,
 -- video-orchestrator.service.js#startGeneration for where each is populated.
+-- user_channels.reply_identifier: the same rule for PROACTIVE sends (a teacher
+-- nudge, which no inbound message originated). The exact identifier the
+-- teacher last wrote from on that channel, stamped on every inbound by
+-- bot-helpers.getOrCreateUserByChannel; nudges/address.js delivers back to it
+-- rather than re-deriving "<prefix>:<channel_user_id>".
+ALTER TABLE user_channels ADD COLUMN IF NOT EXISTS reply_identifier VARCHAR(255);
 ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS recipient_identifier VARCHAR(255);
 ALTER TABLE exam_check_sessions ADD COLUMN IF NOT EXISTS recipient_identifier VARCHAR(255);
 ALTER TABLE video_requests ADD COLUMN IF NOT EXISTS recipient_identifier VARCHAR(255);
+
+-- =====================================================================-- TEST PAPERS (/testpaper)
+-- ============================================================================
+-- A teacher picks material the deployment already has — a textbook chapter,
+-- their own lesson plans, or a chapter they upload — and gets a printable test
+-- paper with a separate answer key. Every edit makes a NEW version; a ready
+-- paper is never rewritten, so "my papers" can always re-send exactly what was
+-- printed. ("Assessment" already means reading assessment in this repo, hence
+-- the name.)
+
+-- 1. test_paper_requests — the ask: what the paper covers and how it is built.
+-- source_text is the material exactly as the generator read it, so every later
+-- version is built from the same text even if a lesson plan is edited or a
+-- textbook re-imported in the meantime.
+CREATE TABLE IF NOT EXISTS test_paper_requests (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source_kind      TEXT NOT NULL
+                     CHECK (source_kind IN ('lesson_plan', 'textbook', 'upload')),
+    -- What was picked: {"lessonPlanIds":[...]} | {"textbookId":"…","chapterNumbers":[…]} | {"filename":"…"}
+    source_ref       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_label     TEXT,
+    source_text      TEXT NOT NULL,
+    subject          TEXT,
+    grade            TEXT,
+    language         TEXT NOT NULL DEFAULT 'en',
+    content_source   TEXT NOT NULL DEFAULT 'unseen'
+                     CHECK (content_source IN ('seen', 'unseen', 'both')),
+    question_types   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    question_count   INTEGER CHECK (question_count IS NULL OR question_count BETWEEN 1 AND 60),
+    total_marks      INTEGER CHECK (total_marks IS NULL OR total_marks BETWEEN 1 AND 1000),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_paper_requests_user_time
+    ON test_paper_requests (user_id, created_at DESC);
+
+-- 2. test_papers — one row per version of a paper. Version 1 is the first
+-- paper; each edit inserts the next version pointing at the one it came from.
+CREATE TABLE IF NOT EXISTS test_papers (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id       UUID NOT NULL REFERENCES test_paper_requests(id) ON DELETE CASCADE,
+    version          SMALLINT NOT NULL DEFAULT 1,
+    edited_from      UUID REFERENCES test_papers(id) ON DELETE SET NULL,
+    edit_instruction TEXT,
+    status           TEXT NOT NULL DEFAULT 'generating'
+                     CHECK (status IN ('generating', 'ready', 'failed')),
+    title            TEXT,
+    exam_json        JSONB,
+    question_count   INTEGER,
+    total_marks      INTEGER,
+    model            TEXT,
+    input_tokens     INTEGER,
+    output_tokens    INTEGER,
+    -- A machine code (INSUFFICIENT_SOURCE, MODEL_UNAVAILABLE, …) and a short
+    -- technical detail. Never a teacher's or child's name or phone number.
+    error_code       TEXT,
+    error_detail     TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ready_at         TIMESTAMPTZ,
+    UNIQUE (request_id, version)
+);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'test_papers_edited_from_not_self') THEN
+    ALTER TABLE test_papers ADD CONSTRAINT test_papers_edited_from_not_self
+      CHECK (edited_from IS NULL OR edited_from <> id);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_test_papers_request ON test_papers (request_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_test_papers_inflight ON test_papers (created_at) WHERE status = 'generating';
+
+-- Attendance register (staff attendance + Leave).
+-- users.school_id links a teacher or head teacher to a school; users.role says
+-- which job they do there. NULL role is a teacher; 'head_teacher' (or the legacy
+-- spelling 'principal') makes "attendance" mean staff attendance. Both nullable:
+-- a deployment that never links schools sees no change.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS school_id UUID REFERENCES schools(id) ON DELETE SET NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(30);
+CREATE INDEX IF NOT EXISTS idx_users_school_id ON users (school_id);
+
+-- attendance_sessions.leave_count: students on approved leave that day, beside
+-- present_count/absent_count, so a Leave round-trips to the register summary.
+ALTER TABLE attendance_sessions ADD COLUMN IF NOT EXISTS leave_count INTEGER DEFAULT 0;
+
+-- attendance_records.status gains 'leave'. Installs that applied the legacy
+-- bot/database/migrations/014_attendance_tables.sql carry a CHECK of
+-- (present, absent, late, excused) that would reject it; widen that CHECK in
+-- place. Every existing row stays valid; installs without the CHECK are untouched.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'attendance_records_status_check'
+          AND conrelid = 'attendance_records'::regclass
+          AND pg_get_constraintdef(oid) NOT LIKE '%leave%'
+    ) THEN
+        ALTER TABLE attendance_records DROP CONSTRAINT attendance_records_status_check;
+        ALTER TABLE attendance_records ADD CONSTRAINT attendance_records_status_check
+            CHECK (status IN ('present', 'absent', 'leave', 'late', 'excused'));
+    END IF;
+END $$;
 
 -- =============================================================================
 -- Function reconcile (Phase 5) — RPCs the bot invokes via supabase.rpc() that the
@@ -4065,6 +4268,216 @@ BEGIN
     AND created_at > NOW() - (p_lookback_hours || ' hours')::INTERVAL;
 END;
 $function$;
+
+-- ======================================================================
+
+-- Teacher nudges — scheduled, proactive messages to teachers
+-- One row per (teacher, local day, kind). The sweeper books rows, claims the
+-- due ones (pending -> sending, single-flight via a conditional UPDATE) and
+-- records sent / skipped / failed. Only bot/shared/services/nudges/
+-- teacher-nudges.store.js touches this table. Placed after the column
+-- reconcile because the users(last_message_at) index needs that column.
+-- See docs/features/teacher-nudges.md.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS teacher_nudges (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- A code registry, not a CHECK: a new kind needs no migration.
+    kind TEXT NOT NULL,
+    -- The local calendar day (TEACHER_NUDGES_TZ) the nudge belongs to.
+    nudge_date DATE NOT NULL,
+    scheduled_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'sending', 'sent', 'skipped', 'failed')),
+    -- Why a nudge was deliberately not sent (window_closed, quiet_hours, ...).
+    skip_reason TEXT,
+    -- What the nudge was about, plus an error message on failure. Merged, never replaced.
+    context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- How many times the row has been claimed.
+    attempts INTEGER NOT NULL DEFAULT 0,
+    claimed_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- One nudge per teacher per local day per kind. Booking relies on this.
+    CONSTRAINT teacher_nudges_one_per_day UNIQUE (user_id, nudge_date, kind)
+);
+
+-- The sweeper's claim: due, pending rows, oldest first.
+CREATE INDEX IF NOT EXISTS idx_teacher_nudges_due
+    ON teacher_nudges (scheduled_at) WHERE status = 'pending';
+-- A teacher's recent nudges (the "same quiet spell" check).
+CREATE INDEX IF NOT EXISTS idx_teacher_nudges_user_recent
+    ON teacher_nudges (user_id, nudge_date DESC);
+-- The re-engage cohort reads users by how long ago they last wrote in.
+CREATE INDEX IF NOT EXISTS idx_users_last_message_at
+    ON users (last_message_at);
+
+-- ============================================================================
+-- Observe: the coach's assistant (v2.8.0)
+-- Leader observations ride on coaching_sessions; the coach's roster is derived
+-- (leader_schools x users.school_id). Same DDL as migrations/V2.6.0__observe_coach_assistant.sql.
+-- ============================================================================
+
+-- A leader observation is a coaching_sessions row like any other, so the whole
+-- transcription + analysis pipeline is reused. user_id is the observed teacher
+-- (or the coach on a bare capture, until the teacher is named); the coach is
+-- observer_user_id. NULL observation_type = the teacher's own recording.
+ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS observation_type       VARCHAR(30);
+ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS observer_user_id       UUID;
+-- Frozen v1 of the AI analysis, written exactly once; analysis_data then holds
+-- the coach-edited v2. The v1 -> v2 diff is the record of what the coach changed.
+ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS autofill_analysis_data JSONB;
+-- pending | done: whether the coach's debrief step has run.
+ALTER TABLE coaching_sessions ADD COLUMN IF NOT EXISTS debrief_status         VARCHAR(20);
+
+CREATE INDEX IF NOT EXISTS idx_coaching_sessions_observer_pending
+  ON coaching_sessions (observer_user_id, created_at DESC)
+  WHERE observation_type = 'leader_observation';
+
+-- users.role (free text; the role family that may use /observe is config,
+-- OBSERVE_LEADER_ROLES), users.school_id and schools are the shared definition
+-- above (schools table + the column reconcile), used by attendance as well.
+
+CREATE TABLE IF NOT EXISTS leader_schools (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  leader_user_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  school_id       UUID REFERENCES schools(id) ON DELETE CASCADE,
+  school_ext_id   TEXT,
+  school_name     TEXT NOT NULL,
+  -- Where the assignment came from ('manual', 'import', ...). Free text, set by
+  -- OBSERVE_ROSTER_SOURCE; no deployment-specific enum.
+  source          TEXT NOT NULL DEFAULT 'manual',
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (leader_user_id, school_id)
+);
+CREATE INDEX IF NOT EXISTS idx_leader_schools_leader ON leader_schools (leader_user_id);
+CREATE INDEX IF NOT EXISTS idx_leader_schools_school_id ON leader_schools (school_id);
+
+CREATE TABLE IF NOT EXISTS observation_schedules (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  leader_user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  school_id          UUID REFERENCES schools(id) ON DELETE SET NULL,
+  school_ext_id      TEXT NOT NULL,
+  teacher_ext_id     TEXT NOT NULL,
+  teacher_name       TEXT,
+  school_name        TEXT,
+  scheduled_for      DATE NOT NULL,
+  scheduled_slot     TEXT,
+  status             TEXT NOT NULL DEFAULT 'upcoming' CHECK (status IN ('upcoming', 'done', 'cancelled')),
+  session_id         UUID,
+  calendar_event_id  TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_obs_sched_leader_status
+  ON observation_schedules (leader_user_id, status, scheduled_for);
+-- One upcoming visit per (coach, school, teacher): scheduling again moves it.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_obs_sched_active
+  ON observation_schedules (leader_user_id, school_ext_id, teacher_ext_id)
+  WHERE status = 'upcoming';
+
+CREATE TABLE IF NOT EXISTS coach_directory (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  leader_user_id  UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  full_name       TEXT NOT NULL,
+  work_email      TEXT NOT NULL,
+  -- exact: matched automatically; confirmed: a person checked it; manual: typed in.
+  match_method    TEXT NOT NULL DEFAULT 'exact' CHECK (match_method IN ('exact', 'confirmed', 'manual')),
+  confirmed_at    TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT coach_directory_confirmed_requires_timestamp
+    CHECK (match_method <> 'confirmed' OR confirmed_at IS NOT NULL)
+);
+
+-- =============================================================================
+-- portal_app_user: the role the admin dashboard works in
+-- For every signed-in admin request the dashboard runs SET ROLE portal_app_user
+-- and set_portal_user_context(<admin id>) on its own connection
+-- (dashboard/middleware/rbac/database-context.js), and reads and writes through
+-- it: users and activity, coaching, videos, retention, access scopes,
+-- invitations, the materialized views. Without the role every admin page fails.
+--
+-- Least privilege that works:
+--   - NOLOGIN: nobody connects as it. Only the role that ran this file (the one
+--     the dashboard connects as, SUPABASE_DB_USER) is granted it, so it is
+--     never reachable from the REST API. If the dashboard connects as a
+--     different role, grant portal_app_user to that role too.
+--   - Not BYPASSRLS (creating such a role needs a superuser on many hosts). It
+--     sees rows through one policy per RLS table (01_rls-policies.sql), and
+--     only while the signed-in dashboard user has an unscoped role (see
+--     portal_user_is_unscoped() below).
+--   - Table DML and sequences, on every table: the dashboard's queries span most
+--     of the schema, and a missing grant is a failed admin page. No DDL, no
+--     function rights beyond what PUBLIC already has, so the one-time SQL
+--     helper from SETUP.md stays service_role only.
+-- Partner roles (partner_admin, partner_viewer: a dashboard user who may see
+-- only some teachers) get NO rows from any RLS table through this role. The
+-- dashboard's pages that read the tables themselves (a teacher's detail,
+-- conversations, coaching, videos) show nothing to a partner until policies
+-- that apply the partner's access_scopes row exist (pages on the dashboard's
+-- materialized views filter in the query and are not covered here). Failing
+-- closed is the point: "signed in" alone would hand a partner every teacher.
+-- Roles are cluster-wide, so the CREATE is guarded; everything here is safe to
+-- run again. Kept last so the grants cover every table above.
+-- =============================================================================
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'portal_app_user') THEN
+    CREATE ROLE portal_app_user NOLOGIN;
+  END IF;
+END $$;
+
+-- SET ROLE needs membership unless the session user is a superuser (a hosted
+-- database's owner role usually is not).
+GRANT portal_app_user TO CURRENT_USER;
+
+GRANT USAGE ON SCHEMA public TO portal_app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO portal_app_user;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO portal_app_user;
+-- Tables this role creates later (a migration) get the same grants.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO portal_app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO portal_app_user;
+
+-- The one check every portal_app_user policy makes: is the dashboard user set
+-- on this connection (set_portal_user_context) active, with a role that sees
+-- every teacher? Partner roles are not on the list, so they get no rows.
+-- SECURITY DEFINER: it reads dashboard_users, which has RLS and this same
+-- policy; run as the caller it would need the answer it is computing. It runs
+-- as the schema's owner instead, with a fixed search_path so nothing on the
+-- caller's path is picked up. It takes no arguments and only answers about the
+-- current setting, so it cannot be used to look up other dashboard users.
+-- The id is compared as text, so a malformed setting answers false rather than
+-- raising an error.
+CREATE OR REPLACE FUNCTION public.portal_user_is_unscoped()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+ SECURITY DEFINER
+ SET search_path = pg_catalog, public
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.dashboard_users du
+    WHERE du.id::text = NULLIF(current_setting('app.portal_user_id', true), '')
+      AND du.is_active IS TRUE
+      AND du.role IN ('super_admin', 'admin', 'viewer')
+  )
+$function$;
+
+-- Only the dashboard's role may call it. Supabase grants new functions to its
+-- API roles by default, so those are revoked by name where they exist.
+REVOKE ALL ON FUNCTION public.portal_user_is_unscoped() FROM PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')
+     AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE ALL ON FUNCTION public.portal_user_is_unscoped() FROM anon, authenticated;
+  END IF;
+END $$;
+GRANT EXECUTE ON FUNCTION public.portal_user_is_unscoped() TO portal_app_user;
 
 -- Reload PostgREST's schema cache last, so the reconciled columns + functions
 -- above are immediately visible to the REST API (the earlier NOTIFY predates these DDLs).

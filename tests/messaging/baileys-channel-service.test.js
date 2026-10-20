@@ -45,6 +45,14 @@ describe('baileys-channel.service — outbound', () => {
     expect(sock.sendMessage).toHaveBeenCalledWith('923001234567@s.whatsapp.net', { text: 'Hello there' });
   });
 
+  // The bare-word rewrite of command copy is Matrix-only (Element eats "/");
+  // WhatsApp users type the slash form, so their copy keeps it.
+  it('sendMessage keeps "/quiz" in command copy -- the Matrix rewrite does not apply on WhatsApp', async () => {
+    const { service, sock } = loadService();
+    await service.sendMessage('15550001234', 'Type /quiz to start a new quiz.');
+    expect(sock.sendMessage).toHaveBeenCalledWith('15550001234@s.whatsapp.net', { text: 'Type /quiz to start a new quiz.' });
+  });
+
   it('sendMessage returns false (never throws) when the socket rejects', async () => {
     const { service } = loadService({ sendMessageImpl: async () => { throw new Error('boom'); } });
     await expect(service.sendMessage('923001234567', 'hi')).resolves.toBe(false);
@@ -340,6 +348,21 @@ describe('baileys-channel.service — interactive/list methods render as numbere
       expect(menu.options.map((o) => o.id)).toEqual([
         'menu_lesson_plan', 'menu_coaching', 'menu_reading', 'menu_video', 'menu_other',
       ]);
+    });
+
+    it('sendInteractiveMessage also records a reply-button interactive as button_reply', async () => {
+      const { service, pending } = loadWithStore();
+      await service.sendInteractiveMessage('15550100001', {
+        type: 'button',
+        body: { text: 'You have 2 images.' },
+        action: { buttons: [
+          { type: 'reply', reply: { id: 'ech_add_more', title: 'Add more' } },
+          { type: 'reply', reply: { id: 'ech_process_now', title: 'Process now' } },
+        ] },
+      });
+      const [, menu] = pending.remember.mock.calls[0];
+      expect(menu.replyType).toBe('button_reply');
+      expect(menu.options.map((o) => o.id)).toEqual(['ech_add_more', 'ech_process_now']);
     });
 
     it('sendInteractiveMessage records list rows across all sections, flattened in order', async () => {

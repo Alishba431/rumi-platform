@@ -638,6 +638,11 @@ class PDFReportService {
    * @private
    */
   static _drawFidelitySection(doc, fidelity, yPos) {
+    // The measured lesson-plan fidelity (fidelity/fidelity-report.js) has its own layout: band, count, the per-move
+    // table. Everything below is the legacy whole-lesson estimate, drawn exactly as before.
+    if (fidelity && typeof fidelity.measured === 'boolean') {
+      return this._drawMeasuredFidelitySection(doc, fidelity, yPos);
+    }
     const columnWidths = [120, 160, 190];
     const summaryText = this._truncateText(
       fidelity.commentary || fidelity.note || 'Teacher followed the submitted plan with minor adaptations.',
@@ -761,6 +766,163 @@ class PDFReportService {
     }
 
     return yPos + detailBoxHeight + 20;
+  }
+
+  /**
+   * Chat markup and emoji never reach the PDF: the built-in font cannot draw them.
+   * @private
+   */
+  static _plainLine(text) {
+    return String(text || '')
+      .replace(/[*_~]/g, '')
+      .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '')
+      .trim();
+  }
+
+  /**
+   * Arabic-script quotes use the registered Urdu/Arabic font when it is available.
+   * @private
+   */
+  static _quoteFont(doc, text) {
+    const hasArabicScript = /[\u0600-\u06FF\u0750-\u077F]/.test(text || '');
+    return hasArabicScript && doc._registeredFonts && doc._registeredFonts.UrduFont ? 'UrduFont' : 'Helvetica';
+  }
+
+  /**
+   * Draw the measured lesson-plan fidelity block: band and count, the status line and narrative, then one row per
+   * planned move — what the plan said, what the recording shows at [MM:SS], and the verdict. A section that was not
+   * measured draws only its reason: no score, no table, never 0%.
+   * @private
+   */
+  static _drawMeasuredFidelitySection(doc, f, yPos) {
+    const BAND_COLOR = { high: this.COLORS.excellent, partial: this.COLORS.developing, low: this.COLORS.emerging };
+    const VERDICT_COLOR = {
+      executed: this.COLORS.excellent, substituted_equivalent: this.COLORS.excellent, substituted_better: this.COLORS.excellent,
+      partial: this.COLORS.developing, not_done: this.COLORS.emerging,
+    };
+    // The section title already asks the question; the chat line's own copy of it is dropped here.
+    const statusText = this._plainLine(f.statusLine).replace(/^Did the lesson follow the plan\?\s*/, '');
+    const commentary = f.measured ? this._truncateText(f.commentary || '', 600) : '';
+    const statusHeight = statusText ? this._calculateTextHeight(doc, statusText, 9, 470, 2) : 0;
+    const commentaryHeight = commentary ? this._calculateTextHeight(doc, commentary, 8, 470, 2) : 0;
+
+    const headBlock = 30 + (f.measured ? 56 + 12 : 0) + statusHeight + commentaryHeight + 40;
+    if (yPos + headBlock > 750) {
+      doc.addPage();
+      yPos = 50;
+    }
+
+    doc.fontSize(18)
+       .fillColor(this.COLORS.primary)
+       .font('Helvetica-Bold')
+       .text('Did the lesson follow the plan?', 50, yPos);
+    yPos += 30;
+
+    if (f.measured) {
+      const boxHeight = 56;
+      doc.roundedRect(50, yPos, 495, boxHeight, 8)
+         .fillAndStroke(this.COLORS.background, this.COLORS.border);
+      const color = BAND_COLOR[f.band] || this.COLORS.secondary;
+      doc.fontSize(13)
+         .fillColor(color)
+         .font('Helvetica-Bold')
+         .text(`${f.bandLabel || 'Measured'} fidelity`, 60, yPos + 10, { width: 200 });
+      doc.fontSize(10)
+         .fillColor('#000')
+         .font('Helvetica')
+         .text(f.note, 60, yPos + 30, { width: 200 });
+      const pct = Math.max(0, Math.min(100, Number(f.score) || 0));
+      this._drawRoundedProgressBar(doc, 280, yPos + 16, 250, 10, pct, color);
+      doc.fontSize(8)
+         .fillColor(this.COLORS.secondary)
+         .font('Helvetica')
+         .text(`${Math.round(pct)}% of planned moves (a partly done move counts half)`, 280, yPos + 32, { width: 250 });
+      yPos += boxHeight + 12;
+    }
+
+    if (statusText || commentary) {
+      const boxHeight = 15 + statusHeight + (commentary ? 8 + commentaryHeight : 0) + 12;
+      doc.roundedRect(50, yPos, 495, boxHeight, 8)
+         .fillAndStroke(this.COLORS.background, this.COLORS.border);
+      let cursor = yPos + 12;
+      if (statusText) {
+        doc.fontSize(9).fillColor('#000').font('Helvetica-Bold')
+           .text(statusText, 60, cursor, { width: 470, lineGap: 2 });
+        cursor = doc.y + 8;
+      }
+      if (commentary) {
+        doc.fontSize(8).fillColor('#000').font('Helvetica')
+           .text(commentary, 60, cursor, { width: 470, lineGap: 2 });
+      }
+      yPos += boxHeight + 12;
+    }
+
+    if (!f.measured || !(f.perAction || []).length) {
+      return yPos + 8;
+    }
+
+    // Per-move table: phase · planned move · what the recording shows · verdict
+    const cols = [{ w: 75, label: 'Phase' }, { w: 150, label: 'Planned move' }, { w: 185, label: 'What the recording shows' }, { w: 65, label: 'Verdict' }];
+    const x0 = 60;
+    const totalWidth = cols.reduce((sum, c) => sum + c.w, 0);
+    const drawHeader = (y) => {
+      let x = x0;
+      doc.fontSize(7).fillColor(this.COLORS.secondary).font('Helvetica-Bold');
+      for (const c of cols) {
+        doc.text(c.label, x, y, { width: c.w - 6, lineGap: 2 });
+        x += c.w;
+      }
+      const bottom = y + 12;
+      doc.moveTo(x0, bottom).lineTo(x0 + totalWidth, bottom).strokeColor(this.COLORS.border).lineWidth(0.5).stroke().lineWidth(1);
+      return bottom + 4;
+    };
+
+    let y = drawHeader(yPos);
+    for (const r of f.perAction) {
+      let shows;
+      if (r.evidence) {
+        shows = [r.evidence, r.evidenceTranslation ? `(${r.evidenceTranslation})` : '', r.unquoted ? '(no moment quoted)' : '']
+          .filter(Boolean).join('\n');
+      } else {
+        shows = r.unquoted ? 'Credited, but no moment was quoted' : 'No moment found in the recording';
+      }
+      const quoteFont = this._quoteFont(doc, r.evidence);
+      doc.fontSize(7).font('Helvetica');
+      const hPhase = doc.heightOfString(r.phaseLabel || '', { width: cols[0].w - 6, lineGap: 2 });
+      const hText = doc.heightOfString(r.text, { width: cols[1].w - 6, lineGap: 2 });
+      doc.font(quoteFont);
+      const hShows = doc.heightOfString(shows, { width: cols[2].w - 6, lineGap: 2 });
+      doc.font('Helvetica-Bold');
+      const hVerdict = doc.heightOfString(r.verdictLabel, { width: cols[3].w - 6, lineGap: 2 });
+      const rowHeight = Math.max(hPhase, hText, hShows, hVerdict) + 8;
+
+      if (y + rowHeight > 780) {
+        doc.addPage();
+        y = drawHeader(50);
+      }
+
+      let x = x0;
+      doc.fontSize(7).fillColor(this.COLORS.secondary).font('Helvetica').text(r.phaseLabel || '', x, y, { width: cols[0].w - 6, lineGap: 2 });
+      x += cols[0].w;
+      doc.fillColor('#000').font('Helvetica').text(r.text, x, y, { width: cols[1].w - 6, lineGap: 2 });
+      x += cols[1].w;
+      doc.fillColor(r.evidence ? '#000' : this.COLORS.secondary).font(r.evidence ? quoteFont : 'Helvetica-Oblique').text(shows, x, y, { width: cols[2].w - 6, lineGap: 2 });
+      x += cols[2].w;
+      doc.fillColor(VERDICT_COLOR[r.verdict] || this.COLORS.secondary).font('Helvetica-Bold').text(r.verdictLabel, x, y, { width: cols[3].w - 6, lineGap: 2 });
+      y += rowHeight;
+    }
+
+    const caveat = 'Measured move by move from the timestamped transcript by an AI grader. Moves the recording could not show are left out, '
+      + 'never counted as missed. Machine scores tend to run stricter than a coach in the room.'
+      + (f.notAssessedCount ? ` ${f.notAssessedCount} planned move(s) could not be judged from this recording.` : '');
+    if (y + 30 > 780) {
+      doc.addPage();
+      y = 50;
+    }
+    doc.fontSize(7).fillColor(this.COLORS.secondary).font('Helvetica-Oblique')
+       .text(caveat, x0, y + 4, { width: totalWidth, lineGap: 2 });
+    doc.font('Helvetica').fillColor('#000');
+    return doc.y + 20;
   }
 
   /**

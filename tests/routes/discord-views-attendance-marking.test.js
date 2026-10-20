@@ -22,8 +22,10 @@ describe('attendance-marking.view — screenToSteps', () => {
 
     expect(textFields).toEqual([]); // all-enum screen — never opens a Discord Modal
     expect(title).toBe('Mark Attendance');
-    expect(steps).toHaveLength(1);
+    // One absent picker, then one leave picker over the same roster.
+    expect(steps).toHaveLength(2);
     expect(steps[0].fieldName).toBe('absent_students_chunk_0');
+    expect(steps[1].fieldName).toBe('leave_students_chunk_0');
     expect(steps[0].multi).toBe(true);
     expect(steps[0].promptText).toContain('Grade 3 - A');
 
@@ -43,7 +45,8 @@ describe('attendance-marking.view — screenToSteps', () => {
     const bigRoster = Array.from({ length: 40 }, (_, i) => ({ id: String(i), title: `Student ${i}` }));
     const { steps } = attendanceMarkingView.screenToSteps('MARK_ABSENT', { students: bigRoster });
 
-    expect(steps).toHaveLength(2);
+    // Two absent chunks, then two leave chunks.
+    expect(steps).toHaveLength(4);
     expect(steps[0].buildMenu().toJSON().options).toHaveLength(25);
     expect(steps[1].buildMenu().toJSON().options).toHaveLength(15);
     expect(steps[0].promptText).toContain('1/2');
@@ -68,12 +71,14 @@ describe('attendance-marking.view — mergeScreenData', () => {
     };
     expect(attendanceMarkingView.mergeScreenData('MARK_ABSENT', enumAnswers)).toEqual({
       absent_student_ids: ['s1', 's5', 's26'],
+      leave_student_ids: [],
     });
   });
 
   it('defaults to an empty array when nobody is selected (everyone present)', () => {
     expect(attendanceMarkingView.mergeScreenData('MARK_ABSENT', { absent_students_chunk_0: [] })).toEqual({
       absent_student_ids: [],
+      leave_student_ids: [],
     });
   });
 

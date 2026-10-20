@@ -12,10 +12,19 @@
  * - AWAITING_VERIFICATION: Showing extracted results, waiting for confirm/edit
  * - PROCESSING: Generating Excel file
  * - COMPLETED: Session finished
+ *
+ * Two subjects share this state machine. A teacher's session is their class
+ * (subject 'class'); a head teacher's is the school's staff (subject 'staff') —
+ * the role has already answered "whose attendance?", so they are never asked.
+ * Either way `students` holds the roster ({ id, student_name }) every marking
+ * surface reads, and `selectedDate` the day being marked ('YYYY-MM-DD', the
+ * school's today unless a past day was named).
  */
 
 const redisService = require('./cache/railway-redis.service');
 const StudentListService = require('./student-list.service');
+const StaffAttendanceService = require('./staff-attendance.service');
+const AttendanceDates = require('./attendance-dates');
 const { logToFile } = require('../utils/logger');
 
 // State constants
@@ -316,19 +325,103 @@ class AttendanceConversationService {
   /**
    * Generate marking method selection message
    */
-  static generateMarkingMethodMessage(classData) {
+  static generateMarkingMethodMessage(classData, { subject = 'class', date = null } = {}) {
     const className = this.formatClassDisplayName(classData);
+    const title = subject === 'staff'
+      ? `*Staff attendance — ${className}*`
+      : `*Attendance for ${className}*`;
+    const who = subject === 'staff' ? 'staff' : 'students';
 
     return [
-      `*Attendance for ${className}*`,
+      title,
+      // Always the day being marked, today included: a teacher who meant another day sees it before marking.
+      `📅 ${AttendanceDates.formatDisplayDate(date || AttendanceDates.todayString())}`,
       '',
       'How would you like to mark attendance?',
       '',
       '1. Voice Roll Call - Read out names',
-      '2. Tap to Mark - Select absent students',
+      `2. Tap to Mark - Select absent ${who} and anyone on leave`,
+      '3. Everyone present',
       '',
-      'Reply 1 or 2'
+      'Reply 1, 2 or 3'
     ].join('\n');
+  }
+
+  /** The marking menu for whatever the session is about. */
+  static markingMethodMessageFor(sessionState) {
+    return this.generateMarkingMethodMessage(sessionState.selectedClass, {
+      subject: sessionState.subject,
+      date: sessionState.selectedDate,
+    });
+  }
+
+  /**
+   * The roster the session marks: the school's staff, or the class's students.
+   * Staff are carried in the session ({ id, student_name }) from the start, so
+   * every surface reads the same list the session opened with.
+   *
+   * @returns {Promise<{data: Array|null, error: any}>}
+   */
+  static async loadRoster(sessionState) {
+    if (sessionState.subject === 'staff') {
+      return { data: sessionState.students || [], error: null };
+    }
+    return StudentListService.getStudentsByList(sessionState.selectedListId);
+  }
+
+  /** "Grade 5 - A has no students yet…" or the staff equivalent. */
+  static emptyRosterMessage(sessionState) {
+    if (sessionState.subject === 'staff') {
+      return 'There is nobody on your staff list yet. Your administrator can link your colleagues to your school.';
+    }
+    return `${this.formatClassDisplayName(sessionState.selectedClass)} has no students yet. Say "add class" to add students before marking attendance.`;
+  }
+
+  /**
+   * Open a head teacher's staff session.
+   *
+   * @returns {Promise<Object>} ASK_MARKING_METHOD, or ERROR naming what is missing
+   */
+  static async startStaffSession(userId, user, baseSessionData) {
+    if (!user.school_id) {
+      return {
+        action: 'ERROR',
+        message: 'Your account is set up as a head teacher but is not linked to a school yet, '
+          + 'so there is no staff list to mark. Your administrator can link it. '
+          + 'To mark a class you teach, say "class attendance".'
+      };
+    }
+
+    const [school, staff] = await Promise.all([
+      StaffAttendanceService.loadSchool(user.school_id),
+      StaffAttendanceService.loadStaffRoster(user.school_id, userId),
+    ]);
+
+    if (!staff.length) {
+      return {
+        action: 'ERROR',
+        message: 'There is no staff linked to your school yet, so there is nobody to mark. '
+          + 'Your administrator can link your colleagues to the school.'
+      };
+    }
+
+    const selectedClass = { id: user.school_id, class_name: school?.name || 'Your school', section: null };
+    const sessionState = {
+      ...baseSessionData,
+      state: STATES.AWAITING_MARKING_METHOD,
+      subject: 'staff',
+      schoolId: user.school_id,
+      selectedListId: null,
+      selectedClass,
+      students: staff.map(s => ({ id: s.id, student_name: StaffAttendanceService.personName(s) })),
+    };
+    await this.saveSessionState(userId, sessionState);
+
+    return {
+      action: 'ASK_MARKING_METHOD',
+      selectedClass,
+      message: this.markingMethodMessageFor(sessionState)
+    };
   }
 
   /**
@@ -369,6 +462,23 @@ class AttendanceConversationService {
       // Increment rate limit counter
       await this.incrementRateLimit(userId);
 
+      // Base session data
+      const baseSessionData = {
+        userId,
+        startedAt: new Date().toISOString(),
+        selectedDate: AttendanceDates.toDateString(options.selectedDate),
+        sessionType: options.sessionType || 'full_day'
+      };
+
+      // A head teacher's "attendance" is staff attendance. Asking "class attendance"
+      // still reaches a class they teach.
+      if (options.subject !== 'class') {
+        const user = await StaffAttendanceService.loadUser(userId);
+        if (StaffAttendanceService.isHeadTeacher(user)) {
+          return this.startStaffSession(userId, user, baseSessionData);
+        }
+      }
+
       // Get user's student lists
       const { data: classList, error } = await StudentListService.getStudentListsByUser(userId);
 
@@ -388,28 +498,22 @@ class AttendanceConversationService {
         };
       }
 
-      // Base session data
-      const baseSessionData = {
-        userId,
-        startedAt: new Date().toISOString(),
-        selectedDate: options.selectedDate || new Date().toISOString().split('T')[0],
-        sessionType: options.sessionType || 'full_day'
-      };
-
       // One class - proceed directly to marking method
       if (classList.length === 1) {
         const selectedClass = classList[0];
-        await this.saveSessionState(userId, {
+        const sessionState = {
           ...baseSessionData,
           state: STATES.AWAITING_MARKING_METHOD,
+          subject: 'class',
           selectedListId: selectedClass.id,
           selectedClass
-        });
+        };
+        await this.saveSessionState(userId, sessionState);
 
         return {
           action: 'ASK_MARKING_METHOD',
           selectedClass,
-          message: this.generateMarkingMethodMessage(selectedClass)
+          message: this.markingMethodMessageFor(sessionState)
         };
       }
 
@@ -417,6 +521,7 @@ class AttendanceConversationService {
       await this.saveSessionState(userId, {
         ...baseSessionData,
         state: STATES.AWAITING_CLASS_SELECTION,
+        subject: 'class',
         classList
       });
 
@@ -473,7 +578,8 @@ class AttendanceConversationService {
                   sessionState.records,
                   sessionState.summary,
                   sessionState.selectedClass,
-                  sessionState.transcript
+                  sessionState.transcript,
+                  { subject: sessionState.subject }
                 )
               };
             default:
@@ -655,17 +761,18 @@ class AttendanceConversationService {
       }
 
       // Update session state
-      await this.saveSessionState(userId, {
+      const nextState = {
         ...sessionState,
         state: STATES.AWAITING_MARKING_METHOD,
         selectedListId: selectedClass.id,
         selectedClass
-      });
+      };
+      await this.saveSessionState(userId, nextState);
 
       return {
         action: 'ASK_MARKING_METHOD',
         selectedClass,
-        message: this.generateMarkingMethodMessage(selectedClass)
+        message: this.markingMethodMessageFor(nextState)
       };
     } catch (error) {
       logToFile('Error handling class selection', { userId, error: error.message });
@@ -702,7 +809,8 @@ class AttendanceConversationService {
         // Voice Roll Call selected
         await this.saveSessionState(userId, {
           ...sessionState,
-          state: STATES.AWAITING_VOICE_INPUT
+          state: STATES.AWAITING_VOICE_INPUT,
+          markingMethod: 'voice'
         });
 
         return {
@@ -721,8 +829,8 @@ class AttendanceConversationService {
       }
 
       if (isTap && !isVoice) {
-        // Tap to Mark selected - get students and send flow
-        const { data: students, error } = await StudentListService.getStudentsByList(sessionState.selectedListId);
+        // Tap to Mark selected - get the roster and send flow
+        const { data: students, error } = await this.loadRoster(sessionState);
 
         if (error || !students) {
           return {
@@ -741,7 +849,7 @@ class AttendanceConversationService {
         if (students.length === 0) {
           return {
             action: 'ERROR',
-            message: `${this.formatClassDisplayName(sessionState.selectedClass)} has no students yet. Say "add class" to add students before marking attendance.`
+            message: this.emptyRosterMessage(sessionState)
           };
         }
 
@@ -762,7 +870,7 @@ class AttendanceConversationService {
       // Couldn't determine selection
       return {
         action: 'INVALID_SELECTION',
-        message: 'Please reply with 1 for Voice Roll Call or 2 for Tap to Mark.'
+        message: 'Please reply with 1 for Voice Roll Call, 2 for Tap to Mark, or 3 if everyone is present.'
       };
     } catch (error) {
       logToFile('Error handling marking method selection', { userId, error: error.message });
@@ -787,8 +895,8 @@ class AttendanceConversationService {
         };
       }
 
-      // Get all students
-      const { data: students, error } = await StudentListService.getStudentsByList(sessionState.selectedListId);
+      // Get everyone on the roster
+      const { data: students, error } = await this.loadRoster(sessionState);
 
       if (error || !students) {
         return {
@@ -802,7 +910,7 @@ class AttendanceConversationService {
       if (students.length === 0) {
         return {
           action: 'ERROR',
-          message: `${this.formatClassDisplayName(sessionState.selectedClass)} has no students yet. Say "add class" to add students before marking attendance.`
+          message: this.emptyRosterMessage(sessionState)
         };
       }
 
@@ -821,6 +929,7 @@ class AttendanceConversationService {
         ...sessionState,
         state: STATES.PROCESSING,
         processingStartedAt: new Date().toISOString(),
+        markingMethod: 'everyone_present',
         records
       });
 
@@ -863,8 +972,8 @@ class AttendanceConversationService {
         selectedListId: sessionState.selectedListId
       });
 
-      // Get students from the selected list
-      const { data: students, error: studentError } = await StudentListService.getStudentsByList(sessionState.selectedListId);
+      // Get everyone on the roster the names are matched against
+      const { data: students, error: studentError } = await this.loadRoster(sessionState);
 
       if (studentError || !students || students.length === 0) {
         return {
@@ -910,6 +1019,8 @@ class AttendanceConversationService {
       await this.saveSessionState(userId, {
         ...sessionState,
         state: STATES.AWAITING_VERIFICATION,
+        markingMethod: 'voice',
+        students,
         records,
         transcript: result.transcript,
         summary: result.summary
@@ -920,7 +1031,8 @@ class AttendanceConversationService {
         records,
         result.summary,
         sessionState.selectedClass,
-        result.transcript
+        result.transcript,
+        { subject: sessionState.subject }
       );
 
       return {
@@ -944,30 +1056,46 @@ class AttendanceConversationService {
   /**
    * Generate verification message for user to confirm/edit attendance
    */
-  static generateVerificationMessage(records, summary, selectedClass, transcript) {
+  static generateVerificationMessage(records, summary, selectedClass, transcript, { subject = 'class' } = {}) {
     const className = this.formatClassDisplayName(selectedClass);
-    const presentStudents = records.filter(r => r.status === 'present');
+    const isStaff = subject === 'staff';
+    // The read-back uses the register's rule: for staff, approved leave is excused.
+    const worked = (summary.present || 0) + (summary.absent || 0);
+    const rate = isStaff
+      ? (worked ? (summary.present / worked) * 100 : 0)
+      : Number(summary.attendancePercentage || 0);
     const absentStudents = records.filter(r => r.status === 'absent');
+    const leaveStudents = records.filter(r => r.status === 'leave');
+    const leaveCount = summary.leave ?? leaveStudents.length;
 
     const lines = [
-      `*Attendance for ${className}*`,
+      isStaff ? `*Staff attendance — ${className}*` : `*Attendance for ${className}*`,
       '',
       `📊 *Summary:*`,
       `✅ Present: ${summary.present}`,
       `❌ Absent: ${summary.absent}`,
-      `📈 Attendance: ${summary.attendancePercentage.toFixed(0)}%`,
+      `🟡 On leave: ${leaveCount}`,
+      `📈 Attendance: ${rate.toFixed(0)}%`,
       ''
     ];
 
-    // Show absent students (more important to verify)
+    // Show who is away (more important to verify)
     if (absentStudents.length > 0) {
-      lines.push('*Absent Students:*');
+      lines.push('*Absent:*');
       absentStudents.forEach((r, i) => {
         lines.push(`${i + 1}. ${r.studentName}`);
       });
       lines.push('');
-    } else {
-      lines.push('*No students marked absent* ✅');
+    }
+    if (leaveStudents.length > 0) {
+      lines.push('*On leave:*');
+      leaveStudents.forEach((r, i) => {
+        lines.push(`${i + 1}. ${r.studentName}`);
+      });
+      lines.push('');
+    }
+    if (!absentStudents.length && !leaveStudents.length) {
+      lines.push('*Nobody marked absent* ✅');
       lines.push('');
     }
 
@@ -1021,6 +1149,7 @@ class AttendanceConversationService {
           students: sessionState.students || [],
           selectedClass: sessionState.selectedClass,
           prefilledAbsent: sessionState.records.filter(r => r.status === 'absent').map(r => r.studentId),
+          prefilledLeave: sessionState.records.filter(r => r.status === 'leave').map(r => r.studentId),
           message: 'Please mark attendance.'
         };
       }

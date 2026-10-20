@@ -4,6 +4,7 @@
 const { logToFile } = require('../../utils/logger');
 const supabase = require('../../config/supabase');
 const WhatsAppService = require('../whatsapp.service');
+const { ownCoaching } = require('../coaching/own-coaching');
 
 class QuizSchedulerService {
   /**
@@ -55,10 +56,10 @@ class QuizSchedulerService {
     if (!teacher?.phone_number) return;
 
     // Check if teacher started coaching for this LP period
-    const { data: coachingSessions } = await supabase
+    const { data: coachingSessions } = await ownCoaching(supabase
       .from('coaching_sessions')
       .select('id')
-      .eq('user_id', lp.user_id)
+      .eq('user_id', lp.user_id)) // never a coach's observation of this teacher: it is not their own session
       .gte('created_at', lp.created_at)
       .limit(1);
 

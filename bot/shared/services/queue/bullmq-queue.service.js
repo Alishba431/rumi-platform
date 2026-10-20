@@ -27,6 +27,7 @@ const { logToFile } = require('../../utils/logger');
 const RedisService = require('../cache/railway-redis.service');
 const { getCurrentCorrelationId, logEvent } = require('../../utils/structured-logger');
 const crypto = require('crypto');
+const { dedupVariant } = require('./dedup-variant');
 
 // Logical queue names (Redis key namespaces). Kept stable so a deploy that switches
 // drivers mid-flight doesn't strand jobs under a renamed queue.
@@ -187,7 +188,9 @@ class BullMQQueueService {
   async queueCoachingJob(sessionId, jobType, payload = {}) {
     const correlationId = getCurrentCorrelationId();
     const envelope = { sessionId, jobType, payload, correlationId, queuedAt: new Date().toISOString(), version: '1.0' };
-    const id = await this._add('main', envelope, { jobId: `${sessionId}-${jobType}` });
+    // phase / nonce are part of the identity — see dedup-variant.js.
+    const variant = dedupVariant(payload);
+    const id = await this._add('main', envelope, { jobId: `${sessionId}-${jobType}${variant ? `-${variant}` : ''}` });
     logToFile('📤 Coaching job queued (bullmq)', { sessionId, jobType, jobId: id });
     return id;
   }

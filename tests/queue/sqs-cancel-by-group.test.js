@@ -6,14 +6,16 @@
  * (`sqs:cancel:<jobType>:<groupId>`, see quiz-job-handler isCancelled).
  */
 
+const { mockBotDependency } = require('../_helpers/mock-bot-dependency');
+
 let redisSet;
 
 function load() {
   jest.resetModules();
   redisSet = jest.fn().mockResolvedValue();
-  jest.doMock('aws-sdk', () => ({ config: { update: jest.fn() }, SQS: jest.fn(() => ({})) }), { virtual: true });
+  mockBotDependency('aws-sdk', () => ({ config: { update: jest.fn() }, SQS: jest.fn(() => ({})) }));
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
-  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: redisSet }), { virtual: true });
+  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: redisSet }));
   jest.doMock('../../bot/shared/utils/structured-logger', () => ({ getCurrentCorrelationId: () => 'c1', logEvent: jest.fn() }));
   process.env.SQS_QUEUE_URL = 'https://sqs/main';
   return require('../../bot/shared/services/queue/sqs-queue.service');

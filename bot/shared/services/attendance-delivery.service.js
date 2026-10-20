@@ -1,28 +1,33 @@
 /**
  * Attendance Delivery Service
- * Orchestrates Excel generation, R2 upload, database save, and WhatsApp delivery
+ * Saves a marked day, then regenerates and delivers the month's register.
  *
  * Created: January 24, 2026
  * Updated: January 25, 2026 (Monthly cumulative register)
  *
  * Flow:
- * 1. Save attendance session and records to database FIRST
- * 2. Fetch ALL sessions for the month (cumulative)
- * 3. Generate MONTHLY register Excel using AttendanceGeneratorService
- * 4. Upload to R2 storage
- * 5. Send document to teacher via WhatsApp
+ * 1. Save the day FIRST (so it is in the monthly query). Re-marking a day that is
+ *    already on file REPLACES it — a teacher correcting a mistake must not hit a
+ *    duplicate guard.
+ * 2. Fetch ALL sessions for the month the day falls in (cumulative)
+ * 3. Generate the MONTHLY register (attendance-register.service)
+ * 4. Archive to R2 when it is configured — storage is an archive, never a gate
+ * 5. Send the document to whoever marked it, through the messaging facade
  * 6. Clear conversation state
+ *
+ * Dates are 'YYYY-MM-DD' strings throughout (attendance-dates): taken through
+ * `new Date(...)` they slid a day either side of UTC.
  */
 
-const path = require('path');
-const fs = require('fs');
 const AttendanceGeneratorService = require('./attendance-generator.service');
+const AttendanceRegister = require('./attendance-register.service');
+const AttendanceDates = require('./attendance-dates');
 const WhatsAppService = require('./whatsapp.service');
 const AttendanceConversationService = require('./attendance-conversation.service');
 const { logToFile } = require('../utils/logger');
-const { uploadBuffer, getSignedUrl } = require('../storage/r2');
+const { deliverRegisterFile } = require('./attendance-register-delivery.service');
+const crypto = require('crypto');
 const supabase = require('../config/supabase');
-const { TEMP_DIR } = require('../utils/constants');
 
 class AttendanceDeliveryService {
   /**
@@ -30,28 +35,36 @@ class AttendanceDeliveryService {
    * Generates a MONTHLY CUMULATIVE register
    *
    * @param {string} userId - User UUID
-   * @param {string} phoneNumber - User's WhatsApp phone number
+   * @param {string} phoneNumber - The address the teacher wrote from (any channel)
    * @param {Object} sessionData - Session data from conversation state
    * @returns {Promise<Object>} Delivery result
    */
   static async processAndDeliver(userId, phoneNumber, sessionData) {
+    if (sessionData && sessionData.subject === 'staff') {
+      const StaffAttendanceService = require('./staff-attendance.service');
+      const result = await StaffAttendanceService.saveAndDeliver(userId, phoneNumber, sessionData);
+      await AttendanceConversationService.clearSessionState(userId);
+      return result;
+    }
+
     const startTime = Date.now();
+    let saved = false;
 
     try {
       const listId = sessionData.selectedListId;
       const className = sessionData.selectedClass?.class_name || 'Unknown Class';
       const section = sessionData.selectedClass?.section || null;
+      const sessionDate = AttendanceDates.toDateString(sessionData.sessionDate);
 
       logToFile('📊 Starting attendance delivery (monthly cumulative)', {
         userId,
         className,
         section,
         listId,
+        sessionDate,
         recordCount: sessionData.records?.length
       });
 
-      // Extract metadata - use sessionDate if provided, otherwise current date
-      const sessionDate = sessionData.sessionDate ? new Date(sessionData.sessionDate) : new Date();
       const metadata = {
         userId,
         className,
@@ -61,37 +74,11 @@ class AttendanceDeliveryService {
       };
 
       // Step 1: Save to database FIRST (so it's included in monthly query)
-      const dbResult = await this.saveToDatabase(
-        userId,
-        sessionData,
-        null, // Excel URL will be updated after generation
-        metadata
-      );
+      const dbResult = await this.saveToDatabase(userId, sessionData, null, metadata);
+      saved = true;
 
-      // Handle duplicate session gracefully
-      if (dbResult.isDuplicate) {
-        logToFile('⚠️ Returning duplicate session info to user', {
-          existingSessionId: dbResult.existingSession.id,
-          listId
-        });
-        return {
-          success: false,
-          isDuplicate: true,
-          existingSession: dbResult.existingSession,
-          summary: dbResult.summary,
-          className,
-          section,
-          sessionType: metadata.sessionType,
-          error: 'Attendance already recorded for this session'
-        };
-      }
-
-      // Step 2: Fetch all attendance data for the month
-      const month = sessionDate.getMonth() + 1; // 1-12
-      const year = sessionDate.getFullYear();
-
-      logToFile('Fetching monthly attendance data...', { listId, month, year });
-
+      // Step 2: Fetch all attendance data for the month the day falls in
+      const { month, year } = AttendanceDates.monthBounds(sessionDate);
       const { students, sessions } = await this.getMonthlyAttendanceData(listId, month, year);
 
       logToFile('Monthly data retrieved', {
@@ -100,8 +87,6 @@ class AttendanceDeliveryService {
       });
 
       // Step 3: Generate MONTHLY register Excel buffer
-      logToFile('Generating monthly register Excel...', { className, month, year });
-
       const excelBuffer = await AttendanceGeneratorService.createMonthlyRegisterBufferFromData(
         { className, section },
         month,
@@ -110,85 +95,72 @@ class AttendanceDeliveryService {
         sessions
       );
 
-      // Step 4: Generate filename and upload to R2
-      const fileName = AttendanceGeneratorService.formatMonthlyFileName(
-        className,
-        section,
-        month,
-        year
+      const title = section ? `${className} - ${section}` : className;
+      const fileName = AttendanceRegister.formatMonthlyFileName(title, month, year, 'student');
+      const caption = this.generateMonthlyCaptionSimple(
+        className, section, month, year, dbResult.summary, sessionDate, { replaced: dbResult.replaced }
       );
 
-      const r2Key = `attendance/${userId}/monthly/${year}/${month}/${fileName}`;
-      logToFile('Uploading monthly register to R2...', { r2Key });
+      // Steps 4-5: archive (best effort) and send
+      const delivery = await deliverRegisterFile({
+        to: phoneNumber,
+        buffer: excelBuffer,
+        fileName,
+        caption,
+        r2Key: `attendance/${userId}/monthly/${year}/${month}/${fileName}`
+      });
 
-      const r2Url = await uploadBuffer(
-        excelBuffer,
-        r2Key,
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-      );
-
-      logToFile('Monthly register uploaded to R2', { r2Url });
-
-      // Update the session with Excel URL
-      if (dbResult.sessionId) {
+      if (delivery.url && dbResult.sessionId) {
         await supabase
           .from('attendance_sessions')
-          .update({ excel_url: r2Url })
+          .update({ excel_url: delivery.url })
           .eq('id', dbResult.sessionId);
-      }
-
-      // Step 5: Send document via WhatsApp
-      const caption = this.generateMonthlyCaptionSimple(className, section, month, year, sessionData.summary, sessionDate);
-
-      // Save Excel to temp file for sending
-      const tempFilePath = path.join(TEMP_DIR, fileName);
-      fs.writeFileSync(tempFilePath, excelBuffer);
-
-      logToFile('Sending monthly register via WhatsApp...', { phoneNumber, fileName });
-      const sendResult = await WhatsAppService.sendDocument(
-        phoneNumber,
-        tempFilePath,
-        fileName,
-        caption
-      );
-
-      // Cleanup temp file
-      if (fs.existsSync(tempFilePath)) {
-        fs.unlinkSync(tempFilePath);
       }
 
       // Step 6: Clear conversation state
       await AttendanceConversationService.clearSessionState(userId);
 
-      const elapsedMs = Date.now() - startTime;
-
-      logToFile('✅ Monthly attendance delivery complete', {
+      logToFile(delivery.sent ? '✅ Monthly attendance delivery complete' : '⚠️ Attendance saved but the register was not delivered', {
         userId,
-        elapsedMs,
+        elapsedMs: Date.now() - startTime,
         fileName,
         sessionId: dbResult.sessionId,
+        replaced: dbResult.replaced,
         sessionCount: sessions.length,
-        sent: sendResult
+        sent: delivery.sent
       });
+
+      if (!delivery.sent) {
+        return {
+          success: false,
+          saved: true,
+          sessionId: dbResult.sessionId,
+          error: 'Your attendance is saved, but the register file could not be sent on this channel.'
+        };
+      }
 
       return {
         success: true,
+        saved: true,
+        replaced: dbResult.replaced,
         sessionId: dbResult.sessionId,
-        excelUrl: r2Url,
+        excelUrl: delivery.url,
         fileName,
         caption,
-        elapsedMs
+        elapsedMs: Date.now() - startTime
       };
 
     } catch (error) {
       logToFile('❌ Attendance delivery failed', {
         userId,
+        saved,
         error: error.message,
         stack: error.stack
       });
 
       return {
         success: false,
+        saved,
         error: error.message
       };
     }
@@ -203,16 +175,11 @@ class AttendanceDeliveryService {
    * @returns {Promise<{students: Array, sessions: Array}>}
    */
   static async getMonthlyAttendanceData(listId, month, year) {
-    const startDate = `${year}-${String(month).padStart(2, '0')}-01`;
-    const endDate = new Date(year, month, 0).toISOString().split('T')[0];
+    // Bounds from the date string: the old `new Date(year, month, 0).toISOString()`
+    // was the day before east of UTC, so the month's last day fell out of the query.
+    const { start: startDate, end: endDate } = AttendanceDates.monthBounds(`${year}-${String(month).padStart(2, '0')}-01`);
 
-    logToFile('📊 Querying monthly attendance data', {
-      listId,
-      month,
-      year,
-      startDate,
-      endDate
-    });
+    logToFile('📊 Querying monthly attendance data', { listId, month, year, startDate, endDate });
 
     // Get all students in the class
     const { data: students, error: studentsError } = await supabase
@@ -224,11 +191,6 @@ class AttendanceDeliveryService {
 
     if (studentsError) {
       logToFile('Error fetching students for monthly register', { error: studentsError.message });
-    } else {
-      logToFile('📊 Students fetched', {
-        count: students?.length,
-        studentIds: students?.slice(0, 5).map(s => ({ id: s.id, name: s.student_name }))
-      });
     }
 
     // Get all attendance sessions for the month with records
@@ -250,14 +212,6 @@ class AttendanceDeliveryService {
 
     if (sessionsError) {
       logToFile('Error fetching sessions for monthly register', { error: sessionsError.message });
-    } else {
-      logToFile('📊 Sessions fetched', {
-        count: sessions?.length,
-        sessions: sessions?.map(s => ({
-          date: s.session_date,
-          recordCount: s.attendance_records?.length
-        }))
-      });
     }
 
     return {
@@ -267,60 +221,50 @@ class AttendanceDeliveryService {
   }
 
   /**
-   * Generate simple caption for monthly register WhatsApp message
+   * Caption for the monthly register document
    * @param {string} className - Class name
    * @param {string|null} section - Section
    * @param {number} month - Month (1-12)
    * @param {number} year - Year
-   * @param {Object} todaySummary - Today's attendance summary
-   * @param {Date} sessionDate - The specific date attendance was marked
+   * @param {Object} daySummary - The marked day's { present, absent, leave }
+   * @param {string} sessionDate - The day marked, YYYY-MM-DD
+   * @param {Object} [opts]
+   * @param {boolean} [opts.replaced] - The day was already on file and was corrected
    */
-  static generateMonthlyCaptionSimple(className, section, month, year, todaySummary, sessionDate) {
-    const monthNames = [
-      'January', 'February', 'March', 'April', 'May', 'June',
-      'July', 'August', 'September', 'October', 'November', 'December'
-    ];
-
+  static generateMonthlyCaptionSimple(className, section, month, year, daySummary, sessionDate, { replaced = false } = {}) {
     const displayName = section ? `${className} - ${section}` : className;
-
-    // Format the specific date
-    const date = sessionDate || new Date();
-    const day = date.getDate();
-    const dateDisplay = `${monthNames[date.getMonth()]} ${day}, ${date.getFullYear()}`;
+    const dateDisplay = AttendanceDates.formatDisplayDate(AttendanceDates.toDateString(sessionDate));
 
     const lines = [
       `📋 *Monthly Attendance Register*`,
       `📚 ${displayName}`,
-      `📅 ${dateDisplay}`,
+      `📅 ${AttendanceRegister.MONTH_NAMES[month - 1]} ${year}`,
       '',
-      `Today's attendance:`,
-      `✅ Present: ${todaySummary?.present || 0}`,
-      `❌ Absent: ${todaySummary?.absent || 0}`,
+      replaced ? `${dateDisplay} — updated:` : `${dateDisplay}:`,
+      `✅ Present: ${daySummary?.present || 0}`,
+      `❌ Absent: ${daySummary?.absent || 0}`,
+      `🟡 On leave: ${daySummary?.leave || 0}`,
       '',
-      'Your cumulative register is ready!'
+      'This file holds the whole month so far — the newest copy replaces the last.'
     ];
 
     return lines.join('\n');
   }
 
   /**
-   * Check if attendance already exists for this class/date/session
+   * Is this class/date/session already on file?
    */
   static async checkExistingSession(listId, sessionDate, sessionType) {
     try {
-      const sessionDateStr = sessionDate instanceof Date
-        ? sessionDate.toISOString().split('T')[0]
-        : sessionDate;
-
       const { data, error } = await supabase
         .from('attendance_sessions')
         .select('id, present_count, absent_count, total_students, excel_url, created_at')
         .eq('list_id', listId)
-        .eq('session_date', sessionDateStr)
+        .eq('session_date', AttendanceDates.toDateString(sessionDate))
         .eq('session_type', sessionType)
-        .single();
+        .maybeSingle();
 
-      if (error && error.code !== 'PGRST116') { // PGRST116 = no rows found
+      if (error) {
         logToFile('⚠️ Error checking existing session', { error: error.message });
         return null;
       }
@@ -333,74 +277,77 @@ class AttendanceDeliveryService {
   }
 
   /**
-   * Save attendance session and records to database
+   * Save a class's day: one session row, one record per student.
+   *
+   * A day already on file is REPLACED — its records rewritten, its tallies
+   * updated — rather than refused. The old duplicate guard dead-ended a teacher who
+   * had made a mistake; a correction is the commonest reason to mark a day twice.
+   * The new records are written BEFORE the old ones are removed, and the tallies
+   * last, so a write that fails part-way leaves the day already on file intact
+   * (if removing the old ones fails, the new ones are taken back out).
+   *
+   * Only the teacher whose class it is can file or replace its day: a stray token
+   * or session naming someone else's list is refused before anything is written.
+   *
+   * @returns {Promise<{sessionId: string, replaced: boolean, summary: Object}>}
    */
   static async saveToDatabase(userId, sessionData, excelUrl, metadata) {
-    try {
-      const listId = sessionData.selectedListId;
-      const records = sessionData.records;
+    const listId = sessionData.selectedListId;
+    const records = sessionData.records || [];
+    const sessionDateStr = AttendanceDates.toDateString(metadata.date);
+    const sessionType = metadata.sessionType || 'full_day';
 
-      // Calculate summary
-      const totalStudents = records.length;
-      const presentCount = records.filter(r => r.status === 'present').length;
-      const absentCount = records.filter(r => r.status === 'absent').length;
+    const summary = {
+      total: records.length,
+      present: records.filter(r => r.status === 'present').length,
+      absent: records.filter(r => r.status === 'absent').length,
+      leave: records.filter(r => r.status === 'leave').length
+    };
 
-      // Create attendance session
-      // Use metadata.date for session_date
-      const sessionDateStr = metadata.date instanceof Date
-        ? metadata.date.toISOString().split('T')[0]
-        : new Date().toISOString().split('T')[0];
+    const { data: list } = await supabase
+      .from('student_lists')
+      .select('id, user_id')
+      .eq('id', listId)
+      .maybeSingle();
+    if (!list || list.user_id !== userId) {
+      logToFile('❌ Attendance refused: the class is not this teacher\'s', { listId, userId, owner: list?.user_id || null });
+      throw new Error('This class is not on your account');
+    }
 
-      // Check for duplicate session BEFORE insert
-      const existingSession = await this.checkExistingSession(
-        listId,
-        sessionDateStr,
-        metadata.sessionType || 'full_day'
-      );
+    const existingSession = await this.checkExistingSession(listId, sessionDateStr, sessionType);
+    const counts = {
+      total_students: summary.total,
+      present_count: summary.present,
+      absent_count: summary.absent,
+      leave_count: summary.leave
+    };
 
-      if (existingSession) {
-        logToFile('⚠️ Duplicate attendance session detected', {
-          existingSessionId: existingSession.id,
-          listId,
-          sessionDate: sessionDateStr,
-          sessionType: metadata.sessionType
-        });
-        return {
-          sessionId: null,
-          isDuplicate: true,
-          existingSession: existingSession,
-          summary: {
-            total: existingSession.total_students,
-            present: existingSession.present_count,
-            absent: existingSession.absent_count,
-            attendanceRate: existingSession.total_students > 0
-              ? `${Math.round((existingSession.present_count / existingSession.total_students) * 100)}%`
-              : '0%'
-          }
-        };
+    let sessionId;
+    let oldRecordIds = [];
+    if (existingSession) {
+      sessionId = existingSession.id;
+      logToFile('📋 Day already on file — replacing it', { sessionId, listId, sessionDate: sessionDateStr });
+
+      const { data: oldRecords, error: oldError } = await supabase
+        .from('attendance_records')
+        .select('id')
+        .eq('session_id', sessionId);
+      if (oldError) {
+        throw new Error(`Failed to read the day on file: ${oldError.message}`);
       }
-
-      logToFile('📊 Saving attendance session', {
-        userId,
-        listId,
-        sessionDate: sessionDateStr,
-        recordCount: records?.length,
-        records: records?.slice(0, 3) // Log first 3 for debugging
-      });
-
+      oldRecordIds = (oldRecords || []).map(r => r.id);
+    } else {
       const { data: session, error: sessionError } = await supabase
         .from('attendance_sessions')
         .insert({
           user_id: userId,
           list_id: listId,
           session_date: sessionDateStr,
-          session_type: metadata.sessionType || 'full_day',
+          session_type: sessionType,
           marking_method: sessionData.markingMethod || 'voice',
           transcript: sessionData.transcript || null,
           excel_url: excelUrl,
-          total_students: totalStudents,
-          present_count: presentCount,
-          absent_count: absentCount
+          ...counts
         })
         .select('id')
         .single();
@@ -415,55 +362,65 @@ class AttendanceDeliveryService {
         });
         throw new Error(`Failed to save attendance session: ${sessionError.message}`);
       }
+      sessionId = session.id;
+    }
 
-      const sessionId = session.id;
+    // Ids chosen here, so a replace that fails after this insert can take
+    // exactly these rows back out again.
+    const recordInserts = records.map(r => ({
+      id: crypto.randomUUID(),
+      session_id: sessionId,
+      student_id: r.studentId,
+      student_name: r.studentName,
+      status: r.status,
+      confidence: r.confidence || 1.0,
+      detected_response: r.detectedResponse || null
+    }));
 
-      // Insert attendance records
-      const recordInserts = records.map(r => ({
-        session_id: sessionId,
-        student_id: r.studentId,
-        student_name: r.studentName,
-        status: r.status,
-        confidence: r.confidence || 1.0,
-        detected_response: r.detectedResponse || null
-      }));
+    const { error: recordsError } = await supabase
+      .from('attendance_records')
+      .insert(recordInserts);
 
-      logToFile('📊 Inserting attendance records', {
-        sessionId,
-        recordCount: recordInserts.length,
-        sampleRecords: recordInserts.slice(0, 3) // Log first 3 for debugging
-      });
+    if (recordsError) {
+      logToFile('❌ Attendance records insert failed', { sessionId, error: recordsError.message, replacing: Boolean(existingSession) });
+      throw new Error(existingSession
+        ? `Could not save the correction; the day on file is unchanged: ${recordsError.message}`
+        : `Saved the day but not the students: ${recordsError.message}`);
+    }
 
-      const { data: insertedRecords, error: recordsError } = await supabase
-        .from('attendance_records')
-        .insert(recordInserts)
-        .select('id, student_id, status');
-
-      if (recordsError) {
-        logToFile('⚠️ Database records insert failed', {
-          error: recordsError.message,
-          hint: recordsError.hint,
-          details: recordsError.details
-        });
-      } else {
-        logToFile('✅ Attendance records inserted', {
-          insertedCount: insertedRecords?.length
-        });
+    if (existingSession) {
+      if (oldRecordIds.length > 0) {
+        const { error: deleteError } = await supabase
+          .from('attendance_records')
+          .delete()
+          .in('id', oldRecordIds);
+        if (deleteError) {
+          // Take the new rows back out, so the day holds what was on file rather than both.
+          await supabase
+            .from('attendance_records')
+            .delete()
+            .in('id', recordInserts.map(r => r.id));
+          throw new Error(`Could not save the correction; the day on file is unchanged: ${deleteError.message}`);
+        }
       }
 
-      logToFile('Attendance saved to database', {
-        sessionId,
-        recordCount: recordInserts.length,
-        insertSuccess: !recordsError
-      });
-
-      return { sessionId };
-
-    } catch (error) {
-      // Re-throw to fail loudly instead of continuing with empty Excel
-      logToFile('❌ Database save error - aborting', { error: error.message });
-      throw error;
+      await supabase
+        .from('attendance_sessions')
+        .update({
+          ...counts,
+          marking_method: sessionData.markingMethod || 'voice',
+          was_manually_edited: true
+        })
+        .eq('id', sessionId);
     }
+
+    logToFile('✅ Attendance saved to database', {
+      sessionId,
+      recordCount: recordInserts.length,
+      replaced: Boolean(existingSession)
+    });
+
+    return { sessionId, replaced: Boolean(existingSession), summary };
   }
 
   /**

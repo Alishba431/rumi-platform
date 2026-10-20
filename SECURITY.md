@@ -51,6 +51,25 @@ We consider security research conducted in good faith to be authorized. We will 
 | Latest release | Yes |
 | Previous major | Best effort |
 
+## Accepted dependency advisories
+
+`npm audit --omit=dev` in `bot/` reports advisories that come with the Matrix channel's SDK,
+`matrix-bot-sdk` (0.8). On 2026-10-02 the audit counted 21 (3 critical, 7 high, 10 moderate, 1 low);
+6 of them, and one severity increase, arrive through `matrix-bot-sdk`. It uses the deprecated `request` HTTP
+client, which has a critical "Server-Side Request Forgery in Request" advisory and no fixed release,
+and with it a nested `form-data` (critical), `tough-cookie`, `request-promise` and
+`request-promise-core` (moderate). `sanitize-html` (moderate) is used only by the SDK's rich-reply
+helper, which Rumi does not call, and `matrix-bot-sdk` itself is flagged (moderate) because of these.
+
+We accept these for now. `request` only ever talks to one server: the homeserver in
+`MATRIX_HOMESERVER_URL`, which the operator sets and runs. Every SDK call Rumi makes is a Matrix API
+path on that server. The one piece of user-sent data that reaches it is an attachment's `mxc://`
+address, which the SDK URL-encodes into a download path on the same homeserver; no full URL from a
+message is ever fetched. Deployments without the Matrix channel never load the SDK. The move off
+`request` is tracked upstream in
+[matrix-bot-sdk#90](https://github.com/turt2live/matrix-bot-sdk/issues/90); we will update the SDK, or
+replace it, when that lands.
+
 ## Security Practices
 
 This project follows these security practices:

@@ -63,7 +63,7 @@ describe('reading passage backgrounds are presence-gated', () => {
   it('getRandomBackgroundUrl returns null with no base URL, rather than a relative path', () => {
     jest.resetModules();
     delete process.env.R2_PUBLIC_URL;
-    jest.doMock('../../bot/shared/config/supabase', () => ({ from: jest.fn() }), { virtual: true });
+    jest.doMock('../../bot/shared/config/supabase', () => ({ from: jest.fn() }));
     jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
 
     const PassageGeneration = require('../../bot/shared/services/reading/passage-generation.service');

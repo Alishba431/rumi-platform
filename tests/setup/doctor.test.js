@@ -357,6 +357,61 @@ describe('the real Discord probe — lighter than Slack\'s, no per-scope breakdo
   });
 });
 
+describe('the real Matrix probe -- an access token is all-or-nothing, no per-scope breakdown at all', () => {
+  const { defaultProbes } = require('../../bot/scripts/setup/doctor');
+  const ENV = { MATRIX_HOMESERVER_URL: 'https://matrix.example.org', MATRIX_ACCESS_TOKEN: 'test-token' };
+
+  let realFetch;
+  beforeEach(() => { realFetch = global.fetch; });
+  afterEach(() => { global.fetch = realFetch; });
+
+  it('passes when the token authenticates against the homeserver\'s whoami endpoint', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ user_id: '@rumi:example.org' }) });
+    // The crypto check has its own tests below; here it always loads, so the
+    // result does not depend on whether bot/ dependencies are installed.
+    const result = await defaultProbes.matrix(ENV, { loadCrypto: () => ({}) });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/@rumi:example\.org/);
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://matrix.example.org/_matrix/client/v3/account/whoami',
+      expect.objectContaining({ headers: { Authorization: 'Bearer test-token' } })
+    );
+  });
+
+  it('fails cleanly on a bad/revoked token (non-2xx HTTP response)', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 401 });
+    const result = await defaultProbes.matrix(ENV);
+    expect(result).toEqual({ ok: false, detail: 'HTTP 401' });
+  });
+
+  // "fetch failed" alone says nothing; the bot keeps retrying, so say where
+  // it tried, why it failed and that Matrix starts once the homeserver answers.
+  it('says why when the homeserver cannot be reached', async () => {
+    const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8008'), { code: 'ECONNREFUSED' });
+    global.fetch = jest.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause }));
+    const result = await defaultProbes.matrix(ENV);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/could not reach the homeserver at https:\/\/matrix\.example\.org \(ECONNREFUSED\)/);
+    expect(result.detail).toMatch(/retries/);
+  });
+
+  it('fails cleanly when the homeserver answers 200 with no user_id (an unexpected/malformed response)', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+    const result = await defaultProbes.matrix(ENV);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/no user_id/);
+  });
+
+  it('strips a trailing slash from MATRIX_HOMESERVER_URL before building the request', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ user_id: '@rumi:example.org' }) });
+    await defaultProbes.matrix({ ...ENV, MATRIX_HOMESERVER_URL: 'https://matrix.example.org/' });
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://matrix.example.org/_matrix/client/v3/account/whoami',
+      expect.anything()
+    );
+  });
+});
+
 describe('the real OpenRouter probe — a valid key is not the same as a usable one', () => {
   // Live finding: doctor reported "✅ OpenRouter (LLM) — HTTP 200" and "All
   // required services are configured and reachable" on an account with zero
@@ -427,5 +482,96 @@ describe('the real OpenRouter probe — a valid key is not the same as a usable 
       '/v1/credits': { ok: false, status: 500 },
     });
     await expect(defaultProbes.openrouter(ENV)).resolves.toEqual({ ok: true, detail: 'HTTP 200' });
+  });
+});
+
+// Encryption fails closed on Matrix: the bot refuses to start the channel when
+// the crypto module can't load and MATRIX_E2EE isn't "off". Doctor says so
+// before the operator finds out from a boot log.
+describe('the Matrix probe also checks that end-to-end encryption can start', () => {
+  const { defaultProbes } = require('../../bot/scripts/setup/doctor');
+  const ENV = { MATRIX_HOMESERVER_URL: 'https://matrix.example.org', MATRIX_ACCESS_TOKEN: 'test-token' };
+  const absent = () => { const e = new Error("Cannot find module '@matrix-org/matrix-sdk-crypto-nodejs'"); e.code = 'MODULE_NOT_FOUND'; throw e; };
+
+  let realFetch;
+  beforeEach(() => {
+    realFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ user_id: '@rumi:example.org' }) });
+  });
+  afterEach(() => { global.fetch = realFetch; });
+
+  it('fails, naming the reinstall fix and the off switch, when the crypto module cannot load', async () => {
+    const result = await defaultProbes.matrix(ENV, { loadCrypto: absent, nodeVersion: 'v22.11.0' });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/@rumi:example\.org/);
+    expect(result.detail).toMatch(/refuse to start/);
+    expect(result.detail).toMatch(/npm ci in bot\//);
+    expect(result.detail).not.toMatch(/Node 24/);
+    expect(result.detail).toMatch(/v22\.11\.0/);
+    expect(result.detail).toMatch(/MATRIX_E2EE=off/);
+  });
+
+  it('treats the retired MATRIX_E2EE=auto like the default: encryption required', async () => {
+    const result = await defaultProbes.matrix({ ...ENV, MATRIX_E2EE: 'auto' }, { loadCrypto: absent, nodeVersion: 'v22.11.0' });
+    expect(result.ok).toBe(false);
+  });
+
+  it('passes and says encryption is off when the operator chose MATRIX_E2EE=off', async () => {
+    const loadCrypto = jest.fn(absent);
+    const result = await defaultProbes.matrix({ ...ENV, MATRIX_E2EE: 'off' }, { loadCrypto });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/encryption OFF/);
+    expect(loadCrypto).not.toHaveBeenCalled();
+  });
+
+  it('passes and says messages are encrypted when the crypto module loads', async () => {
+    const result = await defaultProbes.matrix(ENV, { loadCrypto: () => ({ StoreType: { Sqlite: 0 } }) });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toMatch(/end-to-end encrypted/);
+  });
+});
+
+describe('doctor only probes a channel whose keys are set', () => {
+  const { runDoctor } = require('../../bot/scripts/setup/doctor');
+
+  it('reports an unconfigured Matrix channel by its missing keys, without calling the homeserver', async () => {
+    const matrix = jest.fn(async () => ({ ok: false, detail: 'HTTP 401' }));
+    const r = await runDoctor({ env: {}, probes: { matrix }, setupState: null });
+    const row = r.featureResults.find((f) => /Matrix/.test(f.name));
+    expect(matrix).not.toHaveBeenCalled();
+    expect(row.status).toBe('off');
+    expect(row.detail).toBe('set: MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN');
+  });
+});
+
+// CHANNEL_DRIVER=none: no WhatsApp, only the additive channels answer.
+describe('doctor on a WhatsApp-free deployment (CHANNEL_DRIVER=none)', () => {
+  const CORE = {
+    SUPABASE_URL: 'https://x.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k', OPENROUTER_API_KEY: 'k', REDIS_URL: 'redis://x',
+  };
+  const probes = { supabase: async () => ({ ok: true }), redis: async () => ({ ok: true }), openrouter: async () => ({ ok: true }),
+    matrix: async () => ({ ok: true, detail: 'connected as @rumi:example.org, end-to-end encrypted' }) };
+
+  it('needs no WhatsApp keys and says which channels answer', async () => {
+    const env = { ...CORE, CHANNEL_DRIVER: 'none', MATRIX_HOMESERVER_URL: 'https://m.example.org', MATRIX_ACCESS_TOKEN: 't' };
+    const r = await runDoctor({ env, probes, setupState: null });
+    expect(r.missingRequired).toEqual([]);
+    expect(r.ok).toBe(true);
+    const text = formatReport(r);
+    expect(text).toMatch(/Channel driver: none \(no WhatsApp\)/);
+    expect(text).toMatch(/answers only on: matrix/);
+  });
+
+  it('does not list the WhatsApp Cloud API as a required service', async () => {
+    const env = { ...CORE, CHANNEL_DRIVER: 'none', MATRIX_HOMESERVER_URL: 'https://m.example.org', MATRIX_ACCESS_TOKEN: 't' };
+    const r = await runDoctor({ env, probes, setupState: null });
+    expect(r.probeResults.map((p) => p.name)).not.toContain('WhatsApp Cloud API');
+    expect(formatReport(r)).not.toMatch(/WhatsApp Cloud API/);
+  });
+
+  it('fails when nothing at all can answer', async () => {
+    const r = await runDoctor({ env: { ...CORE, CHANNEL_DRIVER: 'none' }, probes, setupState: null });
+    expect(r.ok).toBe(false);
+    expect(formatReport(r)).toMatch(/no channel is configured/i);
   });
 });

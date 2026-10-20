@@ -15,16 +15,12 @@
 const supabase = require('../config/supabase');
 const StudentListService = require('../services/student-list.service');
 const { logToFile } = require('../utils/logger');
+const AttendanceDates = require('../services/attendance-dates');
 
-// Import academic year helper from attendance-flow.handler
+// The current academic year; the start month is configurable
+// (ATTENDANCE_ACADEMIC_YEAR_START_MONTH, default April) — see attendance-dates.
 function getCurrentAcademicYear() {
-  const now = new Date();
-  const month = now.getMonth() + 1;
-  const year = now.getFullYear();
-  if (month >= 1 && month <= 3) {
-    return `${year - 1}-${year}`;
-  }
-  return `${year}-${year + 1}`;
+  return AttendanceDates.academicYear();
 }
 
 /**

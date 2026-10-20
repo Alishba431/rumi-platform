@@ -32,10 +32,10 @@ jobs:
       - name: Checkout (clean)
         uses: actions/checkout@v4
 
-      - name: Setup Node 20
+      - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install root deps
@@ -43,6 +43,10 @@ jobs:
 
       - name: Install bot/ deps (npm ci — lockfile authoritative)
         working-directory: bot
+        run: npm ci --no-audit --no-fund
+
+      - name: Install dashboard/ deps (the portal session test boots its real middleware)
+        working-directory: dashboard
         run: npm ci --no-audit --no-fund
 
       - name: Run full test suite

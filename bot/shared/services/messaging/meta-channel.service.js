@@ -19,9 +19,12 @@
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
-const { WHATSAPP_TOKEN, PHONE_NUMBER_ID } = require('../../utils/constants');
+const { WHATSAPP_TOKEN, PHONE_NUMBER_ID, TEMP_DIR } = require('../../utils/constants');
 const { logToFile } = require('../../utils/logger');
+const { redactUrl } = require('../../utils/redact-url');
 const { downloadFromR2, extractKeyFromUrl } = require('../../storage/r2');
+const { privateTempPath, removePrivateTemp } = require('../../utils/private-temp');
+const { digestingStream } = require('../../utils/upload-digest');
 
 // Prefer ASSET_BASE_URL; fall back to legacy ASSETS_BASE_URL. Empty when
 // neither is set — the carousel template builder below guards against that.
@@ -350,11 +353,17 @@ class WhatsAppService {
       };
       const contentType = mimeTypes[ext] || 'application/octet-stream';
 
-      // Upload document to WhatsApp
+      // Upload document to WhatsApp. The stream is read only when the body goes
+      // out, so it is hashed as it is read: the sha recorded for this path is of
+      // the bytes the recipient gets (upload-digest.js). form-data cannot measure
+      // a wrapped stream, so the length is given. The size is taken first: a
+      // missing file then fails here, before a stream exists whose error nobody hears.
+      const knownLength = fs.statSync(filePath).size;
       const formData = new FormData();
-      formData.append('file', fs.createReadStream(filePath), {
+      formData.append('file', digestingStream(fs.createReadStream(filePath), filePath), {
         contentType: contentType,
         filename: filename,
+        knownLength,
       });
       formData.append('messaging_product', 'whatsapp');
 
@@ -411,11 +420,14 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendAudio(to, audioBuffer, tempDir) {
-    const path = require('path');
-
+    let temp = null;
     try {
-      // Save audio to temp file
-      const audioPath = path.join(tempDir, `audio_${Date.now()}.mp3`);
+      // Save audio to a temp file in a directory of its own. The upload reads
+      // the file only when the request body goes out, so a clock-named path
+      // would be shared (and overwritten, or unlinked) by another send in the
+      // same millisecond.
+      temp = privateTempPath(tempDir, 'audio.mp3', 'audio-');
+      const audioPath = temp.filePath;
       fs.writeFileSync(audioPath, audioBuffer);
 
       // Upload media to WhatsApp
@@ -458,9 +470,6 @@ class WhatsAppService {
         }
       );
 
-      // Clean up temp file
-      fs.unlinkSync(audioPath);
-
       logToFile('Audio message sent successfully', { response: sendResponse.data });
       return true;
     } catch (error) {
@@ -469,6 +478,9 @@ class WhatsAppService {
         errorDetails: error.response?.data
       });
       return false;
+    } finally {
+      // Clean up on failure too
+      removePrivateTemp(temp);
     }
   }
 
@@ -481,40 +493,35 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendDocumentFromUrl(to, documentUrl, filename, caption) {
-    const path = require('path');
-    const tempDir = path.join(__dirname, '../../../temp');
+    const tempDir = TEMP_DIR;
+    let temp = null;
 
     try {
       // Extract R2 key from URL and download using R2 client
-      logToFile('Downloading document from R2', { documentUrl });
+      logToFile('Downloading document from R2', { documentUrl: redactUrl(documentUrl) });
       const key = extractKeyFromUrl(documentUrl);
       const documentBuffer = await downloadFromR2(key);
 
-      // Save to temp file
-      if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-      }
-      const tempFilePath = path.join(tempDir, `temp_${Date.now()}_${filename}`);
+      // Save to a temp file in a directory of its own: sendDocument streams the
+      // file after an await, and a path built from the clock and the display
+      // name is shared by two sends of the same file in the same millisecond.
+      temp = privateTempPath(tempDir, filename || 'document', 'doc-');
+      const tempFilePath = temp.filePath;
       fs.writeFileSync(tempFilePath, documentBuffer);
 
       logToFile('Document downloaded from R2, sending to WhatsApp', { tempFilePath, size: documentBuffer.length });
 
       // Use existing sendDocument method
-      const result = await this.sendDocument(to, tempFilePath, filename, caption);
-
-      // Clean up temp file
-      if (fs.existsSync(tempFilePath)) {
-        fs.unlinkSync(tempFilePath);
-      }
-
-      return result;
+      return await this.sendDocument(to, tempFilePath, filename, caption);
     } catch (error) {
       logToFile('❌ Error sending document from URL', {
-        error: error.message,
-        documentUrl,
+        error: redactUrl(error.message),
+        documentUrl: redactUrl(documentUrl),
         stack: error.stack
       });
       return false;
+    } finally {
+      removePrivateTemp(temp);
     }
   }
 
@@ -525,12 +532,11 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendAudioFromUrl(to, audioUrl) {
-    const path = require('path');
-    const tempDir = path.join(__dirname, '../../../temp');
+    const tempDir = TEMP_DIR;
 
     try {
       // Extract R2 key from URL and download using R2 client
-      logToFile('Downloading audio from R2', { audioUrl });
+      logToFile('Downloading audio from R2', { audioUrl: redactUrl(audioUrl) });
       const key = extractKeyFromUrl(audioUrl);
       const audioBuffer = await downloadFromR2(key);
 
@@ -540,8 +546,8 @@ class WhatsAppService {
       return await this.sendAudio(to, audioBuffer, tempDir);
     } catch (error) {
       logToFile('❌ Error sending audio from URL', {
-        error: error.message,
-        audioUrl,
+        error: redactUrl(error.message),
+        audioUrl: redactUrl(audioUrl),
         stack: error.stack
       });
       return false;
@@ -560,40 +566,35 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendImageFromUrl(to, imageUrl, caption = '') {
-    const path = require('path');
-    const tempDir = path.join(__dirname, '../../../temp');
+    const tempDir = TEMP_DIR;
+    let temp = null;
 
     try {
       // Extract R2 key from URL and download using R2 client
-      logToFile('Downloading image from R2', { imageUrl });
+      logToFile('Downloading image from R2', { imageUrl: redactUrl(imageUrl) });
       const key = extractKeyFromUrl(imageUrl);
       const imageBuffer = await downloadFromR2(key);
 
-      // Save to temp file
-      if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-      }
-      const tempFilePath = path.join(tempDir, `img_${Date.now()}.png`);
+      // Save to a temp file in a directory of its own: sendImage streams the
+      // file after an await, so a clock-named path would be shared by another
+      // send in the same millisecond.
+      temp = privateTempPath(tempDir, 'image.png', 'img-');
+      const tempFilePath = temp.filePath;
       fs.writeFileSync(tempFilePath, imageBuffer);
 
       logToFile('Image downloaded from R2, sending to WhatsApp', { tempFilePath, size: imageBuffer.length });
 
       // tempFilePath contains '/' so sendImage takes the upload-file branch.
-      const result = await this.sendImage(to, tempFilePath, caption);
-
-      // Clean up temp file
-      if (fs.existsSync(tempFilePath)) {
-        fs.unlinkSync(tempFilePath);
-      }
-
-      return result;
+      return await this.sendImage(to, tempFilePath, caption);
     } catch (error) {
       logToFile('❌ Error sending image from URL', {
-        error: error.message,
-        imageUrl,
+        error: redactUrl(error.message),
+        imageUrl: redactUrl(imageUrl),
         stack: error.stack
       });
       return false;
+    } finally {
+      removePrivateTemp(temp);
     }
   }
 
@@ -661,11 +662,14 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendVideo(to, videoBuffer, tempDir, caption = '') {
-    const path = require('path');
-
+    let temp = null;
     try {
-      // Save video to temp file
-      const videoPath = path.join(tempDir, `video_${Date.now()}.mp4`);
+      // Save video to a temp file in a directory of its own. The upload reads
+      // the file only when the request body goes out, so a clock-named path
+      // would be shared (and overwritten, or unlinked) by another send in the
+      // same millisecond.
+      temp = privateTempPath(tempDir, 'video.mp4', 'video-');
+      const videoPath = temp.filePath;
       fs.writeFileSync(videoPath, videoBuffer);
 
       logToFile('Uploading video to WhatsApp', { size: videoBuffer.length, path: videoPath });
@@ -718,9 +722,6 @@ class WhatsAppService {
         }
       );
 
-      // Clean up temp file
-      fs.unlinkSync(videoPath);
-
       logToFile('✅ Video message sent successfully', { response: sendResponse.data });
       return true;
     } catch (error) {
@@ -729,6 +730,9 @@ class WhatsAppService {
         errorDetails: error.response?.data
       });
       return false;
+    } finally {
+      // Clean up on failure too
+      removePrivateTemp(temp);
     }
   }
 
@@ -740,12 +744,11 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendVideoFromUrl(to, videoUrl, caption = '') {
-    const path = require('path');
-    const tempDir = path.join(__dirname, '../../../temp');
+    const tempDir = TEMP_DIR;
 
     try {
       // Extract R2 key from URL and download using R2 client
-      logToFile('📹 Downloading video from R2', { videoUrl });
+      logToFile('📹 Downloading video from R2', { videoUrl: redactUrl(videoUrl) });
       const key = extractKeyFromUrl(videoUrl);
       const videoBuffer = await downloadFromR2(key);
 
@@ -755,8 +758,8 @@ class WhatsAppService {
       return await this.sendVideo(to, videoBuffer, tempDir, caption);
     } catch (error) {
       logToFile('❌ Error sending video from URL', {
-        error: error.message,
-        videoUrl,
+        error: redactUrl(error.message),
+        videoUrl: redactUrl(videoUrl),
         stack: error.stack
       });
       return false;
@@ -1006,8 +1009,8 @@ class WhatsAppService {
    * @returns {Promise<boolean>}
    */
   static async sendImageWithButtons(to, imageUrl, bodyText, buttons) {
-    const path = require('path');
-    const tempDir = path.join(__dirname, '../../../temp');
+    const tempDir = TEMP_DIR;
+    let temp = null;
 
     try {
       // WhatsApp allows max 3 buttons
@@ -1032,17 +1035,17 @@ class WhatsAppService {
       let imageHeader;
 
       if (isR2Url) {
-        logToFile('📥 Downloading image from R2 (private URL)', { imageUrl });
+        logToFile('📥 Downloading image from R2 (private URL)', { imageUrl: redactUrl(imageUrl) });
 
         // Extract R2 key and download using credentials
         const key = extractKeyFromUrl(imageUrl);
         const imageBuffer = await downloadFromR2(key);
 
-        // Save to temp file
-        if (!fs.existsSync(tempDir)) {
-          fs.mkdirSync(tempDir, { recursive: true });
-        }
-        const tempFilePath = path.join(tempDir, `vocab_${Date.now()}.png`);
+        // Save to a temp file in a directory of its own: the upload streams the
+        // file after an await, so a clock-named path would be shared by another
+        // send in the same millisecond.
+        temp = privateTempPath(tempDir, 'vocabulary.png', 'vocab-');
+        const tempFilePath = temp.filePath;
         fs.writeFileSync(tempFilePath, imageBuffer);
 
         logToFile('📤 Uploading image to WhatsApp Media API', { size: imageBuffer.length });
@@ -1069,10 +1072,9 @@ class WhatsAppService {
         const mediaId = uploadResponse.data.id;
         logToFile('✅ Image uploaded to WhatsApp', { mediaId });
 
-        // Clean up temp file
-        if (fs.existsSync(tempFilePath)) {
-          fs.unlinkSync(tempFilePath);
-        }
+        // Clean up temp file (the finally below covers a failed upload)
+        removePrivateTemp(temp);
+        temp = null;
 
         // Use media ID instead of link
         imageHeader = { id: mediaId };
@@ -1112,18 +1114,20 @@ class WhatsAppService {
 
       logToFile('✅ Image with buttons sent successfully', {
         response: response.data,
-        imageUrl,
+        imageUrl: redactUrl(imageUrl),
         usedMediaId: isR2Url,
         buttonCount: buttons.length
       });
       return true;
     } catch (error) {
       logToFile('❌ Error sending image with buttons', {
-        error: error.message,
+        error: redactUrl(error.message),
         errorDetails: error.response?.data,
-        imageUrl
+        imageUrl: redactUrl(imageUrl)
       });
       return false;
+    } finally {
+      removePrivateTemp(temp);
     }
   }
 

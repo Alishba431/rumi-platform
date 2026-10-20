@@ -232,6 +232,11 @@ function makeRoutedInteractionsHandler(dispatch, modalHandler, eventsAdapter) {
  * @param {object} [options.eventsAdapter] - Injected events adapter (defaults to slack-events.adapter).
  * @returns {import('express').Router}
  */
+function pausedChannel(req, res) {
+  logToFile('Slack: channel switched off by the operator -- request ignored', { path: req.path });
+  res.status(200).send('');
+}
+
 function createSlackRouter(options = {}) {
   const config = typeof options === 'function' ? { dispatch: options } : options;
   const {
@@ -249,6 +254,15 @@ function createSlackRouter(options = {}) {
 
   // 1. Raw body buffering middleware mounted directly on router
   router.use(rawBodyMiddleware);
+
+  // Operator switched Slack off (RUMI_FEATURE_CHANNEL_SLACK=off): acknowledge
+  // (Slack retries anything else) and drop unread. Decided at mount, so it
+  // applies at the next restart — same as slack-interactions.routes.js.
+  const { isChannelSwitchedOff } = require('../../shared/config/feature-availability');
+  if (isChannelSwitchedOff('slack', process.env)) {
+    for (const path of ['/events', '/interactions', '/commands']) router.post(path, pausedChannel);
+    return router;
+  }
 
   // 2. Events API endpoint
   router.post('/events', verifyAndParse('json', signingSecret), eventsAdapter.makeEventsHandler(dispatch));

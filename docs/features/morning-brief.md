@@ -9,6 +9,25 @@
 > Every morning, one thread that answers five plain questions about your programme, each with a number
 > behind it — on WhatsApp, Slack or Discord, wherever your team already is.
 
+## In programme terms
+
+**The programme's routine data, read every morning, so support goes where it is needed.**
+
+Structured-pedagogy programmes that scaled kept delivery honest with routine data. Tusome recorded every coach visit on a tablet. Each term, dashboards of visit rates and pupil fluency were shared with every coach, in front of the local education directors [Piper-JEC18]. The same programme's own review found it "failed to fully exploit the available classroom observational data to better target instructional support" [Piper-JEC18]. The Morning Brief closes that loop at a daily rhythm. Every working morning the programme team gets one thread, in the channel it already uses, that answers five questions with a number behind each. Who is on the platform, and who used it? Are teachers teaching with the lesson plans? Is the teaching improving? Are coaches making their visits against target? Where should attention go next? The last panel lists every school, worst first. The charts, the cohort and the window are the same every day, so the team sees drift, not a story. Friday's thread rolls up the week.
+
+**Where it sits in a structured-pedagogy programme:** the **monitoring and support-targeting loop**. It reads what the other parts record (lesson plans, coaching, reading checks, attendance, observations) and points coaches and managers at the schools that need a visit.
+
+### Honest limits
+
+- **Platform activity, not learning.** It reports what teachers and coaches did on the platform. Its reading panel shows Rumi's own reading checks, not an independent assessment.
+- **Only what is recorded.** A visit or a lesson that happens off the platform does not appear.
+- **Read-only.** It reads the database and changes nothing; it messages the programme team, never teachers.
+- **A brief is not an evaluation.** Trends show where to look; they do not show what caused a change.
+
+### Sources
+
+- [Piper-JEC18] Piper, B., DeStefano, J., Kinyanjui, E. M., & Ong'ele, S., 2018, "Scaling up successfully: Lessons from Kenya's Tusome national literacy program", *Journal of Educational Change* 19(3):293–321. https://doi.org/10.1007/s10833-018-9325-4
+
 ## What it is
 
 Most programmes are rich in data and poor in shared reality: the numbers sit in a database, behind a login,

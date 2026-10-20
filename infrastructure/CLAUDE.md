@@ -15,6 +15,7 @@
 | `scripts/migrate.js` | Applies pending `V*.sql` migrations via the `exec_sql` RPC |
 | `scripts/test-connections.js` | `npm run validate:connections` |
 | `railway/` | Deployment configs |
+| `local/` | Supabase-free local stack: `up.sh` / `down.sh` start Postgres + PostgREST + a `/rest/v1` proxy + Redis on a laptop, no Docker (see `docs/local-stack.md`) |
 
 ## Rules
 

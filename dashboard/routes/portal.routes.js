@@ -4,6 +4,7 @@
  * Version: 2.8.1 - Reading Assessments Integration
  *
  * Endpoints:
+ * - GET /api/portal/channels - Does this deployment run WhatsApp; the chat link (public)
  * - POST /api/portal/validate-token - Validate invitation token
  * - POST /api/portal/setup - Complete portal setup (set password)
  * - POST /api/portal/login - Log in to portal
@@ -20,17 +21,24 @@
  * - GET /api/portal/reading-assessment/:id - Get single reading assessment detail
  * - GET /api/portal/reading-stats - Get reading assessment summary stats
  * - GET /api/portal/reading-analytics - Get reading assessment trends over time
+ * - GET /api/portal/coach/observations, /coach/teachers, /coach/teacher/:id -
+ *   the coach's view (observe role family only; see portal-coach.routes.js)
  *
  * Related: TEACHER_PORTAL_IMPLEMENTATION_PLAN.md, READING_ASSESSMENTS_PORTAL_INTEGRATION_PLAN.md
  */
 
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const supabase = require('../config/supabase');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { generatePresignedUrl, generatePresignedUrls, isValidR2Url } = require('../services/r2.service');
+const { widenPortalAppSession } = require('../lib/portal-app-origins');
+const { createPortalAuthLimiters } = require('../lib/portal-auth-limits');
+const { portalChannels } = require('../lib/portal-channels');
+const { redactUrl } = require('../lib/redact-url');
+const { createCoachRouter } = require('./portal-coach.routes');
+const { canUseCoachView } = require('../services/coach-observations.service');
 
 // Configure R2 S3 client for private PDF access. Lazy — resolved on first
 // use, not at module load, so mounting these routes never depends on R2 env
@@ -55,41 +63,11 @@ function getR2Client() {
 // ============================================================================
 
 /**
- * SECURITY: Extra aggressive rate limiting for public authentication endpoints
- * Prevents brute force attacks and enumeration attempts
- *
- * TEMPORARY: DISABLED FOR TESTING - MUST RE-ENABLE BEFORE PRODUCTION
- * PRODUCTION VALUES: windowMs: 60 * 60 * 1000 (1 hour), max: 10
- * TESTING VALUES: DISABLED (max: 10000)
+ * The public sign-in routes are limited per IP and per account (phone number),
+ * counted in Redis when the dashboard has one so every worker shares the count.
+ * Limits, env settings and the 429 body: lib/portal-auth-limits.js.
  */
-const publicAuthLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // TEMP: 1 minute window
-  max: 10000, // TEMP: Effectively disabled
-  message: 'Too many requests. Please try again later.',
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: false, // Count all requests (prevents timing attacks)
-  keyGenerator: (req) => {
-    // Use IP + endpoint to prevent cross-endpoint abuse
-    return `${req.ip}-${req.path}`;
-  }
-});
-
-/**
- * SECURITY: Very strict rate limiting for token validation (prevent enumeration)
- *
- * TEMPORARY: DISABLED FOR TESTING - MUST RE-ENABLE BEFORE PRODUCTION
- * PRODUCTION VALUES: windowMs: 60 * 60 * 1000 (1 hour), max: 5
- * TESTING VALUES: DISABLED (max: 10000)
- */
-const tokenValidationLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // TEMP: 1 minute window
-  max: 10000, // TEMP: Effectively disabled
-  message: 'Too many validation attempts. Please try again later.',
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: false
-});
+const authLimits = createPortalAuthLimiters();
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -208,6 +186,22 @@ async function getUserById(userId) {
 }
 
 // ============================================================================
+// PUBLIC DEPLOYMENT INFO
+// ============================================================================
+
+/**
+ * GET /api/portal/channels
+ * { whatsapp, chatUrl }: whether the bot answers on WhatsApp here, and where
+ * "chat with Rumi" links go (PORTAL_CHAT_URL, or null). Public: the landing
+ * page asks before anyone signs in. Read from env on each request, so a
+ * restart with new settings is all a change needs.
+ */
+router.get('/channels', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json(portalChannels(process.env));
+});
+
+// ============================================================================
 // AUTHENTICATION ENDPOINTS
 // ============================================================================
 
@@ -242,7 +236,7 @@ router.get('/auth/verify', (req, res) => {
  * Validate invitation token for portal setup
  * SECURITY: Generic errors to prevent token enumeration + strict rate limiting
  */
-router.post('/validate-token', tokenValidationLimiter, async (req, res) => {
+router.post('/validate-token', authLimits.validateToken, async (req, res) => {
   try {
     const { token } = req.body;
 
@@ -311,7 +305,7 @@ router.post('/validate-token', tokenValidationLimiter, async (req, res) => {
  * Complete portal setup - set password and activate account
  * SECURITY: Input validation, session regeneration, and rate limiting
  */
-router.post('/setup', publicAuthLimiter, async (req, res) => {
+router.post('/setup', authLimits.setup, async (req, res) => {
   try {
     const { token, password } = req.body;
 
@@ -394,6 +388,9 @@ router.post('/setup', publicAuthLimiter, async (req, res) => {
         });
       }
 
+      // The bundled portal app needs a SameSite=none cookie (lib/portal-app-origins.js)
+      widenPortalAppSession(req);
+
       // Set new session data
       req.session.portalUserId = user.id;
       req.session.isPortalAuth = true;
@@ -417,7 +414,7 @@ router.post('/setup', publicAuthLimiter, async (req, res) => {
  * Log in to teacher portal
  * SECURITY: Input validation, generic errors, session regeneration, and rate limiting
  */
-router.post('/login', publicAuthLimiter, async (req, res) => {
+router.post('/login', authLimits.login, async (req, res) => {
   try {
     let { phoneNumber, password } = req.body;
 
@@ -484,6 +481,9 @@ router.post('/login', publicAuthLimiter, async (req, res) => {
         });
       }
 
+      // The bundled portal app needs a SameSite=none cookie (lib/portal-app-origins.js)
+      widenPortalAppSession(req);
+
       // Set new session data
       req.session.portalUserId = user.id;
       req.session.isPortalAuth = true;
@@ -532,7 +532,7 @@ router.post('/logout', requirePortalAuth, (req, res) => {
  * Request password reset code via WhatsApp
  * SECURITY: Generic responses to prevent phone number enumeration + rate limiting
  */
-router.post('/request-reset', publicAuthLimiter, async (req, res) => {
+router.post('/request-reset', authLimits.requestReset, async (req, res) => {
   try {
     let { phoneNumber } = req.body;
 
@@ -591,7 +591,7 @@ router.post('/request-reset', publicAuthLimiter, async (req, res) => {
  * Verify password reset code
  * SECURITY: Input validation, generic error messages, and rate limiting
  */
-router.post('/verify-reset-code', publicAuthLimiter, async (req, res) => {
+router.post('/verify-reset-code', authLimits.verifyResetCode, async (req, res) => {
   try {
     let { phoneNumber, code } = req.body;
 
@@ -653,7 +653,7 @@ router.post('/verify-reset-code', publicAuthLimiter, async (req, res) => {
  * Reset password with verified code
  * SECURITY: Input validation and session cleanup
  */
-router.post('/reset-password', async (req, res) => {
+router.post('/reset-password', authLimits.resetPassword, async (req, res) => {
   try {
     const { password } = req.body;
     const userId = req.session.resetUserId;
@@ -682,7 +682,8 @@ router.post('/reset-password', async (req, res) => {
       .update({
         portal_password_hash: passwordHash,
         password_reset_code: null,
-        password_reset_expires_at: null
+        password_reset_expires_at: null,
+        password_reset_attempts: 0
       })
       .eq('id', userId);
 
@@ -734,6 +735,7 @@ router.get('/dashboard', requirePortalAuth, async (req, res) => {
         .from('coaching_sessions')
         .select('id', { count: 'exact', head: true })
         .eq('user_id', userId)
+        .is('observation_type', null) // never a coach's observation: its scores are the coach's ratings
         .eq('status', 'completed')
     ]);
 
@@ -771,6 +773,7 @@ router.get('/dashboard', requirePortalAuth, async (req, res) => {
       .from('coaching_sessions')
       .select('id, created_at, analysis_data')
       .eq('user_id', userId)
+      .is('observation_type', null) // never a coach's observation: its scores are the coach's ratings
       .eq('status', 'completed')
       .not('analysis_data', 'is', null)
       .order('created_at', { ascending: false })
@@ -790,7 +793,10 @@ router.get('/dashboard', requirePortalAuth, async (req, res) => {
       user: {
         firstName: user.first_name,
         lastName: user.last_name,
-        phoneNumber: user.phone_number
+        phoneNumber: user.phone_number,
+        // Shows the "Observations" nav item (observe on + role family); the
+        // coach endpoints gate on the server.
+        isCoach: canUseCoachView(user)
       },
       stats: {
         totalLessonPlans: lessonPlansResult.status === 'fulfilled' ? (lessonPlansResult.value.count || 0) : 0,
@@ -893,6 +899,7 @@ router.get('/coaching-sessions', requirePortalAuth, async (req, res) => {
       .from('coaching_sessions')
       .select('id, created_at, audio_duration_seconds, status, analysis_data', { count: 'exact' })
       .eq('user_id', userId)
+      .is('observation_type', null) // never a coach's observation: its scores are the coach's ratings
       .eq('status', 'completed')
       .not('analysis_data', 'is', null)
       .order('created_at', { ascending: false })
@@ -953,6 +960,7 @@ router.get('/coaching-session/:id', requirePortalAuth, async (req, res) => {
       .select('*')
       .eq('id', sessionId)
       .eq('user_id', userId) // Security: ensure user owns this session
+      .is('observation_type', null) // never a coach's observation: its scores are the coach's ratings
       .single();
 
     if (error || !session) {
@@ -1246,6 +1254,7 @@ router.get('/coaching-analytics', requirePortalAuth, async (req, res) => {
       .from('coaching_sessions')
       .select('id, created_at, analysis_data')
       .eq('user_id', userId)
+      .is('observation_type', null) // never a coach's observation: its scores are the coach's ratings
       .eq('status', 'completed')
       .not('analysis_data', 'is', null)
       .order('created_at', { ascending: true });
@@ -1936,7 +1945,7 @@ router.get('/video/:id', requirePortalAuth, async (req, res) => {
       presignedVideoUrl = await generatePresignedUrl(video.video_url, 3600);
     } else if (video.video_url) {
       // Issue #21: Log warning for invalid URLs (local paths)
-      console.warn(`⚠️ Video ${videoId} has invalid video_url: ${video.video_url}`);
+      console.warn(`⚠️ Video ${videoId} has invalid video_url: ${redactUrl(video.video_url)}`);
     }
 
     // Issue #18: Generate presigned URL for PDF
@@ -1978,5 +1987,8 @@ router.get('/video/:id', requirePortalAuth, async (req, res) => {
     });
   }
 });
+
+// The coach's view (observe role family only).
+router.use(createCoachRouter({ db: supabase, requireAuth: requirePortalAuth }));
 
 module.exports = router;

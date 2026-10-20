@@ -15,6 +15,9 @@
  * "confirmed" semantics, nothing is pre-selected here (default: everyone
  * present) — a selected box means the opposite thing on this screen.
  *
+ * After the absent picker(s) come leave picker(s) over the same roster: who is
+ * on approved leave. Someone selected in both is on leave.
+ *
  * No text-fields modal at all for this screen — it's one (or two+) selects,
  * nothing else, so it never opens a Discord Modal (see discord-modal-flow.js's
  * runScreen(): a screen with zero textFields acks directly and calls
@@ -52,7 +55,7 @@ function screenToSteps(screen, data) {
     const chunks = chunkStudents(students);
     const classDisplay = data?.class_display || 'this class';
 
-    const steps = chunks.map((chunk, i) => ({
+    const absentSteps = chunks.map((chunk, i) => ({
       fieldName: `absent_students_chunk_${i}`,
       promptText: chunks.length > 1
         ? `Check who's ABSENT in ${classDisplay} (${i + 1}/${chunks.length}). Everyone else will be marked present:`
@@ -60,6 +63,15 @@ function screenToSteps(screen, data) {
       buildMenu: () => buildChunkMenu(chunk, `absent_students_chunk_${i}`, `Students ${i + 1}-${i + chunk.length} of ${students.length}`),
       multi: true,
     }));
+    const leaveSteps = chunks.map((chunk, i) => ({
+      fieldName: `leave_students_chunk_${i}`,
+      promptText: chunks.length > 1
+        ? `Anyone on approved LEAVE in ${classDisplay} (${i + 1}/${chunks.length})? Leave it empty if nobody:`
+        : `Anyone on approved LEAVE in ${classDisplay}? Leave it empty if nobody:`,
+      buildMenu: () => buildChunkMenu(chunk, `leave_students_chunk_${i}`, `On leave ${i + 1}-${i + chunk.length} of ${students.length}`),
+      multi: true,
+    }));
+    const steps = [...absentSteps, ...leaveSteps];
 
     return { steps, textFields: [], title: 'Mark Attendance' };
   }
@@ -69,11 +81,14 @@ function screenToSteps(screen, data) {
 
 function mergeScreenData(screen, enumAnswers) {
   if (screen === 'MARK_ABSENT') {
-    const absentStudentIds = Object.keys(enumAnswers)
-      .filter((key) => key.startsWith('absent_students_chunk_'))
+    const collect = (prefix) => Object.keys(enumAnswers)
+      .filter((key) => key.startsWith(prefix))
       .sort()
       .flatMap((key) => enumAnswers[key] || []);
-    return { absent_student_ids: absentStudentIds };
+    return {
+      absent_student_ids: collect('absent_students_chunk_'),
+      leave_student_ids: collect('leave_students_chunk_'),
+    };
   }
   return {};
 }

@@ -276,6 +276,82 @@ const defaultProbes = {
 
     return { ok: true, detail: `connected as ${body.name || 'your application'}` };
   },
+  /**
+   * Confirms the access token authenticates against the homeserver's own
+   * whoami endpoint, the Matrix equivalent of Discord's applications/@me
+   * check above. No scopes to verify (an access token is all-or-nothing on
+   * Matrix).
+   *
+   * It also checks that end-to-end encryption can start, because the channel
+   * fails closed: unless MATRIX_E2EE=off, the bot refuses to start Matrix when
+   * matrix-bot-sdk's own crypto module can't load (matrix-connection.js). Same
+   * rule as matrix-connection.js#e2eeMode, restated here so doctor never has to
+   * load the bot's logger or SDK; the module is found the same way the bot
+   * finds it (matrix-crypto-module.js).
+   */
+  async matrix(env, {
+    loadCrypto = () => require('../../shared/services/messaging/matrix-crypto-module').loadSdkCryptoModule(),
+    nodeVersion = process.version,
+  } = {}) {
+    const base = String(env.MATRIX_HOMESERVER_URL || '').replace(/\/+$/, '');
+    let res;
+    try {
+      res = await fetch(`${base}/_matrix/client/v3/account/whoami`, {
+        headers: { Authorization: `Bearer ${env.MATRIX_ACCESS_TOKEN}` },
+      });
+    } catch (err) {
+      // fetch's own message is just "fetch failed"; the reason is on .cause.
+      const reason = err.cause?.code || err.cause?.message || err.message;
+      return {
+        ok: false,
+        detail: `could not reach the homeserver at ${base} (${reason}). The bot retries the connection `
+          + 'with backoff, so Matrix starts once the homeserver answers; check MATRIX_HOMESERVER_URL if it never does.',
+      };
+    }
+    if (!res.ok) return { ok: false, detail: `HTTP ${res.status}` };
+
+    const body = await res.json();
+    if (!body.user_id) return { ok: false, detail: 'homeserver accepted the request but returned no user_id' };
+
+    if (String(env.MATRIX_E2EE || '').trim().toLowerCase() === 'off') {
+      return { ok: true, detail: `connected as ${body.user_id} (end-to-end encryption OFF: MATRIX_E2EE=off)` };
+    }
+    try {
+      loadCrypto();
+    } catch (err) {
+      return {
+        ok: false,
+        detail: `connected as ${body.user_id}, but the channel will refuse to start: end-to-end encryption `
+          + `is required and its crypto module can't load (${err.code || err.message}; this is Node ${nodeVersion}). `
+          + 'It needs Node 22 or newer and the native binary matrix-bot-sdk installs: reinstall bot '
+          + 'dependencies (npm ci in bot/), or set MATRIX_E2EE=off if plaintext is acceptable on this homeserver.',
+      };
+    }
+    return { ok: true, detail: `connected as ${body.user_id}, end-to-end encrypted` };
+  },
+
+  // Lesson-plan fidelity: on/off, plus how many classroom recordings came back with the [MM:SS] timings it needs
+  // (diarization-health.js counts them in Redis). A silent loss of timings shows here as a falling rate.
+  async diarization(env) {
+    const { FEATURES, isFeatureAvailable } = require('../../shared/config/feature-availability');
+    const entry = FEATURES.find((f) => f.id === 'lp_fidelity');
+    if (!isFeatureAvailable(entry, env)) {
+      return { ok: false, detail: 'set: LP_FIDELITY_ENABLED=true and SONIOX_API_KEY' };
+    }
+    if (!isSet(env.REDIS_URL)) return { ok: true, detail: 'on (set REDIS_URL to see how many recordings carry timings)' };
+    const IORedis = require('ioredis');
+    const client = new IORedis(env.REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
+    client.on('error', () => {});
+    try {
+      await client.connect();
+      const { diarizationStats, describeDiarization } = require('../../shared/services/coaching/diarization-health');
+      return describeDiarization(await diarizationStats(7, { redis: client }));
+    } catch (err) {
+      return { ok: true, detail: `on (timing counts unavailable: ${err.message})` };
+    } finally {
+      client.disconnect();
+    }
+  },
   async redis(env) {
     // Lazy require so the bot's redis lib is optional at doctor time.
     const IORedis = require('ioredis');
@@ -304,7 +380,8 @@ const REQUIRED_PROBES = [
   { name: 'Supabase', probe: 'supabase', needs: ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'] },
   { name: 'Rumi tables', probe: 'tables', needs: ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'] },
   { name: 'OpenRouter (LLM)', probe: 'openrouter', needs: ['OPENROUTER_API_KEY'] },
-  { name: 'WhatsApp Cloud API', probe: 'whatsapp', needs: ['PHONE_NUMBER_ID', 'WHATSAPP_TOKEN'] },
+  // Not required, and not listed, when CHANNEL_DRIVER=none: there is no WhatsApp.
+  { name: 'WhatsApp Cloud API', probe: 'whatsapp', needs: ['PHONE_NUMBER_ID', 'WHATSAPP_TOKEN'], skipOn: ['none'] },
   { name: 'Redis', probe: 'redis', needs: ['REDIS_URL'] },
 ];
 
@@ -335,7 +412,8 @@ async function runDoctor({
 
   // Run REQUIRED probes only for services whose vars are present.
   const probeResults = [];
-  for (const { name, probe, needs = [] } of REQUIRED_PROBES) {
+  for (const { name, probe, needs = [], skipOn = [] } of REQUIRED_PROBES) {
+    if (skipOn.includes(analysis.channel)) continue;
     const impl = probes[probe];
     if (!impl) { probeResults.push({ name, status: 'skip', detail: 'no probe' }); continue; }
     if (needs.some((k) => !isSet(env[k]))) {
@@ -354,7 +432,10 @@ async function runDoctor({
   const featureResults = [];
   for (const f of analysis.features) {
     const keyMeta = { requiredKeys: f.requiredKeys, missingKeys: f.missingKeys, notes: f.notes };
-    if (f.probe && probes[f.probe]) {
+    // Probe only what is configured: a channel with no keys would otherwise be
+    // "checked" against an empty URL/token and report a confusing error. (A
+    // keyless feature has available === null: only its probe can tell.)
+    if (f.probe && probes[f.probe] && f.available !== false) {
       try {
         const { ok, detail } = await probes[f.probe](env);
         featureResults.push({ name: f.name, status: ok ? 'on' : 'off', detail, ...keyMeta });
@@ -372,7 +453,10 @@ async function runDoctor({
   }
 
   const probesPassed = probeResults.every((p) => p.status !== 'fail');
-  const ok = analysis.missingRequired.length === 0 && probesPassed;
+  // CHANNEL_DRIVER=none answers only on the additive channels; with none of
+  // those configured there is nothing a teacher could reach.
+  const noChannel = analysis.channel === 'none' && !(analysis.activeChannels || []).length;
+  const ok = analysis.missingRequired.length === 0 && probesPassed && !noChannel;
 
   return {
     ok,
@@ -383,6 +467,7 @@ async function runDoctor({
     channel: analysis.channel,
     channelDriverTypo: analysis.channelDriverTypo,
     activeChannels: analysis.activeChannels,
+    noChannel,
   };
 }
 
@@ -392,7 +477,12 @@ function formatReport(result) {
   const mark = (s) => ({ pass: '✅', fail: '❌', skip: '⏭️ ', on: '✅', off: '➖' }[s] || '•');
   const lines = [];
   lines.push('Rumi doctor — deployment preflight');
-  if (result.channel) {
+  if (result.channel === 'none') {
+    lines.push('Channel driver: none (no WhatsApp)');
+    lines.push(result.noChannel
+      ? '❌ CHANNEL_DRIVER=none but no channel is configured: set MATRIX_*, SLACK_* or DISCORD_* keys (see docs/channels/matrix.md).'
+      : `ℹ️  Rumi answers only on: ${(result.activeChannels || []).join(', ')}.`);
+  } else if (result.channel) {
     const tier = isProductionTier(result.channel) ? 'production' : 'sandbox';
     lines.push(`Channel driver: ${result.channel} (${tier})`);
     if (result.channel === 'baileys') {
@@ -408,7 +498,7 @@ function formatReport(result) {
   }
   if (result.channelDriverTypo) {
     lines.push(
-      `⚠️  CHANNEL_DRIVER="${result.channelDriverTypo}" is not a recognized driver (valid: meta | baileys) —`
+      `⚠️  CHANNEL_DRIVER="${result.channelDriverTypo}" is not a recognized driver (valid: meta | baileys | none) —`
       + ` falling back to ${result.channel}.`
     );
   }

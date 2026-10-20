@@ -16,15 +16,17 @@
  * default) has no such dependency.
  */
 
-const fs = require('fs');
-const path = require('path');
 const WhatsAppService = require('../whatsapp.service');
 const PicLpSession = require('./pic-lp-session.service');
 const GammaClient = require('./gamma-client.service');
 const { logToFile } = require('../../utils/logger');
+const { redactUrl } = require('../../utils/redact-url');
 const { logEvent } = require('../../utils/structured-logger');
 const { TEMP_DIR } = require('../../utils/constants');
+const { privateTempPath, removePrivateTemp } = require('../../utils/private-temp');
 const supabase = require('../../config/supabase');
+const DailyCaps = require('../limits/daily-caps');
+const LessonPlanAvailability = require('../lesson-plan-availability');
 const crypto = require('crypto');
 
 const PIC_LP_DEFAULT_DAYS = 1; // single-page → single-lesson plan by default
@@ -105,6 +107,9 @@ async function pickBackend(userId, formData) {
 async function generateAndDeliver({ session, formData, from }) {
   const startTime = Date.now();
 
+  // Today's lesson-plan allowance for an unregistered account (limits/daily-caps.js).
+  if (!(await DailyCaps.allowOrExplainForUserId(session.user_id, 'lesson_plan', from))) return null;
+
   // A/B router branch — when app_settings.pic_lp_backend_ab routes to 'kieai',
   // delegate to the SQS-routed Kie.ai pipeline. The Kie.ai path sends its own
   // multilingual wait message + queues an SQS job + returns immediately (frees
@@ -119,6 +124,19 @@ async function generateAndDeliver({ session, formData, from }) {
   } catch (e) {
     logToFile('Pic-LP A/B router soft-failed (falling through to Gamma)', { error: e.message });
     // Fall through to existing Gamma path — safe default
+  }
+
+  // The Gamma branch with no GAMMA_API_KEY can only fail (Gamma answers 401):
+  // hand the plan to Kie.ai when it is configured, else say lesson plans are
+  // not available here (lesson-plan-availability.js).
+  if (!LessonPlanAvailability.lessonPlansAvailable()) {
+    if (process.env.KIE_API_KEY_PIC_LP || process.env.KIE_API_KEY) {
+      logToFile('Pic-LP: Gamma not configured — handing off to Kie.ai', { sessionId: session.id });
+      const KieaiHandoff = require('./kieai-handoff.service');
+      return await KieaiHandoff.enqueueAndAck({ session, formData, from });
+    }
+    await LessonPlanAvailability.explainIfUnavailable(from, { language: formData && formData.language, available: false });
+    return null;
   }
 
   // Gamma "Detailed" path deps are required lazily — the prompt builder is not
@@ -215,9 +233,13 @@ async function generateAndDeliver({ session, formData, from }) {
       ? '📄 آپ کا لیسن پلان تیار ہے۔'
       : '📄 Your lesson plan is ready.';
 
+    // The file name is built from the form (grade, subject, topic), so two
+    // teachers with the same lesson share it: download into a directory of this
+    // call's own, or one teacher is sent the other's plan.
+    const tmp = privateTempPath(TEMP_DIR, filename, 'pic-lp-');
     let tempPdfPath = null;
     try {
-      tempPdfPath = await ContentService.downloadPDF(gammaResult.pdfUrl, filename, TEMP_DIR);
+      tempPdfPath = await ContentService.downloadPDF(gammaResult.pdfUrl, filename, tmp.dir);
 
       const sendResult = await WhatsAppService.sendDocument(from, tempPdfPath, filename, docCaption);
 
@@ -244,7 +266,7 @@ async function generateAndDeliver({ session, formData, from }) {
       logToFile('❌ Pic-LP delivery failed', {
         sessionId: session.id,
         error: sendErr.message,
-        pdfUrl: gammaResult.pdfUrl,
+        pdfUrl: redactUrl(gammaResult.pdfUrl),
       });
       await PicLpSession.updateStatus(session.id, 'failed', { last_error: `delivery: ${sendErr.message}` });
       await WhatsAppService.sendMessage(
@@ -255,9 +277,7 @@ async function generateAndDeliver({ session, formData, from }) {
       );
       return { success: false, error: sendErr.message, pdfUrl: gammaResult.pdfUrl };
     } finally {
-      if (tempPdfPath && fs.existsSync(tempPdfPath)) {
-        try { fs.unlinkSync(tempPdfPath); } catch (_) { /* best-effort cleanup */ }
-      }
+      removePrivateTemp(tmp);
     }
   } catch (error) {
     logToFile('❌ Pic-LP handoff threw', { error: error.message, sessionId: session.id });
@@ -275,7 +295,7 @@ async function generateAndDeliver({ session, formData, from }) {
 function makeFilename(formData) {
   const slug = (s) => String(s || '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').substring(0, 40);
   const parts = [
-    `Grade${formData.grade || 'X'}`,
+    `Grade${slug(formData.grade) || 'X'}`,
     slug(formData.subject) || 'Subject',
     slug(formData.topic) || 'Lesson',
   ];

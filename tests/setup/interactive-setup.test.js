@@ -72,6 +72,18 @@ describe('the channel question', () => {
   });
 });
 
+describe('the channel question: no WhatsApp at all', () => {
+  it('offers running on your own messenger, Slack or Discord only, without naming the driver', async () => {
+    const { chooseChannelDriver } = loadWizard();
+    const io = fakeIo({ select: ['none'] });
+    expect(await chooseChannelDriver(io)).toBe('none');
+    const { options } = io.asked.select[0];
+    const none = options.find((o) => o.value === 'none');
+    expect(`${none.label} ${none.hint}`).toMatch(/messenger/i);
+    expect(`${none.label} ${none.hint}`).not.toMatch(/CHANNEL_DRIVER|driver/i);
+  });
+});
+
 describe('stepChannel', () => {
   /** Collects what would have been written to .env. */
   function recordingSaver(env = {}) {
@@ -94,6 +106,19 @@ describe('stepChannel', () => {
     // as failed, because scheduling its report threw "SQS Queue not configured".
     expect(saved.QUEUE_DRIVER).toBe('bullmq');
     expect(saved.CHANNEL_STATE_DIR).toBe('.channel-state');
+  });
+
+  it('a WhatsApp-free deployment saves CHANNEL_DRIVER=none and a runnable queue, and links nothing', async () => {
+    const { stepChannel } = loadWizard({ probes: allPass });
+    const { env, saved, save } = recordingSaver();
+    const io = fakeIo({ select: ['none'] });
+
+    const result = await stepChannel(io, env, save);
+
+    expect(result).toEqual({ channel: 'none', linked: false });
+    expect(saved.CHANNEL_DRIVER).toBe('none');
+    expect(saved.QUEUE_DRIVER).toBe('bullmq');
+    expect(io.asked.confirm || []).toEqual([]); // no QR code offered
   });
 
   it('leaves a production deployment\'s queue choice alone', async () => {
@@ -399,8 +424,22 @@ describe('stepMessagingChannels', () => {
     const result = await stepMessagingChannels(io, {}, () => {});
 
     expect(io.asked.confirm[0]).toMatch(/also connect slack/i);
-    expect(result).toEqual({ slack: false, discord: false });
+    expect(result).toEqual({ slack: false, discord: false, matrix: false });
     expect(io.asked.ask).toHaveLength(0);
+  });
+
+  it('asks about Slack, then Discord, then Matrix — each independent of the others', async () => {
+    const { stepMessagingChannels } = loadWizard();
+    const io = fakeIo({ confirm: [false, false, false] });
+
+    const result = await stepMessagingChannels(io, {}, () => {});
+
+    expect(io.asked.confirm).toEqual([
+      'Also connect Slack?',
+      'Also connect Discord?',
+      'Do you want teachers to reach Rumi on your own Matrix messenger?',
+    ]);
+    expect(result).toEqual({ slack: false, discord: false, matrix: false });
   });
 
   it('prints the full checklist (scopes, event, all 3 Request URLs, every ADDABLE slash command) before asking for credentials', async () => {
@@ -489,7 +528,7 @@ describe('stepMessagingChannels', () => {
 
     expect(saved.SLACK_SIGNING_SECRET).toBe('a-signing-secret');
     expect(saved.SLACK_BOT_TOKEN).toBe('xoxb-a-bot-token');
-    expect(result).toEqual({ slack: true, discord: false });
+    expect(result).toEqual({ slack: true, discord: false, matrix: false });
   });
 
   it('reports exactly which scopes are missing rather than a generic failure, and lets the user retry', async () => {
@@ -510,7 +549,7 @@ describe('stepMessagingChannels', () => {
 
     expect(scopeCheck).toHaveBeenCalledTimes(2);
     expect(log.text).toContain('missing scopes: files:read, files:write');
-    expect(result).toEqual({ slack: true, discord: false });
+    expect(result).toEqual({ slack: true, discord: false, matrix: false });
   });
 
   it('gives up cleanly if the user declines to retry after a failed check', async () => {
@@ -521,7 +560,7 @@ describe('stepMessagingChannels', () => {
     });
 
     const result = await stepMessagingChannels(io, {}, () => {});
-    expect(result).toEqual({ slack: false, discord: false });
+    expect(result).toEqual({ slack: false, discord: false, matrix: false });
   });
 
   it('rejects a non-https base URL — Slack refuses anything else', async () => {
@@ -543,11 +582,12 @@ describe('stepMessagingChannels', () => {
 
     const result = await stepMessagingChannels(io, env, () => {});
 
-    expect(result).toEqual({ slack: true, discord: false });
+    expect(result).toEqual({ slack: true, discord: false, matrix: false });
     // Never asked "also connect Slack?" (Slack's own live check short-circuited
-    // that) — the one confirm() call that DOES happen is Discord's own
-    // "Also connect Discord?" question, asked unconditionally afterward.
-    expect(io.asked.confirm).toEqual(['Also connect Discord?']);
+    // that) — the confirm() calls that DO happen are Discord's own
+    // "Also connect Discord?" question, then Matrix's own, both asked
+    // unconditionally afterward.
+    expect(io.asked.confirm).toEqual(['Also connect Discord?', 'Do you want teachers to reach Rumi on your own Matrix messenger?']);
   });
 });
 
@@ -639,6 +679,184 @@ describe('stepDiscordChannel', () => {
 
     expect(result).toEqual({ discord: true });
     expect(io.asked.confirm).toHaveLength(0); // never even asked "also connect Discord?"
+  });
+});
+
+describe('stepMatrixChannel', () => {
+  const WANT_MATRIX = 'Do you want teachers to reach Rumi on your own Matrix messenger?';
+  const matrixPass = () => jest.fn().mockResolvedValue({ ok: true, detail: 'connected as @rumi:example.org, end-to-end encrypted' });
+
+  /** Collects what would have been written to .env, and updates env like the real saver. */
+  function recordingSaver(env = {}) {
+    const saved = {};
+    return { env, saved, save: (vars) => { Object.assign(saved, vars); Object.assign(env, vars); } };
+  }
+
+  /** A rumi-messenger `deploy/rumi-channel.env`, as its scripts/setup.sh writes it. */
+  function writeChannelEnv(lines) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rumi-channel-env-'));
+    const file = path.join(dir, 'rumi-channel.env');
+    fs.writeFileSync(file, `${lines.join('\n')}\n`);
+    return file;
+  }
+
+  it('defaults to declining Matrix, and points anyone without a homeserver at rumi-messenger', async () => {
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+    const io = fakeIo({ confirm: [false] });
+
+    const result = await stepMatrixChannel(io, {}, () => {});
+
+    expect(io.asked.confirm[0]).toBe(WANT_MATRIX);
+    expect(result).toEqual({ matrix: false });
+    expect(io.asked.ask).toHaveLength(0);
+    expect(log.text).toContain('https://github.com/Orenda-Project/rumi-messenger');
+    expect(log.text).toContain('docs/channels/matrix.md');
+  });
+
+  it('saves the homeserver URL and access token, with encryption on, once the live check passes', async () => {
+    const check = matrixPass();
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: check } });
+    const { env, saved, save } = recordingSaver();
+    const io = fakeIo({ confirm: [true, false], ask: ['https://matrix.example.org/', 'syt_an_access_token'] });
+
+    const result = await stepMatrixChannel(io, env, save);
+
+    expect(saved.MATRIX_HOMESERVER_URL).toBe('https://matrix.example.org');
+    expect(saved.MATRIX_ACCESS_TOKEN).toBe('syt_an_access_token');
+    expect(saved.MATRIX_E2EE).toBe('on');
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(check.mock.calls[0][0]).toMatchObject({ MATRIX_HOMESERVER_URL: 'https://matrix.example.org', MATRIX_ACCESS_TOKEN: 'syt_an_access_token' });
+    expect(result).toEqual({ matrix: true });
+    // The two things that bite later, said while the person is still here.
+    expect(log.text).toContain('MATRIX_STORAGE_DIR');
+    expect(log.text).toContain('REDIS_URL');
+  });
+
+  it('masks the access token but not the homeserver URL', async () => {
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+    const io = fakeIo({ confirm: [true, false], ask: ['https://matrix.example.org', 'syt_an_access_token'] });
+
+    await stepMatrixChannel(io, {}, () => {});
+
+    expect(io.asked.ask[0].secret).toBeFalsy(); // Homeserver URL
+    expect(io.asked.ask[1].secret).toBe(true); // Access token
+  });
+
+  it('rejects a homeserver address that is not a URL', async () => {
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+    const io = fakeIo({ confirm: [true, false], ask: ['matrix.example.org', 'syt_an_access_token'] });
+
+    await stepMatrixChannel(io, {}, () => {});
+
+    expect(io.validationFailures.some((f) => /https?:\/\//.test(f.reason))).toBe(true);
+  });
+
+  it('reads all three values from rumi-messenger\'s deploy/rumi-channel.env instead of asking for them', async () => {
+    const file = writeChannelEnv([
+      'MATRIX_HOMESERVER_URL=http://localhost:8008',
+      'MATRIX_ACCESS_TOKEN=syt_from_the_file',
+      'MATRIX_USER_ID=@rumi:localhost',
+    ]);
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+    const { env, saved, save } = recordingSaver();
+    const io = fakeIo({ confirm: [true, true], ask: [file] });
+
+    const result = await stepMatrixChannel(io, env, save);
+
+    expect(io.asked.ask).toHaveLength(1); // only the path, never the token
+    expect(io.asked.ask[0].label).toMatch(/rumi-channel\.env/);
+    expect(saved).toMatchObject({
+      MATRIX_HOMESERVER_URL: 'http://localhost:8008',
+      MATRIX_ACCESS_TOKEN: 'syt_from_the_file',
+      MATRIX_USER_ID: '@rumi:localhost',
+      MATRIX_E2EE: 'on',
+    });
+    expect(result).toEqual({ matrix: true });
+  });
+
+  it('rejects a rumi-channel.env path that is missing or has no access token in it', async () => {
+    const noToken = writeChannelEnv(['MATRIX_HOMESERVER_URL=http://localhost:8008']);
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+
+    const missing = fakeIo({ confirm: [true, true], ask: [path.join(os.tmpdir(), 'no-such-dir', 'rumi-channel.env')] });
+    await stepMatrixChannel(missing, {}, () => {});
+    expect(missing.validationFailures.some((f) => /no file/i.test(f.reason))).toBe(true);
+
+    const incomplete = fakeIo({ confirm: [true, true], ask: [noToken] });
+    await stepMatrixChannel(incomplete, {}, () => {});
+    expect(incomplete.validationFailures.some((f) => /MATRIX_ACCESS_TOKEN/.test(f.reason))).toBe(true);
+  });
+
+  it('reports why the live check failed and lets the user try again', async () => {
+    const check = jest.fn()
+      .mockResolvedValueOnce({ ok: false, detail: 'HTTP 401' })
+      .mockResolvedValueOnce({ ok: true, detail: 'connected as @rumi:example.org, end-to-end encrypted' });
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: check } });
+    const io = fakeIo({
+      confirm: [true, false, true, false], // connect, type values, [401] try again, type values
+      ask: ['https://matrix.example.org', 'syt_wrong', 'https://matrix.example.org', 'syt_right'],
+    });
+
+    const result = await stepMatrixChannel(io, {}, () => {});
+
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(log.text).toContain('HTTP 401');
+    expect(io.asked.confirm[2]).toBe('Try those values again?');
+    expect(result).toEqual({ matrix: true });
+  });
+
+  it('gives up cleanly if the user declines to retry after a failed check', async () => {
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: async () => ({ ok: false, detail: 'HTTP 401' }) } });
+    const io = fakeIo({ confirm: [true, false, false], ask: ['https://matrix.example.org', 'syt_wrong'] });
+
+    const result = await stepMatrixChannel(io, {}, () => {});
+
+    expect(result).toEqual({ matrix: false });
+  });
+
+  it('skips straight through when Matrix is already configured and still working', async () => {
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+    const env = { MATRIX_HOMESERVER_URL: 'https://matrix.example.org', MATRIX_ACCESS_TOKEN: 'syt_already_set' };
+    const io = fakeIo();
+
+    const result = await stepMatrixChannel(io, env, () => {});
+
+    expect(result).toEqual({ matrix: true });
+    expect(io.asked.confirm).toHaveLength(0); // never even asked about Matrix
+  });
+
+  // Encryption runs on the same Node 22 floor as everything else, so the step
+  // has no encryption question and always saves it as required.
+  it('never raises an encryption question, and saves encryption as required', async () => {
+    const { stepMatrixChannel } = loadWizard({ probes: { matrix: matrixPass() } });
+    const { env, saved, save } = recordingSaver();
+    const io = fakeIo({ confirm: [true, false], ask: ['https://matrix.example.org', 'syt_an_access_token'] });
+
+    await stepMatrixChannel(io, env, save);
+
+    expect(io.asked.select).toHaveLength(0);
+    expect(log.text).not.toMatch(/Node\s+24/);
+    expect(saved.MATRIX_E2EE).toBe('on');
+  });
+
+  describe('when the crypto module cannot load on this host', () => {
+    it('saves a working login without re-asking for it when only encryption is what blocks the channel', async () => {
+      const check = jest.fn().mockResolvedValue({
+        ok: false,
+        detail: 'connected as @rumi:example.org, but the channel will refuse to start: end-to-end encryption is required and its crypto module can\'t load',
+      });
+      const { stepMatrixChannel } = loadWizard({ probes: { matrix: check } });
+      const { env, saved, save } = recordingSaver();
+      const io = fakeIo({ confirm: [true, false], ask: ['https://matrix.example.org', 'syt_an_access_token'] });
+
+      const result = await stepMatrixChannel(io, env, save);
+
+      expect(check).toHaveBeenCalledTimes(1);
+      expect(io.asked.confirm).not.toContain('Try those values again?');
+      expect(saved.MATRIX_ACCESS_TOKEN).toBe('syt_an_access_token');
+      expect(result).toEqual({ matrix: false });
+      expect(log.text).toMatch(/MATRIX_E2EE=off/);
+    });
   });
 });
 

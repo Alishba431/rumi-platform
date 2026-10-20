@@ -157,5 +157,57 @@ class Shape(unittest.TestCase):
         self.assertEqual(m["registration"]["prev"]["active_week"], 380)
 
 
+OBSERVE_COLS = [("coaching_sessions", "observation_type"), ("coaching_sessions", "observer_user_id"),
+                ("coaching_sessions", "debrief_status")]
+# every query that reads a teacher's own coaching (counts, the score average, its trend, the domains)
+SELF_COACHING_TAGS = ("coach.daily", "coach.daily_by_unit", "coach.weekly", "coach.window",
+                      "coach.summary", "coach.score_trend", "coach.domains")
+
+
+class CoachObservationsStayOutOfTeacherCoaching(unittest.TestCase):
+    """A coach's observation is a coaching_sessions row filed under the observed teacher (user_id), status
+    'completed', and its overall_percentage is the COACH's rating. The observations panel reports those;
+    the teacher coaching panels (counts, the average score, its trend, the domains) and "active" must not."""
+
+    def run_pull(self, f, kind="daily"):
+        conn = FakeConn(canned())
+        pull.pull(conn, DAY, kind, Config(), f)
+        return conn
+
+    def all_sql(self, f):
+        daily, weekly = self.run_pull(f, "daily"), self.run_pull(f, "weekly")
+        return {tag: daily.sql_for(tag) + weekly.sql_for(tag) for tag in SELF_COACHING_TAGS + ("active.total",)}
+
+    def test_the_coaching_score_average_leaves_out_observation_rows(self):
+        sql = self.run_pull(feats(OBSERVE_COLS)).sql_for("coach.summary")
+        self.assertTrue(sql)
+        for q in sql:
+            self.assertIn("avg(", q)
+            self.assertIn("cs.observation_type IS NULL", q)
+
+    def test_every_teacher_coaching_query_leaves_out_observation_rows(self):
+        for tag, sqls in self.all_sql(feats(OBSERVE_COLS)).items():
+            if tag == "active.total":
+                continue
+            self.assertTrue(sqls, tag)
+            for q in sqls:
+                self.assertIn("cs.observation_type IS NULL", q, tag)
+
+    def test_being_observed_does_not_make_a_teacher_active(self):
+        for q in self.run_pull(feats(OBSERVE_COLS)).sql_for("active.total"):
+            self.assertIn("coaching_sessions.observation_type IS NULL", q)
+
+    def test_the_observations_panel_still_counts_observations(self):
+        for q in self.run_pull(feats(OBSERVE_COLS)).sql_for("obs.total"):
+            self.assertIn("cs.observation_type IS NOT NULL", q)
+
+    def test_a_database_without_the_observe_columns_gets_exactly_the_old_queries(self):
+        # an older deployment has no observation_type column: naming it would break every query
+        for tag, sqls in self.all_sql(feats()).items():
+            self.assertTrue(sqls, tag)
+            for q in sqls:
+                self.assertNotIn("observation_type", q, tag)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

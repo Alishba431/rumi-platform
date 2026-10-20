@@ -357,7 +357,8 @@
     }
   </style>
 
-  <script>
+  <script src="/js/escape-html.js"></script>
+  <script nonce="<%= cspNonce %>">
     // Scope state
     let currentScopeType = 'school';
     let countryCodes = [];
@@ -442,7 +443,7 @@
       }
 
       schoolSuggestions.innerHTML = suggestions.map(s =>
-        `<div class="px-3 py-2 hover:bg-gray-100 cursor-pointer text-sm" data-school="${s}">${s}</div>`
+        `<div class="px-3 py-2 hover:bg-gray-100 cursor-pointer text-sm" data-school="${escapeHtml(s)}">${escapeHtml(s)}</div>`
       ).join('');
 
       schoolSuggestions.querySelectorAll('[data-school]').forEach(el => {
@@ -509,13 +510,7 @@
 
       if (code && !combinedCountries.includes(code)) {
         combinedCountries.push(code);
-        updateChipList('combinedCountryList', combinedCountries, (c) => {
-          combinedCountries = combinedCountries.filter(x => x !== c);
-          updateChipList('combinedCountryList', combinedCountries, (c) => {
-            combinedCountries = combinedCountries.filter(x => x !== c);
-            updateChipList('combinedCountryList', combinedCountries, arguments.callee);
-          });
-        });
+        updateChipList('combinedCountryList', combinedCountries, removeCombinedCountry);
         input.value = '';
       }
     });
@@ -526,23 +521,35 @@
 
       if (school && !combinedSchools.includes(school)) {
         combinedSchools.push(school);
-        updateChipList('combinedSchoolList', combinedSchools, (s) => {
-          combinedSchools = combinedSchools.filter(x => x !== s);
-          updateChipList('combinedSchoolList', combinedSchools, arguments.callee);
-        });
+        updateChipList('combinedSchoolList', combinedSchools, removeCombinedSchool);
         input.value = '';
       }
     });
 
-    // Utility: Update chip list
+    function removeCombinedCountry(code) {
+      combinedCountries = combinedCountries.filter(x => x !== code);
+      updateChipList('combinedCountryList', combinedCountries, removeCombinedCountry);
+    }
+
+    function removeCombinedSchool(school) {
+      combinedSchools = combinedSchools.filter(x => x !== school);
+      updateChipList('combinedSchoolList', combinedSchools, removeCombinedSchool);
+    }
+
+    // Utility: Update chip list (built as DOM nodes: the values are user input)
     function updateChipList(listId, items, removeCallback) {
       const list = document.getElementById(listId);
-      list.innerHTML = items.map(item =>
-        `<span class="chip">
-          ${item}
-          <button type="button" onclick="this.parentElement.remove(); (${removeCallback.toString()})('${item}')">×</button>
-        </span>`
-      ).join('');
+      list.replaceChildren(...items.map(item => {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.append(document.createTextNode(item + ' '));
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.addEventListener('click', () => removeCallback(item));
+        chip.append(remove);
+        return chip;
+      }));
     }
 
     // Preview functionality
@@ -580,9 +587,9 @@
           document.getElementById('previewContent').innerHTML = result.users.map(u =>
             `<div class="p-2 border-b border-gray-100 flex justify-between items-center">
               <div>
-                <span class="font-medium">${u.phone_number}</span>
-                ${u.first_name ? ` - ${u.first_name}` : ''}
-                ${u.school_name ? ` <span class="text-gray-500">(${u.school_name})</span>` : ''}
+                <span class="font-medium">${escapeHtml(u.phone_number)}</span>
+                ${u.first_name ? ` - ${escapeHtml(u.first_name)}` : ''}
+                ${u.school_name ? ` <span class="text-gray-500">(${escapeHtml(u.school_name)})</span>` : ''}
               </div>
               <span class="text-xs px-2 py-0.5 rounded ${u.registration_completed ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}">
                 ${u.registration_completed ? 'Registered' : 'Unregistered'}

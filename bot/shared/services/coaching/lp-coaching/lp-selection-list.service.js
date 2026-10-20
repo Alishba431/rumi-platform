@@ -51,16 +51,16 @@ function buildLPSelectionList(coachingSessionId, recentLPs, language = 'en') {
     return {
       id: `lp_select_${lp.id}_${coachingSessionId}`,
       title: truncate(lp.topic || 'Untitled', 24),
-      description: truncate(`Grade ${lp.grade || '?'} • ${date}`, 72),
+      description: truncate([lp.grade ? `Grade ${lp.grade}` : null, date].filter(Boolean).join(' • '), 72),
     };
   });
 
-  // Options section: Upload new + No LP
+  // Options section: Upload or paste + No LP
   const optionRows = [
     {
       id: `lp_upload_${coachingSessionId}`,
-      title: isUrdu ? 'نیا اپلوڈ کریں' : 'Upload new',
-      description: isUrdu ? 'اپنا سبق کا منصوبہ بھیجیں' : 'Send your lesson plan document',
+      title: isUrdu ? 'نیا اپلوڈ کریں' : 'Upload or paste',
+      description: isUrdu ? 'اپنا سبق کا منصوبہ بھیجیں' : 'Send the plan as a document, or paste its text',
     },
     {
       id: `lp_none_${coachingSessionId}`,
@@ -74,7 +74,7 @@ function buildLPSelectionList(coachingSessionId, recentLPs, language = 'en') {
     body: {
       text: isUrdu
         ? 'کیا آپ اپنا حالیہ سبق کا منصوبہ منسلک کرنا چاہیں گے؟ درس کے تجزیے کو بہتر بنائے گا۔'
-        : 'Would you like to link a recent lesson plan? It improves the analysis.',
+        : 'Which lesson plan did you teach? I\'ll compare your lesson with it.',
     },
     footer: { text: isUrdu ? 'رومی ڈیجیٹل کوچ' : 'Rumi Digital Coach' },
     action: {

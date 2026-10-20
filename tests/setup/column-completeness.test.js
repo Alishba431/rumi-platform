@@ -46,6 +46,8 @@ const ALLOWLIST = {
   student_videos: ['onconflict'],
   quizzes: ['onconflict'],
   quiz_questions: ['onconflict'],
+  // Same artifact in staff-attendance.service.js markStaffDay: `.upsert(rows, { onConflict: 'teacher_id,date' })`.
+  teacher_attendance_records: ['onconflict'],
   // conversation_state is a coaching_sessions column mis-attributed to conversations
   // by chain proximity (parser artifact). (The stale context_data write was removed —
   // comprehension state lives in Redis, see redis-comprehension.service.)

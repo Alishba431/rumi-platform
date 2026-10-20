@@ -28,9 +28,13 @@ const { OPENAI_API_KEY } = require('../utils/constants');
 const STATUS = {
   PRESENT: 'present',
   ABSENT: 'absent',
+  LEAVE: 'leave',
   LATE: 'late',
   EXCUSED: 'excused'
 };
+
+// What a record may carry. A model reply outside this set falls back to the default.
+const RECORDED_STATUSES = [STATUS.PRESENT, STATUS.ABSENT, STATUS.LEAVE];
 
 // Urdu/English keywords for present/absent detection
 const PRESENT_KEYWORDS = {
@@ -39,8 +43,15 @@ const PRESENT_KEYWORDS = {
 };
 
 const ABSENT_KEYWORDS = {
-  urdu: ['غیر حاضر', 'غائب', 'ایبسنٹ', 'نہیں', 'نہیں آیا', 'نہیں آئی', 'چھٹی'],
-  english: ['absent', 'no', 'not here', 'missing', 'away', 'leave']
+  urdu: ['غیر حاضر', 'غائب', 'ایبسنٹ', 'نہیں', 'نہیں آیا', 'نہیں آئی'],
+  english: ['absent', 'no', 'not here', 'missing', 'away']
+};
+
+// Approved leave is its own status, not absence: filing it as absent misreports a
+// child (or a colleague) in the register the school keeps.
+const LEAVE_KEYWORDS = {
+  urdu: ['چھٹی', 'رخصت'],
+  english: ['leave', 'on leave', 'sick leave', 'chutti']
 };
 
 class VoiceAttendanceService {
@@ -162,20 +173,21 @@ class VoiceAttendanceService {
       messages: [
         {
           role: 'system',
-          content: `You are an attendance extraction assistant for Pakistani schools.
+          content: `You are an attendance extraction assistant for schools.
 Extract student names and their attendance status from the teacher's voice transcript.
 The teacher may speak in Urdu, English, or a mix (code-switching).
 
 IMPORTANT RULES:
 1. Match names to the provided student list (fuzzy matching allowed)
-2. Detect Urdu keywords: موجود/حاضر (present), غیر حاضر/غائب (absent)
-3. Detect English keywords: present, absent, here, missing
+2. Detect Urdu keywords: موجود/حاضر (present), غیر حاضر/غائب (absent), چھٹی/رخصت (leave)
+3. Detect English keywords: present, here (present); absent, missing (absent); on leave, sick leave (leave)
 4. If teacher says "X, Y, Z are absent", mark those as absent
 5. If teacher says "everyone except X is present", mark X as absent
 6. Use roll numbers if mentioned (e.g., "roll number 5 absent")
 7. Return ONLY mentioned students - don't assume status for unmentioned ones
+8. Approved leave is "leave", never "absent"
 
-Return JSON array: [{"name": "...", "status": "present|absent", "confidence": 0.0-1.0}]`
+Return JSON array: [{"name": "...", "status": "present|absent|leave", "confidence": 0.0-1.0}]`
         },
         {
           role: 'user',
@@ -220,11 +232,13 @@ ${studentNames}
 ATTENDANCE KEYWORDS:
 - Present (Urdu): موجود, حاضر, پریزنٹ, ہاں, جی
 - Absent (Urdu): غیر حاضر, غائب, ایبسنٹ, نہیں
+- Leave (Urdu): چھٹی, رخصت
 - Present (English): present, yes, here
-- Absent (English): absent, no, missing, leave
+- Absent (English): absent, no, missing
+- Leave (English): on leave, sick leave
 
 Extract attendance from the transcript. Return JSON:
-{"attendance": [{"name": "StudentName", "status": "present|absent", "confidence": 0.0-1.0}]}`;
+{"attendance": [{"name": "StudentName", "status": "present|absent|leave", "confidence": 0.0-1.0}]}`;
   }
 
   /**
@@ -303,12 +317,25 @@ Extract attendance from the transcript. Return JSON:
    * contain present words (e.g., "غیر حاضر" contains "حاضر", "not here" contains "here")
    *
    * @param {string} keyword - The keyword to parse
-   * @returns {string|null} 'present', 'absent', or null
+   * Leave is checked before both: "sick leave" is neither absence nor presence.
+   *
+   * @returns {string|null} 'present', 'absent', 'leave', or null
    */
   static parseAttendanceKeyword(keyword) {
     if (!keyword) return null;
 
     const normalizedKeyword = keyword.toLowerCase().trim();
+
+    for (const kw of LEAVE_KEYWORDS.urdu) {
+      if (keyword.includes(kw)) {
+        return STATUS.LEAVE;
+      }
+    }
+    for (const kw of LEAVE_KEYWORDS.english) {
+      if (normalizedKeyword === kw || normalizedKeyword.includes(kw)) {
+        return STATUS.LEAVE;
+      }
+    }
 
     // Check ABSENT keywords FIRST (they may contain present substrings)
     // e.g., "غیر حاضر" contains "حاضر", "not here" contains "here"
@@ -359,6 +386,7 @@ Extract attendance from the transcript. Return JSON:
     // Build a map of extracted names to status
     const extractedMap = new Map();
     for (const item of extractedAttendance) {
+      if (!item || !item.name || !RECORDED_STATUSES.includes(item.status)) continue;
       const normalizedName = item.name.toLowerCase().trim();
       extractedMap.set(normalizedName, {
         status: item.status,
@@ -438,6 +466,7 @@ Extract attendance from the transcript. Return JSON:
     const total = records.length;
     const present = records.filter(r => r.status === STATUS.PRESENT).length;
     const absent = records.filter(r => r.status === STATUS.ABSENT).length;
+    const leave = records.filter(r => r.status === STATUS.LEAVE).length;
     const late = records.filter(r => r.status === STATUS.LATE).length;
     const excused = records.filter(r => r.status === STATUS.EXCUSED).length;
 
@@ -445,6 +474,7 @@ Extract attendance from the transcript. Return JSON:
       total,
       present,
       absent,
+      leave,
       late,
       excused,
       attendancePercentage: total > 0 ? (present / total) * 100 : 0
@@ -456,5 +486,6 @@ Extract attendance from the transcript. Return JSON:
 VoiceAttendanceService.STATUS = STATUS;
 VoiceAttendanceService.PRESENT_KEYWORDS = PRESENT_KEYWORDS;
 VoiceAttendanceService.ABSENT_KEYWORDS = ABSENT_KEYWORDS;
+VoiceAttendanceService.LEAVE_KEYWORDS = LEAVE_KEYWORDS;
 
 module.exports = VoiceAttendanceService;

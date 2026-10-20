@@ -6,6 +6,10 @@
  *   - service_role cannot CREATE in public (42501) without SECURITY DEFINER
  *   - service_role cannot CREATE EXTENSION without OWNER postgres
  * search_path must include 'extensions' because uuid-ossp lives there.
+ * The REVOKE is not optional either: the function runs any SQL as postgres,
+ * Postgres grants EXECUTE on a new function to PUBLIC, and Supabase grants it
+ * to anon and authenticated. Without it, anyone with the project URL and the
+ * anon key could call /rest/v1/rpc/exec_sql.
  * GRANT + NOTIFY make PostgREST see the function after the schema cache clears.
  */
 
@@ -18,6 +22,7 @@ const EXEC_SQL_DEFINITION = [
   'as $$ begin execute query; end; $$;',
   '',
   'alter function public.exec_sql(text) owner to postgres;',
+  'revoke execute on function public.exec_sql(text) from public, anon, authenticated;',
   'grant execute on function public.exec_sql(text) to service_role;',
   "notify pgrst, 'reload schema';",
 ];

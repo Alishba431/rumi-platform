@@ -1,0 +1,148 @@
+# 🖥️ Teacher portal sign-in
+
+> Teachers and coaches sign in to the portal with their phone number and a password. The setup link and the
+> password reset code reach them in their own chat with Rumi, on WhatsApp or on Rumi Messenger.
+
+## What it is
+
+The teacher portal (`portal/`, served by the dashboard) shows a teacher their lesson plans, coaching reports,
+reading results and videos, and shows a coach their observations. Sign-in is a phone number and a password:
+
+- **Setting a password.** Rumi sends a one-time setup link (valid 7 days). The teacher opens it and chooses a
+  password. The link comes when they type `/portal`, at the end of registration, or (for coaches) when the partner
+  sends it from the roster.
+- **Forgot password.** The teacher types their number on the portal's reset page and gets a 6-digit code (valid
+  10 minutes, single use), then chooses a new password. After 5 wrong tries the code stops working, even the
+  right digits, and they ask for a new one once the 10 minutes are up.
+
+Both messages go to the person's **own channel**: where they last talked to Rumi, as recorded in
+`user_channels`. A teacher on WhatsApp gets them on WhatsApp, exactly as before. A teacher who uses only
+[Rumi Messenger](../channels/matrix.md) gets them in their Matrix DM, including on a deployment with no
+WhatsApp at all (`CHANNEL_DRIVER=none`).
+
+## How it works
+
+1. **`/portal`** in any chat. If the portal is already set up, Rumi replies with the sign-in link. Otherwise
+   it mints a setup token and sends the link, through the messaging facade, to the identity the teacher wrote
+   from. Off WhatsApp the message also says which number to sign in with (`+15550100001`), since it is not the
+   address they chat on.
+2. **The setup page** sets the password and signs them in.
+3. **The reset page** posts the number to `/api/portal/request-reset`. The dashboard finds the account, stores
+   a code and asks the bot (`POST /api/internal/send-password-reset`, with `INTERNAL_API_KEY`) to send it to
+   that user. The bot sends it to the user's channel identity, not to the typed number. Every answer the page
+   shows is the same generic one, so the page does not reveal which numbers have accounts, and an unknown
+   number gets nothing sent.
+4. **Coaches** (anyone in the observe role family, with `OBSERVE_ENABLED=true`) see an **Observations** item
+   after signing in. Their invite says so.
+
+## Who can sign in
+
+The portal signs in by **phone number** (`users.phone_number`), so a person needs one on file:
+
+| Person | Phone number on file | Portal |
+|---|---|---|
+| WhatsApp teacher | their WhatsApp number | as before |
+| Rumi Messenger teacher, username `@+15550100001` | `15550100001`, recorded from the username when they first write | link and code in their Matrix DM |
+| Coach put on the roster as `mtx:15550100011`, has not written yet | recorded from the roster identity when the invite is sent | `observe-roster.js portal-invite`, link in their Matrix DM |
+| Rumi Messenger username that is a name (`@robin:example.org`), or a Slack/Discord account | none | `/portal` explains this and sends no link (see below) |
+
+A number is only recorded when no other user already holds it.
+
+**No phone number.** A setup link would let them choose a password they can never sign in with, so Rumi sends
+no link. `/portal` replies: *"The portal signs you in with your phone number, and this chat account doesn't
+have one on file, so a portal link wouldn't let you in. Ask your administrator to add your phone number to your
+Rumi account, then send /portal again."* Registration ends with the welcome but no portal link. To give them
+access, an operator records the number on their row:
+
+```sql
+update users set phone_number = '15550100051' where id = '<their users.id>';
+```
+
+After that, `/portal` sends the link and the reset code still reaches the account they chat on (their Matrix DM,
+Slack or Discord). Messenger usernames that are phone numbers (`@+15550100001`) need none of this, and
+rumi-messenger creates accounts that way.
+
+## Turn it on
+
+The portal is optional. With `PORTAL_URL` unset, no message carries a portal link.
+
+1. **Build the portal** and give it to the dashboard, which serves it next to its API:
+   `cd portal && npm ci && npm run build && cp -R dist ../dashboard/portal-frontend/dist`.
+2. **Run the dashboard** (`node dashboard/index.js`) on an `https://` address: the session cookie is
+   `Secure`, so the portal cannot keep anyone signed in over plain http. Behind a proxy that terminates TLS,
+   the dashboard trusts its `X-Forwarded-Proto`.
+3. **Set the variables**:
+
+| Variable | Service | Meaning |
+|---|---|---|
+| `PORTAL_URL` | bot | The dashboard's public address; links are `<PORTAL_URL>/portal/setup/<token>` |
+| `MAIN_BOT_URL` | dashboard | Where the dashboard reaches the bot, to send reset codes |
+| `INTERNAL_API_KEY` | bot **and** dashboard | The same random secret on both. **Required for reset codes:** the bot refuses every internal send while it is unset |
+| `SESSION_SECRET` | dashboard | Signs the portal session |
+| `PORTAL_RESET_CODE_MAX_ATTEMPTS` | dashboard | Optional. Wrong tries one reset code allows before it is cleared (default 5) |
+| `PORTAL_*_LIMIT_*`, `PORTAL_AUTH_LIMIT_WINDOW_MINUTES` | dashboard | Optional. Sign-in limits per IP and per phone number ([sign-in limits](#sign-in-limits)) |
+| `REDIS_URL` | dashboard | Optional. Shares the sign-in limit counts across workers and replicas |
+| `OBSERVE_ENABLED=true` | bot **and** dashboard | The bot's decides whether a coach's invite mentions Observations; the dashboard's shows them the view (see [Observe](observe.md)). Set it on both |
+
+4. **Coaches** on the observe roster can be sent their invite from the roster, on whichever channel they use:
+
+```bash
+node bot/scripts/observe-roster.js portal-invite mtx:15550100011
+# ✓ portal invite sent to mtx:15550100011
+```
+
+   It runs as a one-off process; on Rumi Messenger the message goes through the bot's
+   [relay](../channels/matrix.md#the-relay), so the bot must be running. It refuses a number or identity Rumi has
+   no account for, someone who has already set up the portal, and someone with no phone number.
+
+## Sign-in limits
+
+Sign-in, setup and the reset steps are public, so each is limited per client IP and, where the request names an
+account, per phone number. Either limit answers `429` with one message, "Too many attempts. Please try again
+later.", whatever the reason and whether or not the account exists; the portal shows it under the form.
+
+| Route | Per IP | Per phone number |
+|---|---|---|
+| `POST /api/portal/login` (failed sign-ins only) | `PORTAL_LOGIN_LIMIT_PER_IP` (10) | `PORTAL_LOGIN_LIMIT_PER_ACCOUNT` (5) |
+| `POST /api/portal/request-reset` | `PORTAL_RESET_LIMIT_PER_IP` (5) | `PORTAL_RESET_LIMIT_PER_ACCOUNT` (5) |
+| `POST /api/portal/verify-reset-code` | `PORTAL_RESET_LIMIT_PER_IP` (5) | `PORTAL_RESET_LIMIT_PER_ACCOUNT` (5) |
+| `POST /api/portal/reset-password` | `PORTAL_RESET_LIMIT_PER_IP` (5) | (needs a verified code in the session) |
+| `POST /api/portal/setup`, `/validate-token` | `PORTAL_SETUP_LIMIT_PER_IP` (10) | (the invite token is the secret) |
+
+- Every window is `PORTAL_AUTH_LIMIT_WINDOW_MINUTES` (15). On top of these, every `/api/portal` request counts
+  toward `PORTAL_DATA_LIMIT_PER_MINUTE` (300 per IP per minute).
+- With `REDIS_URL` set, the counts live in Redis (keys `rl:portal:*`), so every cluster worker and replica shares
+  them; a phone number appears there only as an HMAC keyed with `SESSION_SECRET`. Without Redis, or while it is
+  down, each process counts in memory and no request fails because of it.
+- Each step is counted on its own and by route, so `/login`, `/login/` and `/LOGIN` share one count.
+- Without Redis, or while it is down, each cluster worker and replica counts on its own, so the limits above are
+  multiplied by the number of processes: up to 4× on one dashboard with the default cluster (one worker per CPU,
+  at most 4, unless `CLUSTER_WORKERS` is set), more with replicas. The reset-code tries are counted in the
+  database and are not affected.
+- The per-IP count uses the client address, which depends on what sits in front of the dashboard. Set it to match:
+
+  | In front of the dashboard | Set |
+  |---|---|
+  | Nothing (reached directly) | `TRUST_PROXY=false` |
+  | One Caddy or nginx you run | nothing (`TRUST_PROXY=1`, the default) |
+  | Railway | `PORTAL_CLIENT_IP_HEADER=x-real-ip` |
+  | Railway plus your own edge proxy | `PORTAL_CLIENT_IP_HEADER=x-real-ip` if the edge passes it on, else `TRUST_PROXY=2` |
+  | Cloudflare (dashboard reachable only through it) | `PORTAL_CLIENT_IP_HEADER=cf-connecting-ip` |
+
+  `TRUST_PROXY` takes a hop count (`1` to `10`), `false`/`0`, or the proxies' addresses (`loopback, 10.0.0.0/8`);
+  `true` and anything else invalid mean `1`, with a warning. `PORTAL_CLIENT_IP_HEADER` is used only when its first
+  value is a valid IP; set it only when the proxy always overwrites that header, or a client picks its own
+  address. Both also apply to the `/api/portal` limit and the admin sign-in. Details and the reasons:
+  [running in public](../running-in-public.md#which-address-counts-as-the-client).
+- Anyone who knows a teacher's number can use up its 5 failed sign-ins and lock that number's sign-in for one
+  window (15 minutes). That is the price of a per-account limit; the teacher can still reset their password.
+- Reset codes come from `crypto.randomInt`. Each code allows `PORTAL_RESET_CODE_MAX_ATTEMPTS` (5) wrong tries; then
+  it is cleared, and a new one can be requested once the old one's 10 minutes are up. Codes are never logged.
+  This needs the column added by `V2.11.2__portal_reset_attempts.sql` (see [pulling updates](../pulling-updates.md)).
+
+## Limits
+
+- Sign-in is by phone number only; there is no sign-in with a Matrix, Slack or Discord identity.
+- The reset code goes to the channel the person last used. Someone on both WhatsApp and Rumi Messenger gets it
+  on the one they used most recently.
+- The portal's own pages are in English.

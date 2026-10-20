@@ -24,6 +24,7 @@
 const { checkQuizReadiness } = require('./quiz-readiness.service');
 const RedisService = require('../cache/railway-redis.service');
 const WhatsAppService = require('../whatsapp.service');
+const { nativeFlowIdFor } = require('../messaging/channel-capabilities');
 const supabase = require('../../config/supabase');
 const { logToFile } = require('../../utils/logger');
 
@@ -118,7 +119,7 @@ async function _readPendingIntent(userId) {
  * old deployments).
  */
 async function _openQuizManagerFlow(user, from, topic) {
-  const { QUIZ_FLOW_ID } = require('../../utils/constants');
+  const QUIZ_FLOW_ID = nativeFlowIdFor(from, require('../../utils/constants').QUIZ_FLOW_ID);
   if (!QUIZ_FLOW_ID) {
     await WhatsAppService.sendMessage(from,
       `Sorry, the quiz feature isn't fully configured here. Please try /quiz manually.`);
@@ -155,7 +156,7 @@ async function _openAddClassFlow(user, from) {
 }
 
 async function _openEditClassFlow(user, from, cls, focus) {
-  const { EDIT_CLASS_FLOW_ID } = require('../../utils/constants');
+  const EDIT_CLASS_FLOW_ID = nativeFlowIdFor(from, require('../../utils/constants').EDIT_CLASS_FLOW_ID);
   if (!EDIT_CLASS_FLOW_ID) {
     await WhatsAppService.sendMessage(from, "Sorry, class editing isn't available right now.");
     return;

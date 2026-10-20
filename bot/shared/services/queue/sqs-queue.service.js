@@ -21,6 +21,7 @@ const AWS = require('aws-sdk');
 const { logToFile } = require('../../utils/logger');
 const RedisService = require('../cache/railway-redis.service');
 const { getCurrentCorrelationId, logEvent } = require('../../utils/structured-logger');
+const { dedupVariant } = require('./dedup-variant');
 
 class SQSQueueService {
   constructor() {
@@ -66,8 +67,12 @@ class SQSQueueService {
         throw new Error('SQS Queue not configured');
       }
 
-      // Check Redis for duplicate job (idempotency check)
-      const idempotencyKey = `${this.JOB_PREFIX}${sessionId}:${jobType}`;
+      // Check Redis for duplicate job (idempotency check). A job that runs more
+      // than once per session on purpose (a report preview, then its delivery;
+      // a re-recorded debrief) carries a phase / nonce, and that is part of its
+      // identity — otherwise the second run is dropped as a "duplicate".
+      const variant = dedupVariant(payload);
+      const idempotencyKey = `${this.JOB_PREFIX}${sessionId}:${jobType}${variant ? `:${variant}` : ''}`;
 
       try {
         const existingMessageId = await RedisService.get(idempotencyKey);
@@ -109,7 +114,7 @@ class SQSQueueService {
 
         // FIFO queue parameters
         MessageGroupId: sessionId,  // Ensures all jobs for a session are processed in order
-        MessageDeduplicationId: `${sessionId}-${jobType}`,  // Stable deduplication ID (no timestamp)
+        MessageDeduplicationId: `${sessionId}-${jobType}${variant ? `-${variant}` : ''}`,  // Stable deduplication ID (no timestamp)
 
         // Message attributes for filtering/monitoring
         MessageAttributes: {
@@ -784,6 +789,14 @@ class SQSQueueService {
       // FIFO requires both MessageGroupId and MessageDeduplicationId; rejects DelaySeconds.
       params.MessageGroupId = groupId;
       params.MessageDeduplicationId = deduplicationId;
+      // A quiz job asking for a delay landed here because SQS_QUIZ_QUEUE_URL is
+      // unset. FIFO drops the delay, so the job arrives at once; say so rather
+      // than let a "later" job run now without a trace.
+      if (isQuizJob && opts.delaySeconds && opts.delaySeconds > 0) {
+        logToFile('⚠️ Quiz job delay not honoured: FIFO queue (set SQS_QUIZ_QUEUE_URL to a Standard queue)', {
+          groupId, jobType, delaySeconds: opts.delaySeconds,
+        }, 'warn');
+      }
     } else {
       // Standard queue: supports per-message DelaySeconds; no FIFO params.
       if (opts.delaySeconds && opts.delaySeconds > 0) {
@@ -811,6 +824,21 @@ class SQSQueueService {
     }
 
     return result.MessageId;
+  }
+
+  /**
+   * Does the queue a job of this type lands on honour DelaySeconds? False when
+   * a quiz job falls back to a FIFO main queue (SQS_QUIZ_QUEUE_URL unset).
+   * A job that re-queues itself to wait must not hop on such a queue: every
+   * hop would come back at once, a tight loop until the target time.
+   *
+   * @param {string} jobType
+   * @returns {boolean}
+   */
+  honoursDelay(jobType) {
+    const isQuizJob = Boolean(jobType && jobType.startsWith('quiz_'));
+    const queueUrl = isQuizJob ? (this.quizQueueUrl || this.queueUrl) : this.queueUrl;
+    return Boolean(queueUrl) && !queueUrl.endsWith('.fifo');
   }
 
   /**

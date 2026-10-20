@@ -46,6 +46,10 @@ function stubChain({ sessions, answers, questions }) {
       select: () => chain,
       eq: () => chain,
       in: () => chain,
+      is: () => chain,
+      not: () => chain,
+      order: () => chain,
+      limit: () => chain,
       then: (resolve) => resolve({ data: result, error: null }),
     };
     return chain;

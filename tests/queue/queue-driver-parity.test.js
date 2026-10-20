@@ -6,6 +6,8 @@
  * between the two backends, so it is the highest-value test in the phase.
  */
 
+const { mockBotDependency } = require('../_helpers/mock-bot-dependency');
+
 // The contract every consumer relies on (grepped from bot/ call sites).
 const REQUIRED_METHODS = [
   // producers
@@ -22,9 +24,9 @@ const REQUIRED_METHODS = [
 
 function loadBoth() {
   jest.resetModules();
-  jest.doMock('aws-sdk', () => ({ config: { update: jest.fn() }, SQS: jest.fn(() => ({})) }), { virtual: true });
+  mockBotDependency('aws-sdk', () => ({ config: { update: jest.fn() }, SQS: jest.fn(() => ({})) }));
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
-  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: jest.fn() }), { virtual: true });
+  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: jest.fn() }));
   jest.doMock('../../bot/shared/utils/structured-logger', () => ({ getCurrentCorrelationId: () => 'c1', logEvent: jest.fn() }));
   return {
     sqs: require('../../bot/shared/services/queue/sqs-queue.service'),

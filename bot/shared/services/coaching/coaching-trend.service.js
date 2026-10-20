@@ -18,6 +18,7 @@
 
 const supabase = require('../../config/supabase');
 const { logToFile } = require('../../utils/logger');
+const { ownCoaching } = require('./own-coaching');
 
 const DEFAULT_LIMIT = 10;
 
@@ -76,11 +77,11 @@ async function loadTrendData(userId, opts = {}) {
     // teacher with a long history yields a stale, frozen sparkline. Order DESC
     // so the DB returns the newest N, then reverse() below to get ascending
     // (oldest→newest) for left-to-right plotting.
-    const { data, error } = await supabase
+    const { data, error } = await ownCoaching(supabase
       .from('coaching_sessions')
       .select('id, created_at, analysis_data')
       .eq('user_id', userId)
-      .eq('status', 'completed')
+      .eq('status', 'completed')) // never a coach's observation of this teacher: its score is the coach's rating
       .order('created_at', { ascending: false })
       .limit(limit);
 

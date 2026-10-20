@@ -1,0 +1,71 @@
+[00:00] Teacher (EN): Good morning, everyone. Pencils down and eyes on me, please. Let's warm up. If I cut a sandwich into two equal pieces and eat one piece, what fraction did I eat?
+
+[00:12] Student (EN): One half!
+
+[00:14] Teacher (EN): Well done. And if I cut it into four equal pieces and eat one?
+
+[00:20] Student (EN): One quarter.
+
+[00:22] Teacher (EN): Yes. Sam, which is bigger, one half or one quarter?
+
+[00:27] Student 2 (EN): One half, because when you cut it into two, the pieces are bigger than when you cut it into four.
+
+[00:34] Teacher (EN): Exactly. Fewer equal parts means bigger parts. Look at the board. Our objective today: we will add fractions with the same denominator. Read it with me.
+
+[00:45] Student (EN): We will add fractions with the same denominator.
+
+[00:49] Teacher (EN): Lovely. Today we won't use paper strips. Instead, look at this number line I've drawn on the board, from zero to one. I've split it into five equal jumps, so each jump is one fifth.
+
+[01:03] Teacher (EN): I start at zero and make one jump. That's one fifth. Now I make two more jumps. Where have I landed? Count the jumps with me.
+
+[01:14] Student (EN): Three fifths!
+
+[01:16] Teacher (EN): Three fifths. One fifth plus two fifths is three fifths. The jumps stay the same size, they're still fifths, we just made more of them.
+
+[01:26] Teacher (EN): Now, someone once told me one fifth plus two fifths is three tenths. Ayo, look at the number line. Did it suddenly get ten jumps?
+
+[01:36] Student 3 (EN): No, it still has five jumps. They are the same size as before.
+
+[01:42] Teacher (EN): Right. The denominator tells us the size of each jump, and that doesn't change, so we never add the denominators.
+
+[01:51] Teacher (EN): Watch me write it. One fifth plus two fifths. Step one, check the denominators match: five and five. Step two, add the numerators: three. Step three, keep the denominator. Three fifths.
+
+[02:03] Teacher (EN): Let's do some together. Two eighths plus three eighths. Are the denominators the same?
+
+[02:09] Student (EN): Yes! Five eighths.
+
+[02:11] Teacher (EN): Good. Next: one sixth plus four sixths. Everyone?
+
+[02:16] Student (EN): Five sixths.
+
+[02:18] Teacher (EN): Sam, how did you know?
+
+[02:21] Student 2 (EN): One plus four is five, and it stays sixths.
+
+[02:25] Teacher (EN): Perfect. Now work with your partner. Draw a number line from zero to one in your book for each problem on the card: two sevenths plus three sevenths, one quarter plus two quarters, three tenths plus four tenths. Mark the equal jumps, then hop along to find the answer. Three minutes.
+
+[02:45] Student 3 (EN): We got five sevenths for the first one, because two plus three is five.
+
+[02:50] Student (EN): Teacher, is three quarters right for the second one?
+
+[02:55] Teacher (EN): Show me your jumps. One quarter, then two more... yes, you landed on three quarters. Well done, both of you.
+
+[03:04] Teacher (EN): Time's up. Swap books with the pair behind you. Check their number lines and answers. Tick if you agree, talk to them if you don't.
+
+[03:14] Student 3 (EN): They wrote seven twentieths for the last one. I think they added the bottom numbers.
+
+[03:20] Teacher (EN): They added the denominators. Help them fix it. Good. Now, mini whiteboards. Write three ninths plus four ninths. Show me in three, two, one, show!
+
+[03:30] Student (EN): Seven ninths!
+
+[03:33] Teacher (EN): Lots of seven ninths. Thumbs up if you feel confident, sideways if you're nearly there. Mostly thumbs up, great.
+
+[03:41] Teacher (EN): Who can tell me today's rule in one sentence?
+
+[03:45] Student 2 (EN): When the denominators are the same, add the numerators and keep the denominator.
+
+[03:51] Teacher (EN): Brilliant. Now your exit ticket: one question each. Two sixths plus three sixths. Write your name and answer on the slip, then pass it forward.
+
+[04:01] Teacher (EN): Thank you, I have everyone's slip.
+
+[04:05] Teacher (EN): Homework is in your workbook, page forty-two, questions one to five. And if you finish early, make up your own story problem that adds two fractions with the same denominator. Well done today.

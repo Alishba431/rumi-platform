@@ -75,7 +75,7 @@ describe('handleMarkingExchange', () => {
       expect.objectContaining({ studentId: 's1', status: 'present' }),
       expect.objectContaining({ studentId: 's2', status: 'absent' }),
     ]);
-    expect(result.data.stats).toEqual({ total: 2, present: 1, absent: 1, attendanceRate: '50.00%' });
+    expect(result.data.stats).toEqual({ total: 2, present: 1, absent: 1, leave: 0, attendanceRate: '50.00%' });
     expect(result.data.success_message).toContain('Grade 3 - A');
     expect(result.data.selectedListId).toBe('list-1');
   });
@@ -83,7 +83,7 @@ describe('handleMarkingExchange', () => {
   it('treats an empty absent list as everyone present', async () => {
     mockConversationService.getSessionState.mockResolvedValue(sessionState);
     const result = await endpoint.handleMarkingExchange('u1', 'MARK_ABSENT', { absent_student_ids: [] });
-    expect(result.data.stats).toEqual({ total: 2, present: 2, absent: 0, attendanceRate: '100%' });
+    expect(result.data.stats).toEqual({ total: 2, present: 2, absent: 0, leave: 0, attendanceRate: '100%' });
   });
 
   it('rejects an unknown screen', async () => {

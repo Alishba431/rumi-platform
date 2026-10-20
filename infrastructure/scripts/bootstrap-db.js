@@ -14,9 +14,8 @@ const { EXEC_SQL_SQL, describeExecSqlFailure } = require('./exec-sql-helper');
  * Every file is idempotent (CREATE … IF NOT EXISTS / CREATE OR REPLACE /
  * ON CONFLICT DO NOTHING), so re-running bootstrap on an existing DB is safe.
  *
- * SQL execution uses the same `exec_sql` RPC as migrate.js:
- *   CREATE OR REPLACE FUNCTION exec_sql(query TEXT)
- *   RETURNS VOID AS $$ BEGIN EXECUTE query; END; $$ LANGUAGE plpgsql;
+ * SQL execution uses the same `exec_sql` RPC as migrate.js. Its one-time
+ * definition (service_role only) is in exec-sql-helper.js.
  *
  * Stops at the first failure — RLS and seed must not run against a schema that
  * didn't apply.

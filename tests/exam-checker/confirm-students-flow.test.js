@@ -111,3 +111,61 @@ describe('orchestrator.handleStudentConfirmation — id→object mapping', () =>
     expect(confirmedPatch.confirmed_students).toHaveLength(3);
   });
 });
+
+describe('orchestrator.handleOCRProcessing — which channel gets the confirm Flow', () => {
+  const ORIG_FLOW = process.env.EXAM_CHECKER_STUDENTS_FLOW_ID;
+  const ORIG_DRIVER = process.env.CHANNEL_DRIVER;
+  beforeEach(() => {
+    jest.resetModules();
+    process.env.EXAM_CHECKER_STUDENTS_FLOW_ID = 'flow_confirm_test';
+    process.env.CHANNEL_DRIVER = 'meta';
+  });
+  afterEach(() => {
+    if (ORIG_FLOW === undefined) delete process.env.EXAM_CHECKER_STUDENTS_FLOW_ID;
+    else process.env.EXAM_CHECKER_STUDENTS_FLOW_ID = ORIG_FLOW;
+    if (ORIG_DRIVER === undefined) delete process.env.CHANNEL_DRIVER;
+    else process.env.CHANNEL_DRIVER = ORIG_DRIVER;
+  });
+
+  function load() {
+    jest.doMock('../../bot/shared/config/supabase', () => ({ from: jest.fn() }));
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const updates = [];
+    jest.doMock('../../bot/shared/services/exam-checker/exam-session.service', () => ({
+      update: jest.fn(async (id, patch) => { updates.push(patch); }),
+      updateStatus: jest.fn(async () => {}),
+    }));
+    jest.doMock('../../bot/shared/services/exam-checker/ocr.service', () => ({
+      extractBatch: jest.fn(async () => ({ provider: 'test', averageConfidence: 0.9, results: [] })),
+    }));
+    jest.doMock('../../bot/shared/services/exam-checker/question-detector.service', () => ({
+      analyze: jest.fn(async () => ({ students: DETECTED, questions: [] })),
+    }));
+    const mod = require('../../bot/shared/services/exam-checker/exam-checker.orchestrator');
+    const orch = mod.ExamCheckerOrchestrator || mod;
+    orch.handleQuestionDetection = jest.fn(async () => ({ text: 'questions next' }));
+    return { orch, updates };
+  }
+
+  it('offers the confirm Flow to a WhatsApp teacher on Meta', async () => {
+    const { orch } = load();
+    const res = await orch.handleOCRProcessing({ id: 'sess-1', original_images: [], recipient_identifier: '15550100001' }, 'u1');
+    expect(res.flow).toEqual(expect.objectContaining({ id: 'flow_confirm_test', flowToken: 'sess-1' }));
+  });
+
+  it('keeps the Flow for Slack/Discord, which open it as a modal', async () => {
+    const { orch } = load();
+    const res = await orch.handleOCRProcessing({ id: 'sess-1', original_images: [], recipient_identifier: 'slack:U0123ABC' }, 'u1');
+    expect(res.flow).toBeDefined();
+  });
+
+  // A Matrix teacher used to get silence after OCR: the Flow came back from
+  // here, sendFlow() returned false on Matrix, and nothing else was sent.
+  it('auto-confirms the detected students for a Matrix teacher even when the Flow id is set', async () => {
+    const { orch, updates } = load();
+    const res = await orch.handleOCRProcessing({ id: 'sess-1', original_images: [], recipient_identifier: 'mtx:15550100001' }, 'u1');
+    expect(res.flow).toBeUndefined();
+    expect(res).toEqual({ text: 'questions next' });
+    expect(updates.find((u) => u.confirmed_students).confirmed_students).toHaveLength(3);
+  });
+});

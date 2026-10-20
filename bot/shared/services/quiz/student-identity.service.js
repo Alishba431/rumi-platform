@@ -36,15 +36,39 @@ const CLASS_MAX = 40;
  * One handset, one key.
  *
  * Children arrive on whatever their parent's phone is saved as, so the same
- * number reaches us as `+92 300 1234567`, `03001234567` and `923001234567`
- * depending on the handset. Without this they would be three different children.
- * Same normalisation the rest of the bot uses for PK numbers.
+ * number can reach us as `+1 555 010 0123`, `0015550100123` or, in a local
+ * format, with a leading trunk `0`. Without this they would be different
+ * children. A leading `00` is the international prefix and is dropped; a single
+ * leading `0` becomes the deployment's DEFAULT_PHONE_COUNTRY_CODE when one is
+ * set — the same rule utils/phone-validation.js applies to teachers' numbers.
+ *
+ * A sender that is NOT a phone number (`slack:U01AB2CDE3`, `discord:<id>`,
+ * `matrix:@user:server`, `mtx:<id>`) keys on its full prefixed id. Digits only
+ * would make two Slack users one child — greeted by the other's name and filed
+ * under them — and give a Matrix user no key at all.
  */
+const PHONE_CHANNEL_PREFIX = /^(?:whatsapp|baileys|wa|tel|sms):/i;
+const WHATSAPP_JID_SUFFIX = /@(?:s\.whatsapp\.net|c\.us)$/i;
+const PHONE_SHAPED = /^[+\d\s().-]*\d[+\d\s().-]*$/;
+const CHANNEL_ID_MAX = 255;
+
+function isPhoneShaped(id) {
+  const bare = id.replace(PHONE_CHANNEL_PREFIX, '').replace(WHATSAPP_JID_SUFFIX, '').trim();
+  return PHONE_SHAPED.test(bare);
+}
+
 function normalisePhone(phone) {
-  let d = String(phone || '').replace(/\D/g, '');
+  const raw = String(phone || '').trim();
+  if (!raw) return '';
+  if (!isPhoneShaped(raw)) return raw.slice(0, CHANNEL_ID_MAX);
+  let d = raw.replace(/\D/g, '');
   if (!d) return '';
-  if (d.startsWith('0')) d = `92${d.slice(1)}`;
-  else if (d.startsWith('3') && d.length === 10) d = `92${d}`;
+  if (d.startsWith('00')) {
+    d = d.slice(2);
+  } else if (d.startsWith('0')) {
+    const cc = String(process.env.DEFAULT_PHONE_COUNTRY_CODE || '').replace(/\D/g, '');
+    if (cc) d = `${cc}${d.slice(1)}`;
+  }
   return d.slice(0, 15);
 }
 
@@ -129,7 +153,7 @@ async function touch(studentId, { className } = {}) {
 }
 
 /**
- * the children a teacher has enrolled through her shared quizzes.
+ * the children a teacher has enrolled through their shared quizzes.
  *
  * This is the question `students` could not answer before: the only teacher
  * association was per-QUIZ (session -> share code -> teacher), so a returning

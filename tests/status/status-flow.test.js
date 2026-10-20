@@ -11,7 +11,7 @@ const path = require('path');
 // A supabase chain whose terminal/await resolves to `result`.
 function chainResolving(result) {
   const chain = {};
-  for (const m of ['select', 'insert', 'update', 'delete', 'eq', 'in', 'not', 'gte', 'order', 'limit']) {
+  for (const m of ['select', 'insert', 'update', 'delete', 'eq', 'in', 'is', 'not', 'gte', 'order', 'limit']) {
     chain[m] = jest.fn(() => chain);
   }
   chain.single = jest.fn().mockResolvedValue(result);

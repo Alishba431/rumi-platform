@@ -3,6 +3,7 @@ const { jsonrepair } = require('jsonrepair');
 const { OPENAI_API_KEY } = require('../utils/constants');
 const { logToFile } = require('../utils/logger');
 const supabase = require('../config/supabase');
+const { ownCoaching } = require('./coaching/own-coaching');
 const {
   CLASSROOM_MARKS_BASE,
   CLASSROOM_MARKS_WITH_LP,
@@ -360,7 +361,10 @@ CONVERSATIONAL FRAMEWORK: S.T.I.C.K.S. PRINCIPLES
         model: 'gpt-5-mini-2025-08-07',
         messages,
         // Note: GPT-5 mini only supports default temperature (1), custom values not allowed
-        max_completion_tokens: 16000
+        max_completion_tokens: 16000,
+        // A framework module may opt in to JSON mode (the observe packs do: one
+        // malformed reply would otherwise fail a coach's whole observation).
+        ...(useFrameworkModule && framework.jsonMode ? { response_format: { type: 'json_object' } } : {})
       });
 
       const duration = Date.now() - startTime;
@@ -594,6 +598,38 @@ CONVERSATIONAL FRAMEWORK: S.T.I.C.K.S. PRINCIPLES
     };
 
     return analysis;
+  }
+
+  /**
+   * Generic single-shot JSON completion on gpt-5-mini — same conventions as
+   * analyzePedagogy (one model, jsonrepair on parse, log + rethrow). The
+   * observe debrief guide, coach-the-coach feedback and the teacher's notes all
+   * run on it.
+   *
+   * @param {string} prompt   must contain the word "JSON" (json_object mode)
+   * @param {object} options  { maxTokens = 4000, label = 'completeJson' }
+   * @returns {Promise<{result: object, usage: object}>}
+   */
+  static async completeJson(prompt, options = {}) {
+    const { maxTokens = 4000, label = 'completeJson' } = options;
+    try {
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-5-mini-2025-08-07',
+        messages: [{ role: 'user', content: prompt }],
+        max_completion_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        // No temperature: GPT-5 mini only supports the default (1)
+      });
+      const choice = response.choices && response.choices[0];
+      if (choice && choice.finish_reason === 'length') {
+        logToFile(`⚠️ ${label}: response truncated at max_completion_tokens`, { maxTokens });
+      }
+      const result = this._safeJsonParse(choice.message.content);
+      return { result, usage: response.usage || {} };
+    } catch (error) {
+      logToFile(`❌ ${label} failed`, { error: error.message, stack: error.stack });
+      throw error;
+    }
   }
 
   /**
@@ -1063,10 +1099,14 @@ Rules:
         return analysisData;
       }
 
+      // The lesson-plan fidelity blob is code-owned (a deterministic score with quoted evidence): it never goes
+      // through this rewrite, and is re-attached verbatim below.
+      const { lp_fidelity: lpFidelity, ...analysisForPrompt } = analysisData || {};
+
       const prompt = `You are enhancing a classroom observation report with the teacher's reflective responses.
 
 ORIGINAL ANALYSIS (from classroom observation):
-${JSON.stringify(analysisData, null, 2)}
+${JSON.stringify(analysisForPrompt, null, 2)}
 
 CLASSROOM TRANSCRIPT:
 ${transcript}
@@ -1209,6 +1249,13 @@ GUIDELINES:
       if (analysisData?.reflective_corpus && !enhancedAnalysis.reflective_corpus) {
         enhancedAnalysis.reflective_corpus = analysisData.reflective_corpus;
       }
+      // Same landmine for lesson-plan fidelity, with one difference: the measured blob always wins, even over an
+      // lp_fidelity the rewrite invented.
+      if (lpFidelity) {
+        enhancedAnalysis.lp_fidelity = lpFidelity;
+      } else {
+        delete enhancedAnalysis.lp_fidelity;
+      }
 
       // Compute marks for Debrief & Reflection section
       if (enhancedAnalysis.debrief_reflection) {
@@ -1229,11 +1276,11 @@ GUIDELINES:
 
           if (userId && currentSessionId) {
             try {
-              const { count, error: countError } = await supabase
+              const { count, error: countError } = await ownCoaching(supabase
                 .from('coaching_sessions')
                 .select('id', { count: 'exact', head: true })
                 .eq('user_id', userId)
-                .eq('status', 'completed')
+                .eq('status', 'completed')) // never a coach's observation of this teacher: it is not their own session
                 .neq('id', currentSessionId);
 
               if (countError) {
@@ -1606,6 +1653,8 @@ STRUCTURE (90 seconds total):
 4. Encouraging closing (10 seconds)
 
 If "hasLessonPlan" is true in the observation data, explicitly reference how closely the teacher followed their plan (use the fidelityScore if provided) either in the strength or growth portion.
+
+If "lessonPlanFidelity" is present, it is the measured comparison of the lesson with the teacher's plan. When "assessed" is true, say how closely the plan was followed using "band_words" and "planned_moves_delivered" in natural speech; never say a percentage or a score for it. When "lesson_mismatch" is true, say gently that the recording did not seem to match the linked plan, not that the teacher failed. When "assessed" is false, do not guess how closely the plan was followed.
 
 TONE:
 - Warm, respectful, mentor-like

@@ -40,6 +40,9 @@ const { DRIVERS } = require('../../bot/shared/services/messaging/channel-registr
 require('../../bot/shared/services/messaging/meta-channel.service');
 require('../../bot/shared/services/messaging/baileys-channel.service');
 require('../../bot/shared/services/messaging/slack-channel.service');
+require('../../bot/shared/services/messaging/discord-channel.service');
+require('../../bot/shared/services/messaging/matrix-channel.service');
+require('../../bot/shared/services/messaging/none-channel.service');
 
 function parseMethodNames(src) {
   const names = new Set();
@@ -116,12 +119,12 @@ describe('channel driver parity', () => {
 
   it.each(STUB_ASYNC_METHODS)('Baileys %s() has no equivalent yet — logs and resolves false', async (m) => {
     const { baileys } = loadDrivers();
-    await expect(baileys[m]('923001234567', 'x', 'y', 'z')).resolves.toBe(false);
+    await expect(baileys[m]('15550101234', 'x', 'y', 'z')).resolves.toBe(false);
   });
 
   it.each(STUB_SYNC_METHODS)('Baileys %s() has no equivalent yet — is synchronous and returns null, not a Promise', (m) => {
     const { baileys } = loadDrivers();
-    const result = baileys[m]('923001234567');
+    const result = baileys[m]('15550101234');
     expect(result).not.toBeInstanceOf(Promise);
     expect(result).toBeNull();
   });
@@ -134,7 +137,7 @@ describe('channel driver parity', () => {
 
   it('Baileys startContinuousTypingIndicator() is synchronous and returns a real, callable controller', () => {
     const { baileys } = loadDrivers();
-    const controller = baileys.startContinuousTypingIndicator('923001234567', 'msg-id');
+    const controller = baileys.startContinuousTypingIndicator('15550101234', 'msg-id');
     expect(controller).not.toBeInstanceOf(Promise);
     expect(typeof controller.stop).toBe('function');
     expect(() => controller.stop()).not.toThrow();

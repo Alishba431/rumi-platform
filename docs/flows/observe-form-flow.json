@@ -1,0 +1,748 @@
+{
+  "version": "6.3",
+  "data_api_version": "3.0",
+  "routing_model": {
+    "DOMAIN_1": [
+      "DOMAIN_2"
+    ],
+    "DOMAIN_2": [
+      "DOMAIN_3"
+    ],
+    "DOMAIN_3": [
+      "DOMAIN_4"
+    ],
+    "DOMAIN_4": [
+      "SUCCESS"
+    ],
+    "SUCCESS": []
+  },
+  "screens": [
+    {
+      "id": "DOMAIN_1",
+      "title": "TEACH review 1/4",
+      "data": {
+        "scale": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "1",
+              "title": "1 · Low"
+            },
+            {
+              "id": "2",
+              "title": "2 · Low–medium"
+            },
+            {
+              "id": "3",
+              "title": "3 · Medium"
+            },
+            {
+              "id": "4",
+              "title": "4 · Medium–high"
+            },
+            {
+              "id": "5",
+              "title": "5 · High"
+            }
+          ]
+        },
+        "s_T": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_T": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_T": {
+          "type": "string",
+          "__example__": "One next step…"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "form_1",
+            "init-values": {
+              "r_T": "${data.s_T}",
+              "ev_T": "${data.e_T}",
+              "imp_T": "${data.i_T}"
+            },
+            "children": [
+              {
+                "type": "TextHeading",
+                "text": "1. Time on Task"
+              },
+              {
+                "type": "TextBody",
+                "text": "Part 1 of 4 — check each rating and note, and change anything you disagree with."
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_T",
+                "label": "T — Time on task",
+                "description": "Time on task",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_T",
+                "label": "Evidence",
+                "helper-text": "T — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_T",
+                "label": "To improve",
+                "helper-text": "T — one next step",
+                "required": false
+              },
+              {
+                "type": "Footer",
+                "label": "Next",
+                "on-click-action": {
+                  "name": "data_exchange",
+                  "payload": {
+                    "_screen": "DOMAIN_1",
+                    "r_T": "${form.r_T}",
+                    "ev_T": "${form.ev_T}",
+                    "imp_T": "${form.imp_T}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "DOMAIN_2",
+      "title": "TEACH review 2/4",
+      "data": {
+        "scale": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "1",
+              "title": "1 · Low"
+            },
+            {
+              "id": "2",
+              "title": "2 · Low–medium"
+            },
+            {
+              "id": "3",
+              "title": "3 · Medium"
+            },
+            {
+              "id": "4",
+              "title": "4 · Medium–high"
+            },
+            {
+              "id": "5",
+              "title": "5 · High"
+            }
+          ]
+        },
+        "s_1": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_1": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_1": {
+          "type": "string",
+          "__example__": "One next step…"
+        },
+        "s_2": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_2": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_2": {
+          "type": "string",
+          "__example__": "One next step…"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "form_2",
+            "init-values": {
+              "r_1": "${data.s_1}",
+              "ev_1": "${data.e_1}",
+              "imp_1": "${data.i_1}",
+              "r_2": "${data.s_2}",
+              "ev_2": "${data.e_2}",
+              "imp_2": "${data.i_2}"
+            },
+            "children": [
+              {
+                "type": "TextHeading",
+                "text": "2. Classroom Culture"
+              },
+              {
+                "type": "TextBody",
+                "text": "Part 2 of 4 — check each rating and note, and change anything you disagree with."
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_1",
+                "label": "1 — Supportive Learning…",
+                "description": "Supportive Learning Environment",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_1",
+                "label": "Evidence",
+                "helper-text": "1 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_1",
+                "label": "To improve",
+                "helper-text": "1 — one next step",
+                "required": false
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_2",
+                "label": "2 — Positive Behavioral…",
+                "description": "Positive Behavioral Expectations",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_2",
+                "label": "Evidence",
+                "helper-text": "2 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_2",
+                "label": "To improve",
+                "helper-text": "2 — one next step",
+                "required": false
+              },
+              {
+                "type": "Footer",
+                "label": "Next",
+                "on-click-action": {
+                  "name": "data_exchange",
+                  "payload": {
+                    "_screen": "DOMAIN_2",
+                    "r_1": "${form.r_1}",
+                    "ev_1": "${form.ev_1}",
+                    "imp_1": "${form.imp_1}",
+                    "r_2": "${form.r_2}",
+                    "ev_2": "${form.ev_2}",
+                    "imp_2": "${form.imp_2}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "DOMAIN_3",
+      "title": "TEACH review 3/4",
+      "data": {
+        "scale": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "1",
+              "title": "1 · Low"
+            },
+            {
+              "id": "2",
+              "title": "2 · Low–medium"
+            },
+            {
+              "id": "3",
+              "title": "3 · Medium"
+            },
+            {
+              "id": "4",
+              "title": "4 · Medium–high"
+            },
+            {
+              "id": "5",
+              "title": "5 · High"
+            }
+          ]
+        },
+        "s_3": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_3": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_3": {
+          "type": "string",
+          "__example__": "One next step…"
+        },
+        "s_4": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_4": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_4": {
+          "type": "string",
+          "__example__": "One next step…"
+        },
+        "s_5": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_5": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_5": {
+          "type": "string",
+          "__example__": "One next step…"
+        },
+        "s_6": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_6": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_6": {
+          "type": "string",
+          "__example__": "One next step…"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "form_3",
+            "init-values": {
+              "r_3": "${data.s_3}",
+              "ev_3": "${data.e_3}",
+              "imp_3": "${data.i_3}",
+              "r_4": "${data.s_4}",
+              "ev_4": "${data.e_4}",
+              "imp_4": "${data.i_4}",
+              "r_5": "${data.s_5}",
+              "ev_5": "${data.e_5}",
+              "imp_5": "${data.i_5}",
+              "r_6": "${data.s_6}",
+              "ev_6": "${data.e_6}",
+              "imp_6": "${data.i_6}"
+            },
+            "children": [
+              {
+                "type": "TextHeading",
+                "text": "3. Instruction"
+              },
+              {
+                "type": "TextBody",
+                "text": "Part 3 of 4 — check each rating and note, and change anything you disagree with."
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_3",
+                "label": "3 — Lesson Facilitation",
+                "description": "Lesson Facilitation",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_3",
+                "label": "Evidence",
+                "helper-text": "3 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_3",
+                "label": "To improve",
+                "helper-text": "3 — one next step",
+                "required": false
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_4",
+                "label": "4 — Checks for Understanding",
+                "description": "Checks for Understanding",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_4",
+                "label": "Evidence",
+                "helper-text": "4 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_4",
+                "label": "To improve",
+                "helper-text": "4 — one next step",
+                "required": false
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_5",
+                "label": "5 — Feedback",
+                "description": "Feedback",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_5",
+                "label": "Evidence",
+                "helper-text": "5 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_5",
+                "label": "To improve",
+                "helper-text": "5 — one next step",
+                "required": false
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_6",
+                "label": "6 — Critical Thinking",
+                "description": "Critical Thinking",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_6",
+                "label": "Evidence",
+                "helper-text": "6 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_6",
+                "label": "To improve",
+                "helper-text": "6 — one next step",
+                "required": false
+              },
+              {
+                "type": "Footer",
+                "label": "Next",
+                "on-click-action": {
+                  "name": "data_exchange",
+                  "payload": {
+                    "_screen": "DOMAIN_3",
+                    "r_3": "${form.r_3}",
+                    "ev_3": "${form.ev_3}",
+                    "imp_3": "${form.imp_3}",
+                    "r_4": "${form.r_4}",
+                    "ev_4": "${form.ev_4}",
+                    "imp_4": "${form.imp_4}",
+                    "r_5": "${form.r_5}",
+                    "ev_5": "${form.ev_5}",
+                    "imp_5": "${form.imp_5}",
+                    "r_6": "${form.r_6}",
+                    "ev_6": "${form.ev_6}",
+                    "imp_6": "${form.imp_6}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "DOMAIN_4",
+      "title": "TEACH review 4/4",
+      "data": {
+        "scale": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "1",
+              "title": "1 · Low"
+            },
+            {
+              "id": "2",
+              "title": "2 · Low–medium"
+            },
+            {
+              "id": "3",
+              "title": "3 · Medium"
+            },
+            {
+              "id": "4",
+              "title": "4 · Medium–high"
+            },
+            {
+              "id": "5",
+              "title": "5 · High"
+            }
+          ]
+        },
+        "s_7": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_7": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_7": {
+          "type": "string",
+          "__example__": "One next step…"
+        },
+        "s_8": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_8": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_8": {
+          "type": "string",
+          "__example__": "One next step…"
+        },
+        "s_9": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "e_9": {
+          "type": "string",
+          "__example__": "What the coach saw…"
+        },
+        "i_9": {
+          "type": "string",
+          "__example__": "One next step…"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "form_4",
+            "init-values": {
+              "r_7": "${data.s_7}",
+              "ev_7": "${data.e_7}",
+              "imp_7": "${data.i_7}",
+              "r_8": "${data.s_8}",
+              "ev_8": "${data.e_8}",
+              "imp_8": "${data.i_8}",
+              "r_9": "${data.s_9}",
+              "ev_9": "${data.e_9}",
+              "imp_9": "${data.i_9}"
+            },
+            "children": [
+              {
+                "type": "TextHeading",
+                "text": "4. Socioemotional Skills"
+              },
+              {
+                "type": "TextBody",
+                "text": "Part 4 of 4 — check each rating and note, and change anything you disagree with."
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_7",
+                "label": "7 — Autonomy",
+                "description": "Autonomy",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_7",
+                "label": "Evidence",
+                "helper-text": "7 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_7",
+                "label": "To improve",
+                "helper-text": "7 — one next step",
+                "required": false
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_8",
+                "label": "8 — Perseverance",
+                "description": "Perseverance",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_8",
+                "label": "Evidence",
+                "helper-text": "8 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_8",
+                "label": "To improve",
+                "helper-text": "8 — one next step",
+                "required": false
+              },
+              {
+                "type": "RadioButtonsGroup",
+                "name": "r_9",
+                "label": "9 — Social & Collaborative",
+                "description": "Social & Collaborative",
+                "required": false,
+                "data-source": "${data.scale}"
+              },
+              {
+                "type": "TextArea",
+                "name": "ev_9",
+                "label": "Evidence",
+                "helper-text": "9 — what was seen",
+                "required": false
+              },
+              {
+                "type": "TextArea",
+                "name": "imp_9",
+                "label": "To improve",
+                "helper-text": "9 — one next step",
+                "required": false
+              },
+              {
+                "type": "Footer",
+                "label": "Submit observation",
+                "on-click-action": {
+                  "name": "data_exchange",
+                  "payload": {
+                    "_screen": "DOMAIN_4",
+                    "r_7": "${form.r_7}",
+                    "ev_7": "${form.ev_7}",
+                    "imp_7": "${form.imp_7}",
+                    "r_8": "${form.r_8}",
+                    "ev_8": "${form.ev_8}",
+                    "imp_8": "${form.imp_8}",
+                    "r_9": "${form.r_9}",
+                    "ev_9": "${form.ev_9}",
+                    "imp_9": "${form.imp_9}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "SUCCESS",
+      "title": "Saved",
+      "terminal": true,
+      "data": {
+        "session_id": {
+          "type": "string",
+          "__example__": "00000000-0000-0000-0000-000000000000"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Thank you! ✅"
+          },
+          {
+            "type": "TextBody",
+            "text": "Your TEACH observation is saved. The next step follows in the chat."
+          },
+          {
+            "type": "Footer",
+            "label": "Done",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "observe_action": "submitted",
+                "session_id": "${data.session_id}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

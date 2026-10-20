@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand colour behind the launcher icon and the launch screen. -->
+    <color name="ic_launcher_background">#001240</color>
+    <color name="splash_background">#001240</color>
+</resources>

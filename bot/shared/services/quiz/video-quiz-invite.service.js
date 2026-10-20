@@ -1,20 +1,20 @@
 'use strict';
 /**
- * a child passes the quiz to a friend, and hears how they did.
+ * A child passes the quiz to a friend, and hears how they did.
  *
  * THE BOUNDARY
  * This is the only place in the feature where two CHILDREN exchange
  * information, so what crosses is deliberately small: a first name and a score.
  * Not a family name, not a class, not a phone number, not which questions the
- * friend got wrong. Operator decision, 2026-07-28. If that ever widens it
- * should widen on purpose, not by someone adding a field to a query.
+ * friend got wrong. If that ever widens it should widen on purpose, not by
+ * someone adding a field to a query.
  *
  * THE STRUCTURAL CHOICE
  * A child arriving through an invite gets their session recorded against the
  * TEACHER's share code, not the invite. The teacher's class report therefore
- * needs no knowledge that invites exist — she queries one share code and sees
- * every child who took her quiz, however they reached it. The invite row only
- * decides who ALSO gets told when they finish.
+ * needs no knowledge that invites exist — the teacher queries one share code
+ * and sees every child who took their quiz, however they reached it. The
+ * invite row only decides who ALSO gets told when they finish.
  */
 
 const supabase = require('../../config/supabase');
@@ -26,12 +26,20 @@ const { logEvent } = require('../../utils/structured-logger');
 const INVITE_YES = 'vq_invite_yes';
 const INVITE_NO = 'vq_invite_no';
 const INVITE_TTL_SECS = 60 * 60;
+/**
+ * How long an unanswered invite waits before the videos offer arrives anyway.
+ * In live use nearly half of all invites were never answered, and the videos
+ * offer used to follow only a NO — so those children, and every child who said
+ * YES, never saw it: about two in three children who finished.
+ */
+const VIDEOS_AFTER_SILENCE_SECS = 600;
+const VIDEOS_JOB = 'quiz_child_videos_offer';
 const stripPlus = (p) => (p && p.startsWith('+') ? p.slice(1) : p);
 const INVITE_KEY = (phone) => `videoquiz:${stripPlus(phone)}:invite`;
 
 /** A child's first name. Nothing after the first space leaves their chat. */
-function firstName(full) {
-  return String(full || '').trim().split(/\s+/)[0] || 'Your friend';
+function firstName(full, fallback = 'Your friend') {
+  return String(full || '').trim().split(/\s+/)[0] || fallback;
 }
 
 /**
@@ -41,18 +49,74 @@ function firstName(full) {
  * to send the comparison back to, so offering it would be a promise we cannot
  * keep.
  */
-async function offerInvite({ phone, studentId, shareCodeId, language = 'en' }) {
+async function offerInvite({ phone, studentId, shareCodeId, language = 'en',
+                             sessionId = null, quizId = null }) {
   if (!studentId || !shareCodeId) return false;
-  await redisService.set(INVITE_KEY(phone), { studentId, shareCodeId, language },
+  await redisService.set(INVITE_KEY(phone), { studentId, shareCodeId, language, sessionId, quizId },
     INVITE_TTL_SECS);
+  // In the quiz language — a child who just took an Urdu quiz reads Urdu here.
+  const { resolveUx } = require('../../config/ux-strings');
+  // Same window as the quiz that just finished on this phone: an untracked
+  // send here is a send the limiter cannot see, and the whole point of the
+  // window is that every send against a pair is counted.
+  const rateLimiter = require('./video-quiz-rate-limiter.service');
+  await rateLimiter.throttle(phone);
   await WhatsAppService.sendInteractiveButtons(phone, {
-    body: 'Want to send this quiz to a friend?\n\n'
-      + "I'll tell you how they did once they finish.",
+    body: resolveUx('vqInviteAsk', { language }),
     buttons: [
-      { id: INVITE_YES, title: 'Invite a friend' },   // 15 chars
-      { id: INVITE_NO, title: 'No thanks' },          // 9
+      { id: INVITE_YES, title: resolveUx('vqInviteYes', { language }) },   // ≤ 20 code points, asserted in tests
+      { id: INVITE_NO, title: resolveUx('vqInviteNo', { language }) },
     ],
   });
+  // The invite is only ever offered on a share_link session.
+  logEvent('video_quiz.offer_shown', { kind: 'invite', sessionId, quizId, source: 'share_link', language });
+
+  // The videos offer must reach this child whether they answer or not. A tap
+  // offers it at once (handleInviteButton); silence offers it after
+  // VIDEOS_AFTER_SILENCE_SECS through a delayed quiz-queue job that checks the
+  // invite is STILL unanswered before it sends. Non-fatal: a queue hiccup
+  // costs one offer, never the quiz.
+  try {
+    const SQSQueueService = require('../queue');
+    await SQSQueueService.queueJob(shareCodeId, VIDEOS_JOB, { phone, shareCodeId }, {
+      delaySeconds: VIDEOS_AFTER_SILENCE_SECS,
+      deduplicationId: `${shareCodeId}-${VIDEOS_JOB}-${stripPlus(phone)}-${Date.now()}`,
+    });
+  } catch (err) {
+    logToFile('⚠️ video-quiz-invite: could not queue the delayed videos offer', { error: err.message });
+  }
+  return true;
+}
+
+/**
+ * The videos offer for THIS child, from the invite's own context. Every exit
+ * of the invite — yes, no, could-not-mint, and the silence job — ends here.
+ */
+async function offerVideosFor(phone, ctx) {
+  const Binge = require('./video-quiz-binge.service');
+  return Binge.offerMore({
+    phone, studentId: ctx.studentId, shareCodeId: ctx.shareCodeId, language: ctx.language,
+    sessionId: ctx.sessionId ?? null, quizId: ctx.quizId ?? null,
+  }).catch((err) => {
+    logToFile('⚠️ video-quiz-invite: offerMore threw', { error: err.message });
+    return false;
+  });
+}
+
+/**
+ * The delayed job's handler. If the invite is still sitting unanswered, it is
+ * consumed here — so a late tap on the invite buttons is a quiet no-op rather
+ * than a second videos offer — and the child is offered videos.
+ */
+async function offerVideosIfUnanswered(phone) {
+  const ctx = await redisService.get(INVITE_KEY(phone));
+  if (!ctx) return false;
+  await redisService.delete(INVITE_KEY(phone));
+  logEvent('video_quiz.offer_answered', {
+    kind: 'invite', choice: 'ignored', studentId: ctx.studentId, shareCodeId: ctx.shareCodeId,
+    sessionId: ctx.sessionId ?? null, quizId: ctx.quizId ?? null,
+  });
+  await offerVideosFor(phone, ctx);
   return true;
 }
 
@@ -61,15 +125,38 @@ async function handleInviteButton(buttonId, phone) {
   if (buttonId !== INVITE_YES && buttonId !== INVITE_NO) return false;
   const ctx = await redisService.get(INVITE_KEY(phone));
   await redisService.delete(INVITE_KEY(phone));
-  if (buttonId === INVITE_NO || !ctx) return true;
+  if (!ctx) return true;
+
+  // An old in-flight ctx minted before this deploy has no
+  // sessionId/quizId; they simply come out undefined/null here, and the
+  // answer still logs cleanly.
+  const choice = buttonId === INVITE_YES ? 'yes' : 'no';
+  logEvent('video_quiz.offer_answered', {
+    kind: 'invite', choice, studentId: ctx.studentId, shareCodeId: ctx.shareCodeId,
+    sessionId: ctx.sessionId ?? null, quizId: ctx.quizId ?? null,
+  });
+
+  if (buttonId === INVITE_NO) {
+    // A decline chains into "want to watch more?" rather than
+    // dead-ending the conversation. Same student/share-code so the next
+    // round still attributes to this teacher's report.
+    await offerVideosFor(phone, ctx);
+    return true;
+  }
 
   const share = require('./video-quiz-share.service');
+  const { resolveUx, clampLanguage } = require('../../config/ux-strings');
   const { data: parent } = await supabase
     .from('quiz_share_codes')
     .select('id, quiz_id, video_id, teacher_user_id, teacher_name, topic, language')
     .eq('id', ctx.shareCodeId)
     .maybeSingle();
-  if (!parent) return true;
+  if (!parent) { await offerVideosFor(phone, ctx); return true; }
+  // Everything below is read by children taking THIS quiz — the inviter, then
+  // the friend they forward it to — so it is in the quiz language. The invite
+  // context carries it; one minted before it did falls back to the share code.
+  const language = clampLanguage(ctx.language || parent.language);
+  const ux = (key, params) => resolveUx(key, { language, params });
 
   const { data: me } = await supabase
     .from('students').select('student_name').eq('id', ctx.studentId).maybeSingle();
@@ -95,22 +182,37 @@ async function handleInviteButton(buttonId, phone) {
       break;
     }
   }
-  if (!minted || !share.botNumber()) {
-    await WhatsAppService.sendMessage(phone,
-      "Sorry — I couldn't make that link just now. Try again in a moment.");
+  if (!minted) {
+    await WhatsAppService.sendMessage(phone, ux('vqInviteLinkFailed'));
+    await offerVideosFor(phone, ctx);
     return true;
   }
 
-  const link = `https://wa.me/${share.botNumber()}?text=QUIZ-${minted.code}`;
-  await WhatsAppService.sendMessage(phone,
-    'Here is the message — forward THIS one to your friend:');
-  await WhatsAppService.sendMessage(phone,
-    `📚 *Try this quiz!*\n\n${firstName(me?.student_name)} thinks you'd like this `
-    + `quiz on *${parent.topic || 'today’s lesson'}*.\n\nTap here to start:\n${link}`);
+  // The friend is on the inviter's channel: the same channel-aware join line as
+  // the teacher's class link (a wa.me link, a matrix.to link plus the code, or
+  // the code alone).
+  const invite = share.joinInvite({ code: minted.code, recipient: phone });
+  const who = {
+    name: firstName(me?.student_name, ux('vqInviteFriend')),
+    topic: parent.topic || ux('tqTodaysLesson'),
+  };
+  await WhatsAppService.sendMessage(phone, ux('vqInviteForwardThis'));
+  if (invite.kind === 'wa') {
+    await WhatsAppService.sendMessage(phone, ux('vqInviteMessage', { ...who, link: invite.link }));
+  } else if (invite.kind === 'matrix') {
+    await WhatsAppService.sendMessage(phone, ux('vqInviteMessageJoin', {
+      ...who, link: invite.link, code: invite.code, bot: invite.bot,
+    }));
+  } else {
+    await WhatsAppService.sendMessage(phone, ux('vqInviteMessageCode', { ...who, code: invite.code, bot: invite.bot }));
+  }
 
   logEvent('video_quiz.friend_invited', {
     inviterStudentId: ctx.studentId, shareCodeId: parent.id, code: minted.code,
   });
+  // A YES used to end here; the child who invited a friend never
+  // heard about the videos. The offer follows the forwardable message.
+  await offerVideosFor(phone, ctx);
   return true;
 }
 
@@ -141,32 +243,36 @@ async function resolveInvite(code) {
  * Never framed as a defeat. Children show these to each other, and a line that
  * reads as "you lost" turns a quiz into something to avoid.
  */
-function buildComparison({ inviter, friend, topic }) {
-  const them = firstName(friend.student_name);
+function buildComparison({ inviter, friend, topic, language = 'en' }) {
+  // In the quiz's language: the inviter took the same quiz, in that language.
+  const { resolveUx } = require('../../config/ux-strings');
+  const ux = (key, params) => resolveUx(key, { language, params });
+  const them = firstName(friend.student_name, ux('vqInviteFriend'));
   const theirs = friend.correct_answers || 0;
   const outOf = friend.total_questions_answered || 0;
   const mine = inviter.correct_answers || 0;
 
   let line;
   if (theirs > mine) {
-    line = `${them} edged you this time — worth another go.`;
+    line = ux('vqCompareBehind', { them });
   } else if (theirs < mine) {
-    line = `You are still ahead. Nicely done.`;
+    line = ux('vqCompareAhead');
   } else {
-    line = `A dead heat — you both got the same.`;
+    line = ux('vqCompareTie');
   }
 
-  return `🎯 *${them} finished your quiz!*\n\n`
-    + `${them}: *${theirs}/${outOf}*\n`
-    + `You: *${mine}/${outOf}*\n\n`
-    + `${line}`;
+  return ux('vqCompareMessage', { them, theirs, outOf, mine, line });
 }
 
 /**
  * Tell the inviter how their friend did. Best-effort throughout — this is a
  * nicety, and nothing about the friend's own quiz should fail because of it.
+ *
+ * `language` is the quiz's: the friend just took it in that language, and the
+ * inviter took the same quiz. quiz_sessions carries no language, so the caller
+ * (finish(), which holds the session state) passes it.
  */
-async function notifyInviter(session) {
+async function notifyInviter(session, language = 'en') {
   try {
     if (!session || !session.invited_by_student_id) return false;
     const { data: inviterStudent } = await supabase
@@ -174,22 +280,24 @@ async function notifyInviter(session) {
       .eq('id', session.invited_by_student_id).maybeSingle();
     if (!inviterStudent?.phone) return false;
 
-    // The inviter's own run of the SAME quiz, for the comparison.
+    // The inviter's own run of the SAME quiz, for the comparison: their FIRST
+    // completed run, the attempt that counts, so a retake never changes it.
     const { data: mine } = await supabase
       .from('quiz_sessions')
       .select('correct_answers, total_questions_answered, mastery_percentage')
       .eq('student_id', inviterStudent.id)
       .eq('quiz_id', session.quiz_id)
       .eq('status', 'completed')
+      .order('completed_at', { ascending: true })
       .limit(1);
     const inviterRun = (mine || [])[0];
     if (!inviterRun) return false;   // nothing to compare against
 
     await WhatsAppService.sendMessage(inviterStudent.phone,
-      buildComparison({ inviter: inviterRun, friend: session, topic: session.topic }));
+      buildComparison({ inviter: inviterRun, friend: session, topic: session.topic, language }));
 
     logEvent('video_quiz.invite_result_sent', {
-      inviterStudentId: inviterStudent.id, quizId: session.quiz_id,
+      inviterStudentId: inviterStudent.id, quizId: session.quiz_id, language,
     });
     return true;
   } catch (err) {
@@ -202,5 +310,6 @@ async function notifyInviter(session) {
 
 module.exports = {
   offerInvite, handleInviteButton, resolveInvite, buildComparison,
-  notifyInviter, firstName, INVITE_YES, INVITE_NO, INVITE_KEY,
+  notifyInviter, offerVideosIfUnanswered, firstName,
+  INVITE_YES, INVITE_NO, INVITE_KEY, VIDEOS_JOB, VIDEOS_AFTER_SILENCE_SECS,
 };

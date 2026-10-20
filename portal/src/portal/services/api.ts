@@ -1,13 +1,14 @@
 import axios from 'axios';
-import type { User, DashboardStats, LessonPlan, CoachingSession, SessionDetail, CoachingAnalytics, Pagination, VideoRequest, VideoDetail } from '../types/portal';
+import { getApiBaseUrl } from '@/lib/runtime';
+import type { User, DashboardStats, LessonPlan, CoachingSession, SessionDetail, CoachingAnalytics, Pagination, VideoRequest, VideoDetail, CoachObservationsData, CoachTeacher, CoachObservation } from '../types/portal';
 import type { ReadingAssessment, ReadingAssessmentDetail, ReadingStats } from '../types/readingAssessment';
 
-// Use relative URL since frontend and backend are on same domain
-// This fixes mobile cookie blocking issues - no more CORS, no more third-party cookies!
-// GitHub Actions auto-deploy workflow active - edits in Lovable deploy automatically!
-const API_BASE_URL = import.meta.env.PROD
-  ? '/api/portal' // Relative URL for production (same domain)
-  : 'http://localhost:4000/api/portal'; // Absolute URL for local development
+// On the web, frontend and backend share a domain, so a relative URL avoids
+// CORS and third-party cookies entirely. In the Capacitor app there is no
+// such origin — the WebView serves from localhost — so an absolute URL
+// (VITE_API_BASE_URL) is required. getApiBaseUrl() picks the right one and
+// fails loudly if a native build is missing its config.
+const API_BASE_URL = getApiBaseUrl();
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -158,6 +159,27 @@ export const portal = {
     video: VideoDetail;
   }> => {
     const response = await api.get(`/video/${id}`);
+    return response.data;
+  }
+};
+
+// Coach's view — the server answers 403 to anyone outside the observe role family.
+export const coach = {
+  getObservations: async (): Promise<{ observations: CoachObservationsData }> => {
+    const response = await api.get('/coach/observations');
+    return response.data;
+  },
+
+  getTeachers: async (): Promise<{ teachers: CoachTeacher[] }> => {
+    const response = await api.get('/coach/teachers');
+    return response.data;
+  },
+
+  getTeacher: async (id: string): Promise<{
+    teacher: { id: string; name: string; schoolName: string | null };
+    observations: CoachObservation[];
+  }> => {
+    const response = await api.get(`/coach/teacher/${encodeURIComponent(id)}`);
     return response.data;
   }
 };

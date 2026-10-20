@@ -13,7 +13,7 @@ function load() {
     sendImage: jest.fn().mockResolvedValue(true),
   };
   jest.doMock('../../bot/shared/services/whatsapp.service', () => whatsapp);
-  jest.doMock('../../bot/shared/config/branding', () => ({ portalUrl: () => null }), { virtual: true });
+  jest.doMock('../../bot/shared/config/branding', () => ({ portalUrl: () => null }));
 
   const DeliveryService = require('../../bot/shared/services/exam-checker/delivery.service');
   return { DeliveryService, whatsapp };

@@ -77,6 +77,7 @@ def pull(conn, day: dt.date, kind: str, cfg: Config, feats: Features) -> dict:
     unit_col = feats.resolve_group_by(cfg.group_by)
     cohort = _cohort_sql(cfg, unit_col)
     events = _events_sql(feats)
+    own = feats.self_coaching("cs")  # a teacher's own coaching only, never a coach's observation of them
     weekly = kind == "weekly"
     lo, hi = cal.weekly_window(day) if weekly else (day, day)
     span = (hi - lo).days + 1
@@ -119,7 +120,7 @@ def pull(conn, day: dt.date, kind: str, cfg: Config, feats: Features) -> dict:
                     f"FROM lesson_plans lp JOIN cohort c ON c.id = lp.user_id WHERE {COARSE.format(col='lp.created_at')} "
                     f"GROUP BY 1")
     coach_daily_sql = (f"WITH {cohort} SELECT {LD.format(col='cs.completed_at')} AS d, count(*), count(DISTINCT cs.user_id) "
-                       f"FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed' "
+                       f"FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed'{own} "
                        f"AND {COARSE.format(col='cs.completed_at')} GROUP BY 1")
     reading_daily_sql = (f"WITH {cohort} SELECT {LD.format(col='ra.created_at')} AS d, count(*), count(DISTINCT ra.user_id) "
                          f"FROM reading_assessments ra JOIN cohort c ON c.id = ra.user_id WHERE ra.status = 'completed' "
@@ -157,7 +158,7 @@ def pull(conn, day: dt.date, kind: str, cfg: Config, feats: Features) -> dict:
                f"FROM lesson_plans lp JOIN cohort c ON c.id = lp.user_id WHERE {COARSE.format(col='lp.created_at')} "
                f"GROUP BY 1, 2")
         cou = (f"WITH {cohort} SELECT {LD.format(col='cs.completed_at')} AS d, c.unit, count(DISTINCT cs.user_id) "
-               f"FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed' "
+               f"FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed'{own} "
                f"AND {COARSE.format(col='cs.completed_at')} GROUP BY 1, 2")
         lp_u = _q(cur, "lp.daily_by_unit", lpu, _p(cfg, s_lo, day)) if feats.has("lesson_plans") else []
         co_u = _q(cur, "coach.daily_by_unit", cou, _p(cfg, s_lo, day)) if feats.has("coaching_sessions") else []
@@ -180,7 +181,7 @@ def pull(conn, day: dt.date, kind: str, cfg: Config, feats: Features) -> dict:
                 f"WHERE {COARSE.format(col='lp.created_at')} GROUP BY 1")
         co_w = (f"WITH {cohort} SELECT {bucket.format(d=LD.format(col='cs.completed_at'))} AS k, count(*), "
                 f"count(DISTINCT cs.user_id) FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id "
-                f"WHERE cs.status = 'completed' AND {COARSE.format(col='cs.completed_at')} GROUP BY 1")
+                f"WHERE cs.status = 'completed'{own} AND {COARSE.format(col='cs.completed_at')} GROUP BY 1")
         rd_w = (f"WITH {cohort} SELECT {bucket.format(d=LD.format(col='ra.created_at'))} AS k, count(*), "
                 f"count(DISTINCT ra.user_id) FROM reading_assessments ra JOIN cohort c ON c.id = ra.user_id "
                 f"WHERE ra.status = 'completed' AND {COARSE.format(col='ra.created_at')} GROUP BY 1")
@@ -218,7 +219,7 @@ def pull(conn, day: dt.date, kind: str, cfg: Config, feats: Features) -> dict:
                 t["lps"], t["lp_teachers"] = int(r[0] or 0), int(r[1] or 0)
         if feats.has("coaching_sessions"):
             r = one("coach.window", f"WITH {cohort} SELECT count(*), count(DISTINCT cs.user_id) FROM coaching_sessions cs "
-                    f"JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed' AND {COARSE.format(col='cs.completed_at')} "
+                    f"JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed'{own} AND {COARSE.format(col='cs.completed_at')} "
                     f"AND {LD.format(col='cs.completed_at')} BETWEEN %(lo)s AND %(hi)s", lo_, hi_)
             if r:
                 t["coach"], t["coach_teachers"] = int(r[0] or 0), int(r[1] or 0)
@@ -236,7 +237,7 @@ def pull(conn, day: dt.date, kind: str, cfg: Config, feats: Features) -> dict:
     coaching = None
     if feats.has("coaching_sessions") and feats.col("coaching_sessions", "analysis_data"):
         pct = "NULLIF(cs.analysis_data->'scores'->>'overall_percentage', '')::numeric"
-        base = (f"FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed' "
+        base = (f"FROM coaching_sessions cs JOIN cohort c ON c.id = cs.user_id WHERE cs.status = 'completed'{own} "
                 f"AND {COARSE.format(col='cs.completed_at')} AND {LD.format(col='cs.completed_at')} BETWEEN %(lo)s AND %(hi)s")
         summ_sql = (f"WITH {cohort} SELECT count(*), count(DISTINCT cs.user_id), round(avg({pct}), 1), "
                     f"mode() WITHIN GROUP (ORDER BY cs.analysis_data->>'framework') {base}")

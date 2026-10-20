@@ -31,6 +31,16 @@ jest.mock('../../bot/shared/services/whatsapp.service', () => ({
 jest.mock('../../bot/shared/services/queue/sqs-queue.service', () => ({
   queueJob: jest.fn().mockResolvedValue({ MessageId: 'm1' }),
 }));
+// The schedule and send claims are Redis SET NX keys; an in-memory map here,
+// so the suite never dials a real Redis.
+const mockKv = new Map();
+jest.mock('../../bot/shared/services/cache/railway-redis.service', () => ({
+  get: jest.fn(async (k) => (mockKv.has(k) ? mockKv.get(k) : null)),
+  set: jest.fn(async (k, v) => { mockKv.set(k, v); return true; }),
+  setNX: jest.fn(async (k, v) => { if (mockKv.has(k)) return false; mockKv.set(k, v); return true; }),
+  delete: jest.fn(async (k) => { mockKv.delete(k); return true; }),
+  isAvailable: () => true,
+}));
 jest.mock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
 jest.mock('../../bot/shared/utils/structured-logger', () => ({ logEvent: jest.fn() }));
 
@@ -45,7 +55,7 @@ const SHARE_CODE_ID = 'sc-1';
  * Minimal Supabase stub. `rows` maps table -> the array a select resolves to;
  * `updates` records what the guard writes back.
  */
-function stubSupabase({ shareCode, teacher, sessions, answers = [] }) {
+function stubSupabase({ shareCode, teacher, sessions, answers = [], quiz = null }) {
   const updates = [];
   supabase.from.mockImplementation((table) => {
     const chain = {
@@ -56,6 +66,7 @@ function stubSupabase({ shareCode, teacher, sessions, answers = [] }) {
       maybeSingle: async () => {
         if (table === 'quiz_share_codes') return { data: shareCode };
         if (table === 'users') return { data: teacher };
+        if (table === 'quizzes') return { data: quiz };
         return { data: null };
       },
       update: (patch) => {
@@ -75,6 +86,10 @@ function stubSupabase({ shareCode, teacher, sessions, answers = [] }) {
       };
       listy.eq = () => listy;
       listy.in = () => listy;
+      listy.is = () => listy;
+      listy.not = () => listy;
+      listy.order = () => listy;
+      listy.limit = () => listy;
       listy.select = () => listy;
       listy.maybeSingle = chain.maybeSingle;
       listy.update = chain.update;
@@ -87,6 +102,7 @@ function stubSupabase({ shareCode, teacher, sessions, answers = [] }) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockKv.clear();
 });
 
 describe('bd-2334 — scheduling must survive the queue', () => {
@@ -187,5 +203,24 @@ describe('bd-2334 — one report, once', () => {
     const stamp = updates.find((u) => u.table === 'quiz_share_codes'
       && Object.keys(u.patch).includes('report_sent_at'));
     expect(stamp).toBeDefined();
+  });
+});
+
+describe('the report goes to the chat the quiz was sent to', () => {
+  test('a lesson quiz sent to a Matrix teacher reports there, not to users.phone_number', async () => {
+    stubSupabase({
+      shareCode: {
+        id: SHARE_CODE_ID, code: 'K7RM2', quiz_id: 'q1', teacher_user_id: 'u1',
+        teacher_name: 'Sample Teacher', topic: 'Magnets', language: 'en', report_sent_at: null,
+      },
+      teacher: { phone_number: '15550100001' },
+      quiz: { id: 'q1', quiz_source: 'transcript', teacher_id: 'u1', meta: { teacher_to: 'mtx:15550100001' } },
+      sessions: [{ id: 's1', student_name: 'Child One', status: 'completed',
+        total_questions_answered: 8, correct_answers: 6, mastery_percentage: 75 }],
+    });
+    await report.generate(SHARE_CODE_ID, { reason: 'all_finished' });
+    const recipients = [...WhatsAppService.sendMessage.mock.calls, ...WhatsAppService.sendDocument.mock.calls].map((c) => c[0]);
+    expect(recipients.length).toBeGreaterThan(0);
+    expect(new Set(recipients)).toEqual(new Set(['mtx:15550100001']));
   });
 });

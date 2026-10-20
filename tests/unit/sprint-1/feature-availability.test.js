@@ -121,7 +121,9 @@ describe('feature-availability (presence-based gating)', () => {
   });
 
   it('availableFeatures reflects exactly the keys provided', () => {
-    expect(fa.availableFeatures(FULL_ENV)).toEqual([]); // no optional keys yet
+    // No optional keys yet: the only feature on is the one that needs nothing
+    // beyond the required LLM key (test papers), so a fresh clone has it.
+    expect(fa.availableFeatures(FULL_ENV)).toEqual(['Test papers from the book (/testpaper)']);
     const withGamma = fa.availableFeatures({ ...FULL_ENV, GAMMA_API_KEY: 'k' });
     expect(withGamma).toContain('Lesson-plan generation (Gamma)');
   });

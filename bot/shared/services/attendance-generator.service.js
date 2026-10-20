@@ -1,15 +1,17 @@
 /**
  * Attendance Generator Service
- * Excel generation for attendance records matching Pakistani register format
+ * Excel generation for attendance records in the shape of a paper class register
  *
  * Created: January 24, 2026
  */
 
 const ExcelJS = require('exceljs');
 const { logToFile } = require('../utils/logger');
+const { redactUrl } = require('../utils/redact-url');
+const AttendanceRegister = require('./attendance-register.service');
 
 /**
- * Column definitions for Pakistani attendance register
+ * Column definitions for the daily attendance sheet
  */
 const COLUMNS = {
   rollNumber: { header: 'Roll #', key: 'rollNumber', width: 8 },
@@ -108,6 +110,7 @@ class AttendanceGeneratorService {
     const total = records.length;
     const present = records.filter(r => r.status === 'present').length;
     const absent = records.filter(r => r.status === 'absent').length;
+    const leave = records.filter(r => r.status === 'leave').length;
 
     const rate = total > 0 ? ((present / total) * 100) : 0;
     const attendanceRate = rate === 100 || rate === 0
@@ -118,6 +121,7 @@ class AttendanceGeneratorService {
       total,
       present,
       absent,
+      leave,
       attendanceRate
     };
   }
@@ -353,7 +357,7 @@ class AttendanceGeneratorService {
 
     logToFile('Attendance Excel uploaded to R2', {
       key,
-      url,
+      url: redactUrl(url),
       fileName
     });
 
@@ -428,63 +432,53 @@ class AttendanceGeneratorService {
   }
 
   /**
+   * Flatten month sessions into the one record shape the register reads:
+   * { student_id, date: 'YYYY-MM-DD', status }.
+   *
+   * @param {Array} sessions - Session records with attendance_records
+   * @returns {Array}
+   */
+  static flattenSessions(sessions) {
+    return (sessions || []).flatMap((session) => (session.attendance_records || []).map((r) => ({
+      student_id: r.student_id,
+      date: session.session_date,
+      status: r.status
+    })));
+  }
+
+  /**
    * Build attendance matrix from students and sessions
-   * Creates { studentId: { student, days: { day: 'P'|'A' } } }
+   * Creates { studentId: { student, days: { day: 'P'|'A'|'L' } } }
+   *
+   * Delegates to the register builder, which keeps Leave as its own status and reads
+   * the day off the date string (`new Date(date).getDate()` is the day before in a
+   * negative UTC offset).
    *
    * @param {Array} students - Array of student objects
    * @param {Array} sessions - Array of session objects with attendance_records
    * @returns {Object} Matrix indexed by student ID
    */
   static buildAttendanceMatrix(students, sessions) {
-    const matrix = {};
-
-    // Initialize all students with empty days
-    for (const student of students) {
-      matrix[student.id] = {
-        student,
-        days: {}
-      };
+    const matrix = AttendanceRegister.buildMatrix(students, this.flattenSessions(sessions));
+    for (const entry of Object.values(matrix)) {
+      entry.student = entry.person;
     }
-
-    // Populate from sessions
-    for (const session of sessions || []) {
-      const day = new Date(session.session_date).getDate();
-
-      for (const record of session.attendance_records || []) {
-        if (matrix[record.student_id]) {
-          matrix[record.student_id].days[day] =
-            record.status === 'present' ? 'P' : 'A';
-        }
-      }
-    }
-
     return matrix;
   }
 
   /**
-   * Calculate monthly statistics for a student
+   * Calculate monthly statistics for a student — the student rule: a leave day is a
+   * marked day the child was not in the room.
    *
-   * @param {Object} days - Object with day numbers as keys and 'P'|'A' as values
-   * @returns {Object} { present, absent, percentage }
+   * @param {Object} days - Object with day numbers as keys and 'P'|'A'|'L' as values
+   * @returns {Object} { present, absent, leave, percentage }
    */
   static calculateStudentMonthlyStats(days) {
-    let present = 0;
-    let absent = 0;
-
-    for (const status of Object.values(days)) {
-      if (status === 'P') present++;
-      if (status === 'A') absent++;
-    }
-
-    const total = present + absent;
-    const percentage = total > 0 ? Math.round((present / total) * 100) : 0;
-
-    return { present, absent, percentage };
+    return AttendanceRegister.monthlyStats(days, { subject: 'student' });
   }
 
   /**
-   * Create monthly register Excel from pre-fetched data
-   * (For testing without database)
+   * Create the monthly class register from pre-fetched data.
    *
    * @param {Object} metadata - { className, section }
    * @param {number} month - Month (1-12)
@@ -494,218 +488,18 @@ class AttendanceGeneratorService {
    * @returns {Promise<Buffer>} Excel buffer
    */
   static async createMonthlyRegisterBufferFromData(metadata, month, year, students, sessions) {
-    const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'Rumi - Digital Teacher Coach';
-    workbook.created = new Date();
-
-    const daysInMonth = new Date(year, month, 0).getDate();
-    const weekendDays = this.getWeekendDays(year, month);
-    const matrix = this.buildAttendanceMatrix(students, sessions);
-
-    const sheet = workbook.addWorksheet('Monthly Register', {
-      views: [{ state: 'frozen', xSplit: 2, ySplit: 4 }]
-    });
-
-    // Add headers
-    this.addMonthlyHeaders(sheet, metadata, month, year, daysInMonth, weekendDays);
-
-    // Add student rows
-    this.addMonthlyStudentRows(sheet, students, matrix, daysInMonth, weekendDays);
-
-    // Generate buffer
-    const buffer = await workbook.xlsx.writeBuffer();
-
-    logToFile('Monthly register Excel generated', {
-      className: metadata.className,
-      month,
-      year,
-      students: students.length,
-      bufferSize: buffer.length
-    });
-
-    return Buffer.from(buffer);
-  }
-
-  /**
-   * Add header rows to monthly register
-   */
-  static addMonthlyHeaders(sheet, metadata, month, year, daysInMonth, weekendDays) {
-    // Title row
-    const titleRow = sheet.addRow(['Monthly Attendance Register']);
-    sheet.mergeCells(1, 1, 1, daysInMonth + 5);
-    titleRow.font = { bold: true, size: 14 };
-    titleRow.alignment = { horizontal: 'center' };
-    titleRow.height = 25;
-
-    // Class info row
-    const className = metadata.section
+    const title = metadata.section
       ? `${metadata.className} - ${metadata.section}`
       : metadata.className;
-    sheet.addRow(['Class:', className]);
+    const people = [...(students || [])].sort((a, b) => (a.roll_number || 0) - (b.roll_number || 0));
 
-    // Month/Year row
-    sheet.addRow(['Month:', `${this.MONTH_NAMES[month - 1]} ${year}`]);
-
-    // Column headers row
-    const headerData = ['Roll #', 'Student Name'];
-    for (let day = 1; day <= daysInMonth; day++) {
-      const date = new Date(year, month - 1, day);
-      const dayName = this.DAY_NAMES[date.getDay()];
-      headerData.push(`${day}`);
-    }
-    headerData.push('P', 'A', '%');
-
-    const headerRow = sheet.addRow(headerData);
-    headerRow.height = 25;
-
-    // Style header row
-    headerRow.eachCell((cell, colNumber) => {
-      cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 9 };
-      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-      cell.fill = {
-        type: 'pattern',
-        pattern: 'solid',
-        fgColor: { argb: COLORS.headerBg }
-      };
-      cell.border = {
-        top: { style: 'thin', color: { argb: COLORS.borderColor } },
-        left: { style: 'thin', color: { argb: COLORS.borderColor } },
-        bottom: { style: 'thin', color: { argb: COLORS.borderColor } },
-        right: { style: 'thin', color: { argb: COLORS.borderColor } }
-      };
-
-      // Gray out weekend columns
-      if (colNumber > 2 && colNumber <= daysInMonth + 2) {
-        const day = colNumber - 2;
-        if (weekendDays.includes(day)) {
-          cell.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FF808080' } // Dark gray for weekend headers
-          };
-        }
-      }
-    });
-
-    // Add day name subheader row
-    const dayNameRow = ['', ''];
-    for (let day = 1; day <= daysInMonth; day++) {
-      const date = new Date(year, month - 1, day);
-      dayNameRow.push(this.DAY_NAMES[date.getDay()]);
-    }
-    dayNameRow.push('', '', '');
-
-    const subHeaderRow = sheet.addRow(dayNameRow);
-    subHeaderRow.height = 18;
-    subHeaderRow.eachCell((cell, colNumber) => {
-      cell.font = { size: 8, color: { argb: 'FF666666' } };
-      cell.alignment = { horizontal: 'center', vertical: 'middle' };
-
-      // Gray out weekend columns
-      if (colNumber > 2 && colNumber <= daysInMonth + 2) {
-        const day = colNumber - 2;
-        if (weekendDays.includes(day)) {
-          cell.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFD9D9D9' }
-          };
-        }
-      }
-    });
-
-    // Set column widths
-    sheet.getColumn(1).width = 6;   // Roll #
-    sheet.getColumn(2).width = 22;  // Student Name
-    for (let i = 3; i <= daysInMonth + 2; i++) {
-      sheet.getColumn(i).width = 3.5; // Day columns (narrow)
-    }
-    sheet.getColumn(daysInMonth + 3).width = 4; // P total
-    sheet.getColumn(daysInMonth + 4).width = 4; // A total
-    sheet.getColumn(daysInMonth + 5).width = 5; // %
-  }
-
-  /**
-   * Add student data rows to monthly register
-   */
-  static addMonthlyStudentRows(sheet, students, matrix, daysInMonth, weekendDays) {
-    // Sort students by roll number
-    const sortedStudents = [...students].sort((a, b) => (a.roll_number || 0) - (b.roll_number || 0));
-
-    for (const student of sortedStudents) {
-      const studentData = matrix[student.id];
-      const days = studentData?.days || {};
-
-      const rowData = [student.roll_number || '', student.student_name || ''];
-
-      // Add status for each day
-      for (let day = 1; day <= daysInMonth; day++) {
-        const status = days[day] || '-';
-        rowData.push(status);
-      }
-
-      // Calculate and add totals
-      const stats = this.calculateStudentMonthlyStats(days);
-      rowData.push(stats.present, stats.absent, `${stats.percentage}%`);
-
-      const row = sheet.addRow(rowData);
-
-      // Style cells
-      row.eachCell((cell, colNumber) => {
-        cell.alignment = { horizontal: 'center', vertical: 'middle' };
-        cell.border = {
-          top: { style: 'thin', color: { argb: COLORS.borderColor } },
-          left: { style: 'thin', color: { argb: COLORS.borderColor } },
-          bottom: { style: 'thin', color: { argb: COLORS.borderColor } },
-          right: { style: 'thin', color: { argb: COLORS.borderColor } }
-        };
-        cell.font = { size: 9 };
-
-        // Student name - left align
-        if (colNumber === 2) {
-          cell.alignment = { horizontal: 'left', vertical: 'middle' };
-        }
-
-        // Day columns (3 to daysInMonth+2)
-        if (colNumber > 2 && colNumber <= daysInMonth + 2) {
-          const day = colNumber - 2;
-          const status = days[day];
-
-          // Weekend styling
-          if (weekendDays.includes(day)) {
-            cell.fill = {
-              type: 'pattern',
-              pattern: 'solid',
-              fgColor: { argb: 'FFE8E8E8' }
-            };
-            cell.font = { size: 9, color: { argb: 'FF999999' } };
-          }
-
-          // Present (green) / Absent (red) styling
-          if (status === 'P') {
-            cell.font = { bold: true, color: { argb: COLORS.presentText }, size: 9 };
-            if (!weekendDays.includes(day)) {
-              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.presentBg } };
-            }
-          } else if (status === 'A') {
-            cell.font = { bold: true, color: { argb: COLORS.absentText }, size: 9 };
-            if (!weekendDays.includes(day)) {
-              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.absentBg } };
-            }
-          }
-        }
-
-        // Percentage column - color based on rate
-        if (colNumber === daysInMonth + 5) {
-          const pct = stats.percentage;
-          if (pct >= 90) {
-            cell.font = { bold: true, color: { argb: COLORS.presentText }, size: 9 };
-          } else if (pct < 75) {
-            cell.font = { bold: true, color: { argb: COLORS.absentText }, size: 9 };
-          }
-        }
-      });
-    }
+    return AttendanceRegister.createMonthlyRegisterBuffer(
+      { title, subject: 'student' },
+      month,
+      year,
+      people,
+      this.flattenSessions(sessions)
+    );
   }
 }
 

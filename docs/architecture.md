@@ -50,6 +50,21 @@ Meta WhatsApp API
 | Branding | `bot/shared/config/branding.js` | Customizable bot identity |
 | Feature gating | `bot/shared/config/feature-availability.js` | Presence-based feature availability (no tiers) |
 
+## Temp files for media
+
+Every media send or receive that touches disk writes into a directory of its own:
+`privateTempPath(baseDir, fileName, prefix)` from `bot/shared/utils/private-temp.js`, removed with
+`removePrivateTemp(handle)` in a `finally`. The Meta upload reads a file only when the request body goes out, and
+voice notes are read back after awaits, so a path named by the clock (`audio_${Date.now()}.ogg`) or by a display
+name (`Attendance_Grade_5_A_September_2026.xlsx`, the same at every school) is shared by two concurrent calls: one
+person receives the other's file, with no error. The file inside keeps the name the recipient should see; only the
+directory is unique. Use the helper for any new code that writes a file and hands its path to a send, an upload or
+a transcription.
+
+To log which bytes a `sendDocument` actually sent, take `takeUploadedSha256(path)` from
+`bot/shared/utils/upload-digest.js` after the send returns: each driver records a short sha of what it read from
+that path (the Meta driver as its upload stream is consumed).
+
 ## Message Flow
 
 1. WhatsApp sends webhook POST to `/webhook`
@@ -82,7 +97,8 @@ Meta WhatsApp API
 | **Quizzes** | `quizzes`, `quiz_sessions`, `quiz_questions`, `quiz_answers` | active |
 | **Exam checker** | `exam_check_sessions`, `exam_submissions`, `exam_grades`, `image_analysis_requests` | active |
 | **Video generation** | `video_requests`, `video_tasks`, `student_videos`, `student_video_feedback` | active |
-| **Attendance** | `attendance_sessions`, `attendance_records` | active |
+| **Attendance** | `attendance_sessions`, `attendance_records`, `teacher_attendance_records`, `schools` | active |
+| **Teacher nudges** | `teacher_nudges` | active |
 | **Homework + content** | `homework_chapters`, `textbook_toc` | active |
 | **BYOF (bring-your-own-flow)** | `byof_plans`, `byof_sessions`, `byof_messages`, `byof_approval_log` | active |
 | **Broadcasts** | `broadcast_logs`, `broadcast_messages`, `website_visits`, `release_notes` | active |

@@ -252,7 +252,7 @@ describe('attach', () => {
       tryHandleAttendanceLoopButton: jest.fn().mockResolvedValue(false),
       ...overrides,
     };
-    jest.doMock('../../bot/shared/routes/discord-modal-interactions.handler', () => mod, { virtual: true });
+    jest.doMock('../../bot/shared/routes/discord-modal-interactions.handler', () => mod);
     return mod;
   }
 

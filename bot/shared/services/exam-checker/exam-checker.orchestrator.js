@@ -12,6 +12,7 @@
 
 const { runWithCorrelation, getCurrentCorrelationId } = require('../../utils/structured-logger');
 const { logToFile } = require('../../utils/logger');
+const { flowSurfaceFor } = require('../messaging/channel-capabilities');
 
 // Service imports (to be created)
 // const ExamSessionService = require('./exam-session.service');
@@ -194,8 +195,10 @@ class ExamCheckerOrchestrator {
       // It's a data_exchange flow — the endpoint (/api/flows/exam-confirm-students)
       // serves the detected-student list on INIT keyed off the flow_token, which
       // IS the session id. We pass NO inline data; just the token.
+      // Slack and Discord open it as a modal (exam-checker.handler.js); a
+      // text-only channel (Matrix, Baileys) can't, so it auto-confirms below.
       const confirmFlowId = process.env.EXAM_CHECKER_STUDENTS_FLOW_ID;
-      if (confirmFlowId) {
+      if (confirmFlowId && flowSurfaceFor(session.recipient_identifier) !== 'text') {
         return {
           flow: {
             id: confirmFlowId,
@@ -208,7 +211,8 @@ class ExamCheckerOrchestrator {
       }
 
       // Graceful degrade: the confirm Flow isn't registered on this deployment
-      // (EXAM_CHECKER_STUDENTS_FLOW_ID unset). Rather than dead-end the teacher,
+      // (EXAM_CHECKER_STUDENTS_FLOW_ID unset), or this channel can't show it.
+      // Rather than dead-end the teacher,
       // auto-confirm every detected student and proceed straight to grading.
       logToFile('ℹ️ EXAM_CHECKER_STUDENTS_FLOW_ID unset — auto-confirming detected students', {
         sessionId: session.id, count: students.length,
@@ -439,7 +443,7 @@ class ExamCheckerOrchestrator {
         text: `${questionNum}: What's the correct answer?`,
         interactive: {
           type: 'button',
-          body: { text: question.text || 'Select the correct option:' },
+          body: { text: `${question.text || 'Select the correct option:'}\n\nSend /cancel to stop.` },
           action: {
             buttons: [
               { type: 'reply', reply: { id: 'ech_ans_A', title: 'A' } },
@@ -454,7 +458,7 @@ class ExamCheckerOrchestrator {
 
     // For short answer, essay, math - ask for text or voice
     return {
-      text: `${questionNum}: ${question.text || 'What is the correct answer?'}\n\n💡 Type your answer or send a 🎤 voice note.`
+      text: `${questionNum}: ${question.text || 'What is the correct answer?'}\n\n💡 Type your answer or send a 🎤 voice note. Send /cancel to stop.`
     };
   }
 
@@ -488,7 +492,13 @@ class ExamCheckerOrchestrator {
   static async getSessionState(userId) {
     const ExamSessionService = require('./exam-session.service');
     const session = await ExamSessionService.getActive(userId);
-    return session ? { active: true, state: session.status, sessionId: session.id } : { active: false };
+    if (!session) return { active: false };
+    return {
+      active: true,
+      state: session.status,
+      sessionId: session.id,
+      imageCount: session.original_images?.length || 0,
+    };
   }
 }
 

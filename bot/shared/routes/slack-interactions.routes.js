@@ -131,7 +131,24 @@ function makeRoutedInteractionsHandler(dispatch) {
   };
 }
 
+/**
+ * The operator switched Slack off (RUMI_FEATURE_CHANNEL_SLACK=off): the router
+ * has no Slack driver to reply through, so a request is acknowledged (Slack
+ * retries anything else) and dropped unread; nothing in it is acted on, so
+ * it needs no signature check. Decided at mount, like every other
+ * channel's switch, so it applies at the next restart.
+ */
+function pausedChannel(req, res) {
+  logToFile('Slack: channel switched off by the operator -- request ignored', { path: req.path });
+  res.status(200).send('');
+}
+
 function mount(dispatch) {
+  const { isChannelSwitchedOff } = require('../config/feature-availability');
+  if (isChannelSwitchedOff('slack', process.env)) {
+    for (const path of ['/events', '/interactions', '/commands']) router.post(path, pausedChannel);
+    return router;
+  }
   router.post('/events', verifyAndParse('json'), makeEventsHandler(dispatch));
   router.post('/interactions', verifyAndParse('form'), makeRoutedInteractionsHandler(dispatch));
   router.post('/commands', verifyAndParse('form'), makeSlashCommandHandler(dispatch));

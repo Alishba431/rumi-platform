@@ -1,0 +1,42 @@
+<!doctype html>
+<!--
+  Android app, over-the-air mode (capacitor.config.ts, server.errorPath).
+  When the live portal cannot be reached at launch, Capacitor loads this page
+  from the copy bundled in the APK instead of Android's raw "Webpage not
+  available". Retry reloads the portal url passed in `?u=` (https only). It
+  must not navigate to the bundled origin: once server.url is set that is an
+  external navigation, and Capacitor hands it to the browser.
+  Nothing here may load from the network.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Can't reach the portal</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+             justify-content: center; gap: 12px; padding: 24px; box-sizing: border-box; text-align: center;
+             font-family: system-ui, sans-serif; background: #001240; color: #fff; }
+      h1 { font-size: 1.4rem; font-weight: 600; margin: 0; }
+      p { margin: 0; opacity: 0.85; max-width: 22rem; line-height: 1.4; }
+      button { margin-top: 12px; padding: 14px 40px; border: 0; border-radius: 999px; font-size: 1rem;
+               font-weight: 600; background: #f07142; color: #fff; }
+    </style>
+  </head>
+  <body>
+    <h1>Can't reach the portal</h1>
+    <p>Check your internet connection, then try again.</p>
+    <button id="retry" type="button">Try again</button>
+    <script>
+      var target = null;
+      try {
+        var u = new URL(new URLSearchParams(location.search).get('u') || '');
+        if (u.protocol === 'https:') target = u.href;
+      } catch (e) { /* no usable url: Retry reloads history instead */ }
+      document.getElementById('retry').addEventListener('click', function () {
+        if (target) location.replace(target);
+        else history.back();
+      });
+    </script>
+  </body>
+</html>

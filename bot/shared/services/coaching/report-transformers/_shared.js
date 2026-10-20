@@ -21,10 +21,18 @@ function formatDate(dateString) {
 
 /**
  * Extract fidelity section from analysis if present.
+ *
+ * Preferred: the MEASURED lesson-plan fidelity (analysis_data.lp_fidelity, LP_FIDELITY_ENABLED) — band, "N of M
+ * planned moves delivered" and a per-move table, or a "not assessed" line saying why. Without it (the feature off,
+ * or an older session) the legacy whole-lesson estimate is returned exactly as before.
  * @param {object} analysis - Enhanced analysis data
  * @returns {object|null} Fidelity section or null
  */
 function extractFidelity(analysis) {
+  if (analysis.lp_fidelity) {
+    const { buildFidelityReportSection } = require('../fidelity/fidelity-report');
+    return buildFidelityReportSection(analysis.lp_fidelity, analysis.language || 'en');
+  }
   if (!analysis.fidelity_analysis) return null;
 
   return {

@@ -44,6 +44,8 @@
 const fs = require('fs');
 const path = require('path');
 const { logToFile } = require('../../utils/logger');
+const { noteUploadedBytes } = require('../../utils/upload-digest');
+const { redactUrl } = require('../../utils/redact-url');
 const { downloadFromR2, extractKeyFromUrl } = require('../../storage/r2');
 const { prefixFor } = require('./channel-registry');
 
@@ -174,14 +176,14 @@ async function resolveMediaBuffer(url) {
     } catch (error) {
       if (!isAbsoluteHttpUrl(url)) throw error;
       logToFile('⚠️ Slack: R2 download failed — fetching the URL directly instead', {
-        url, error: error.message,
+        url: redactUrl(url), error: redactUrl(error.message),
       });
     }
   }
 
   if (!isAbsoluteHttpUrl(url)) {
     throw new Error(
-      `Cannot send media from "${url}": it is not an absolute URL, and R2 is not configured `
+      `Cannot send media from "${redactUrl(url)}": it is not an absolute URL, and R2 is not configured `
       + '(set R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY to read private objects).'
     );
   }
@@ -211,7 +213,7 @@ function slackErrorDetail(error) {
     return { code: data.error, neededScope: data.needed, providedScopes: data.provided };
   }
   if (data?.error) return { code: data.error };
-  return { message: error?.message };
+  return { message: redactUrl(error?.message) };
 }
 
 async function sendMessage(to, message) {
@@ -311,6 +313,7 @@ async function uploadFile(to, buffer, filename, caption) {
 async function sendDocument(to, filePath, filename, caption) {
   try {
     const buffer = fs.readFileSync(filePath);
+    noteUploadedBytes(filePath, buffer); // what the caller's log reports as sent
     return await uploadFile(to, buffer, filename, caption);
   } catch (error) {
     logToFile('❌ Slack: error sending document', { ...slackErrorDetail(error) });
@@ -332,7 +335,7 @@ async function sendDocumentFromUrl(to, documentUrl, filename, caption) {
     const buffer = await resolveMediaBuffer(documentUrl);
     return await uploadFile(to, buffer, filename, caption);
   } catch (error) {
-    logToFile('❌ Slack: error sending document from URL', { ...slackErrorDetail(error), documentUrl });
+    logToFile('❌ Slack: error sending document from URL', { ...slackErrorDetail(error), documentUrl: redactUrl(documentUrl) });
     return false;
   }
 }
@@ -342,7 +345,7 @@ async function sendAudioFromUrl(to, audioUrl) {
     const buffer = await resolveMediaBuffer(audioUrl);
     return await uploadFile(to, buffer, 'audio.mp3');
   } catch (error) {
-    logToFile('❌ Slack: error sending audio from URL', { ...slackErrorDetail(error), audioUrl });
+    logToFile('❌ Slack: error sending audio from URL', { ...slackErrorDetail(error), audioUrl: redactUrl(audioUrl) });
     return false;
   }
 }
@@ -357,7 +360,7 @@ async function sendAudioFromUrlReturningId(to, audioUrl) {
     // closest analogue Slack has to "the sent item's id" for a file share.
     return result?.files?.[0]?.id || null;
   } catch (error) {
-    logToFile('❌ Slack: error sending audio from URL (returning id)', { ...slackErrorDetail(error), audioUrl });
+    logToFile('❌ Slack: error sending audio from URL (returning id)', { ...slackErrorDetail(error), audioUrl: redactUrl(audioUrl) });
     return null;
   }
 }
@@ -367,7 +370,7 @@ async function sendImageFromUrl(to, imageUrl, caption = '') {
     const buffer = await resolveMediaBuffer(imageUrl);
     return await uploadFile(to, buffer, 'image.png', caption);
   } catch (error) {
-    logToFile('❌ Slack: error sending image from URL', { ...slackErrorDetail(error), imageUrl });
+    logToFile('❌ Slack: error sending image from URL', { ...slackErrorDetail(error), imageUrl: redactUrl(imageUrl) });
     return false;
   }
 }
@@ -386,7 +389,7 @@ async function sendVideoFromUrl(to, videoUrl, caption = '') {
     const buffer = await resolveMediaBuffer(videoUrl);
     return await uploadFile(to, buffer, 'video.mp4', caption);
   } catch (error) {
-    logToFile('❌ Slack: error sending video from URL', { ...slackErrorDetail(error), videoUrl });
+    logToFile('❌ Slack: error sending video from URL', { ...slackErrorDetail(error), videoUrl: redactUrl(videoUrl) });
     return false;
   }
 }
@@ -485,7 +488,7 @@ async function sendImageWithButtons(to, imageUrl, bodyText, buttons) {
     await client.chat.postMessage({ channel, text: bodyText, blocks });
     return true;
   } catch (error) {
-    logToFile('❌ Slack: error sending image with buttons', { ...slackErrorDetail(error), imageUrl });
+    logToFile('❌ Slack: error sending image with buttons', { ...slackErrorDetail(error), imageUrl: redactUrl(imageUrl) });
     return false;
   }
 }
@@ -535,8 +538,12 @@ async function sendInteractiveMessage(to, listData) {
           type: 'static_select',
           action_id: 'list_select',
           placeholder: { type: 'plain_text', text: action?.button || 'Choose an option' },
+          // A row's description is part of what the person chooses between, not
+          // decoration: a video quiz whose options outgrow the row title sends
+          // "A".."D" as titles and the option itself as the description.
           options: options.slice(0, 100).map((opt) => ({
             text: { type: 'plain_text', text: String(opt.title).slice(0, 75) },
+            ...(opt.description ? { description: { type: 'plain_text', text: String(opt.description).slice(0, 75) } } : {}),
             value: opt.id,
           })),
         }],

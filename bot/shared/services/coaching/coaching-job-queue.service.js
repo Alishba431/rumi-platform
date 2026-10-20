@@ -45,6 +45,31 @@ class CoachingJobQueueService {
   }
 
   /**
+   * Queue an observe debrief job (the coach's recorded feedback conversation).
+   * Each recording is its own job: the nonce from the audio id keeps a
+   * re-recorded debrief from being dropped as a duplicate of the first.
+   * @param {string} coachingSessionId
+   * @param {object} metadata - { from, audioId, mimeType }
+   */
+  static async queueObserveDebrief(coachingSessionId, metadata) {
+    const payload = { ...metadata };
+    if (payload.audioId) {
+      const crypto = require('crypto');
+      payload.dedupNonce = crypto.createHash('sha1').update(String(payload.audioId)).digest('hex').slice(0, 16);
+    }
+    return await this.queueJob(coachingSessionId, 'observe_debrief', payload);
+  }
+
+  /**
+   * Queue an observe teacher-report job.
+   * @param {string} coachingSessionId
+   * @param {object} metadata - { phase: 'preview'|'deliver'|'teacher_tap', ... } (phase is part of the dedup identity)
+   */
+  static async queueObserveTeacherReport(coachingSessionId, metadata) {
+    return await this.queueJob(coachingSessionId, 'observe_teacher_report', metadata);
+  }
+
+  /**
    * Queue lesson plan extraction job
    * @param {string} coachingSessionId
    * @param {object} metadata - { r2Key, fileType, userId }

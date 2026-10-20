@@ -1,10 +1,24 @@
 /**
- * html-to-pdf engine — Playwright wrapper. playwright-core is virtually mocked
+ * html-to-pdf engine — Playwright wrapper. playwright-core is mocked
  * so the suite needs no real Chromium (CI + local stay green; the real engine
  * only launches Chromium at runtime).
  */
 
+const path = require('path');
+
 let launchMock, page, context, browser;
+
+// playwright-core is installed under bot/ on a developer machine but not in CI's
+// root job. When it is installed, mock the file html-to-pdf actually resolves: a
+// virtual mock of an installed package is skipped once another suite in the same
+// worker has resolved the real one, and the real Chromium then runs instead.
+const PLAYWRIGHT = (() => {
+  try {
+    return require.resolve('playwright-core', { paths: [path.join(__dirname, '../../bot/shared/utils')] });
+  } catch {
+    return null;
+  }
+})();
 
 function load() {
   jest.resetModules();
@@ -23,7 +37,9 @@ function load() {
     close: jest.fn().mockResolvedValue(),
   };
   launchMock = jest.fn().mockResolvedValue(browser);
-  jest.doMock('playwright-core', () => ({ chromium: { launch: launchMock } }), { virtual: true });
+  const playwright = () => ({ chromium: { launch: launchMock } });
+  if (PLAYWRIGHT) jest.doMock(PLAYWRIGHT, playwright);
+  else jest.doMock('playwright-core', playwright, { virtual: true });
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
   return require('../../bot/shared/utils/html-to-pdf');
 }

@@ -15,6 +15,9 @@
  * default — everyone present), unlike exam-confirm's all-pre-checked
  * "confirmed" semantics, since the two screens mean opposite things by a
  * checked box.
+ *
+ * A second checkbox group, leave_students, names who is on approved leave —
+ * the second kind of away. Someone checked in both is on leave.
  */
 
 function toOption(row) {
@@ -38,16 +41,25 @@ function screenToView(screen, data, ctx) {
       blocks: [
         {
           type: 'section', block_id: 'instructions_block',
-          text: { type: 'plain_text', text: 'Check the students who are ABSENT. Everyone else will be marked present.' },
+          text: { type: 'plain_text', text: 'Check who is ABSENT, and who is on approved LEAVE. Everyone else will be marked present.' },
         },
         {
           // optional: true — submitting with nobody checked (everyone
           // present) is a valid, common case, not a validation failure.
           type: 'input', block_id: 'absent_students_block', optional: true,
-          label: { type: 'plain_text', text: 'Absent students' },
+          label: { type: 'plain_text', text: 'Absent' },
           element: {
             type: 'checkboxes',
             action_id: 'absent_students',
+            options,
+          },
+        },
+        {
+          type: 'input', block_id: 'leave_students_block', optional: true,
+          label: { type: 'plain_text', text: 'On approved leave' },
+          element: {
+            type: 'checkboxes',
+            action_id: 'leave_students',
             options,
           },
         },
@@ -77,8 +89,12 @@ function viewToScreenData(screen, stateValues) {
   const get = (blockId, actionId) => stateValues?.[blockId]?.[actionId];
 
   if (screen === 'MARK_ABSENT') {
-    const selected = get('absent_students_block', 'absent_students')?.selected_options || [];
-    return { absent_student_ids: selected.map((o) => o.value) };
+    const absent = get('absent_students_block', 'absent_students')?.selected_options || [];
+    const leave = get('leave_students_block', 'leave_students')?.selected_options || [];
+    return {
+      absent_student_ids: absent.map((o) => o.value),
+      leave_student_ids: leave.map((o) => o.value),
+    };
   }
   return {};
 }

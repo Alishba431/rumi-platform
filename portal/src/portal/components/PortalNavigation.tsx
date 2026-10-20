@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { Home, BookOpen, MessageSquare, TrendingUp, LogOut, FileText, Video } from 'lucide-react';
+import { Home, BookOpen, MessageSquare, TrendingUp, LogOut, FileText, Video, ClipboardList } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { cn } from '@/lib/utils';
 import rumiLogo from '@/assets/rumi-logo-header.png';
@@ -16,9 +16,12 @@ const PortalNavigation = () => {
     { title: 'Reading', path: '/portal/reading-assessments', icon: FileText },
     { title: 'Videos', path: '/portal/videos', icon: Video },
     { title: 'Analytics', path: '/portal/coaching/analytics', icon: TrendingUp },
+    // Coaches only; the API enforces it, this just keeps the nav honest.
+    ...(user?.isCoach ? [{ title: 'Observations', path: '/portal/observe', icon: ClipboardList }] : []),
   ];
 
-  const isActive = (path: string) => currentPath === path;
+  const isActive = (path: string) =>
+    currentPath === path || (path === '/portal/observe' && currentPath.startsWith('/portal/observe/'));
 
   return (
     <>

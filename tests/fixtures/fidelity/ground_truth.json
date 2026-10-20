@@ -1,0 +1,407 @@
+[
+  {
+    "case": "full",
+    "plan": "plan_fractions.md",
+    "transcript": "transcript_full.txt",
+    "expected": {
+      "fidelity_pct_min": 90,
+      "fidelity_pct_max": 100,
+      "null": false,
+      "note": null
+    },
+    "intent": [
+      {
+        "plan_step": "Warm-up: recall halves and quarters (which is bigger and why)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:00]"
+      },
+      {
+        "plan_step": "Announce the objective: add fractions with the same denominator",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:34]"
+      },
+      {
+        "plan_step": "Explain with fraction strips (shade 1/5 then 2/5 more, count fifths)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:50]"
+      },
+      {
+        "plan_step": "Address the common mistake 1/5 + 2/5 = 3/10 (do not add denominators)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:18]"
+      },
+      {
+        "plan_step": "Model the worked example 1/5 + 2/5 step by step on the board",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:44]"
+      },
+      {
+        "plan_step": "Guided practice with the whole class (2/8 + 3/8 and 1/6 + 4/6)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[02:01]"
+      },
+      {
+        "plan_step": "Pair activity: 3 problems from the card solved with a partner using strips",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[02:25]"
+      },
+      {
+        "plan_step": "Peer checking: swap cards with another pair and check answers",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:03]"
+      },
+      {
+        "plan_step": "Whole-class check: mini whiteboards (3/9 + 4/9) and thumbs up/sideways",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:18]"
+      },
+      {
+        "plan_step": "Recap: a pupil states the rule in one sentence",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:41]"
+      },
+      {
+        "plan_step": "Exit ticket: one question each (2/6 + 3/6), collected by the teacher",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:50]"
+      },
+      {
+        "plan_step": "Homework: workbook page 42, questions 1-5",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[04:06]"
+      },
+      {
+        "plan_step": "Extension (optional, if time permits): pupils write their own story problem",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[04:06]",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "case": "half",
+    "plan": "plan_fractions.md",
+    "transcript": "transcript_half.txt",
+    "expected": {
+      "fidelity_pct_min": 55,
+      "fidelity_pct_max": 75,
+      "null": false,
+      "note": null
+    },
+    "intent": [
+      {
+        "plan_step": "Warm-up: recall halves and quarters (which is bigger and why)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:00]"
+      },
+      {
+        "plan_step": "Announce the objective: add fractions with the same denominator",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:48]"
+      },
+      {
+        "plan_step": "Explain with fraction strips (shade 1/5 then 2/5 more, count fifths)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:04]"
+      },
+      {
+        "plan_step": "Address the common mistake 1/5 + 2/5 = 3/10 (do not add denominators)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:29]"
+      },
+      {
+        "plan_step": "Model the worked example 1/5 + 2/5 step by step on the board",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:51]"
+      },
+      {
+        "plan_step": "Guided practice with the whole class (2/8 + 3/8 and 1/6 + 4/6)",
+        "intended_verdict": "partial",
+        "evidence_stamp": "[02:34]"
+      },
+      {
+        "plan_step": "Pair activity: 3 problems from the card solved with a partner using strips",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Peer checking: swap cards with another pair and check answers",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Whole-class check: mini whiteboards (3/9 + 4/9) and thumbs up/sideways",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Recap: a pupil states the rule in one sentence",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:23]"
+      },
+      {
+        "plan_step": "Exit ticket: one question each (2/6 + 3/6), collected by the teacher",
+        "intended_verdict": "partial",
+        "evidence_stamp": "[03:43]"
+      },
+      {
+        "plan_step": "Homework: workbook page 42, questions 1-5",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:50]"
+      },
+      {
+        "plan_step": "Extension (optional, if time permits): pupils write their own story problem",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null,
+        "optional": true,
+        "comment": "optional move not attempted; excluded from the denominator"
+      }
+    ]
+  },
+  {
+    "case": "substituted",
+    "plan": "plan_fractions.md",
+    "transcript": "transcript_substituted.txt",
+    "expected": {
+      "fidelity_pct_min": 85,
+      "fidelity_pct_max": 100,
+      "null": false,
+      "note": null
+    },
+    "intent": [
+      {
+        "plan_step": "Warm-up: recall halves and quarters (which is bigger and why)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:00]"
+      },
+      {
+        "plan_step": "Announce the objective: add fractions with the same denominator",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:34]"
+      },
+      {
+        "plan_step": "Explain with fraction strips (shade 1/5 then 2/5 more, count fifths)",
+        "intended_verdict": "substituted_equivalent",
+        "evidence_stamp": "[00:49]"
+      },
+      {
+        "plan_step": "Address the common mistake 1/5 + 2/5 = 3/10 (do not add denominators)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:26]"
+      },
+      {
+        "plan_step": "Model the worked example 1/5 + 2/5 step by step on the board",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:51]"
+      },
+      {
+        "plan_step": "Guided practice with the whole class (2/8 + 3/8 and 1/6 + 4/6)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[02:03]"
+      },
+      {
+        "plan_step": "Pair activity: 3 problems from the card solved with a partner using strips",
+        "intended_verdict": "substituted_equivalent",
+        "evidence_stamp": "[02:25]"
+      },
+      {
+        "plan_step": "Peer checking: swap cards with another pair and check answers",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:04]"
+      },
+      {
+        "plan_step": "Whole-class check: mini whiteboards (3/9 + 4/9) and thumbs up/sideways",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:20]"
+      },
+      {
+        "plan_step": "Recap: a pupil states the rule in one sentence",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:41]"
+      },
+      {
+        "plan_step": "Exit ticket: one question each (2/6 + 3/6), collected by the teacher",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:51]"
+      },
+      {
+        "plan_step": "Homework: workbook page 42, questions 1-5",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[04:05]"
+      },
+      {
+        "plan_step": "Extension (optional, if time permits): pupils write their own story problem",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[04:05]",
+        "optional": true
+      }
+    ]
+  },
+  {
+    "case": "plants_vs_fractions",
+    "plan": "plan_fractions.md",
+    "transcript": "transcript_plants.txt",
+    "expected": {
+      "fidelity_pct_min": 0,
+      "fidelity_pct_max": 15,
+      "null": false,
+      "note": "lesson_mismatch"
+    },
+    "intent": [
+      {
+        "plan_step": "Warm-up: recall halves and quarters (which is bigger and why)",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Announce the objective: add fractions with the same denominator",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Explain with fraction strips (shade 1/5 then 2/5 more, count fifths)",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Address the common mistake 1/5 + 2/5 = 3/10 (do not add denominators)",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Model the worked example 1/5 + 2/5 step by step on the board",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Guided practice with the whole class (2/8 + 3/8 and 1/6 + 4/6)",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Pair activity: 3 problems from the card solved with a partner using strips",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Peer checking: swap cards with another pair and check answers",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Whole-class check: mini whiteboards (3/9 + 4/9) and thumbs up/sideways",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Recap: a pupil states the rule in one sentence",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Exit ticket: one question each (2/6 + 3/6), collected by the teacher",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Homework: workbook page 42, questions 1-5",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null
+      },
+      {
+        "plan_step": "Extension (optional, if time permits): pupils write their own story problem",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null,
+        "optional": true,
+        "comment": "optional move not attempted; excluded from the denominator"
+      }
+    ]
+  },
+  {
+    "case": "nostamps",
+    "plan": "plan_fractions.md",
+    "transcript": "transcript_full_nostamps.txt",
+    "expected": {
+      "fidelity_pct_min": null,
+      "fidelity_pct_max": null,
+      "null": true,
+      "note": null
+    },
+    "intent": []
+  },
+  {
+    "case": "plants_self",
+    "plan": "plan_plants.md",
+    "transcript": "transcript_plants.txt",
+    "expected": {
+      "fidelity_pct_min": 85,
+      "fidelity_pct_max": 100,
+      "null": false,
+      "note": null
+    },
+    "intent": [
+      {
+        "plan_step": "Warm-up: what does a plant need; where have you seen plants",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:00]"
+      },
+      {
+        "plan_step": "Announce the objective: parts of a plant and their jobs",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:32]"
+      },
+      {
+        "plan_step": "Show a real plant out of its pot and have pupils name the parts",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[00:46]"
+      },
+      {
+        "plan_step": "Explain roots: hold the plant and take in water",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:08]"
+      },
+      {
+        "plan_step": "Celery-in-coloured-water demonstration: the stem carries water",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:28]"
+      },
+      {
+        "plan_step": "Explain leaves make food from sunlight; the flower makes seeds",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[01:57]"
+      },
+      {
+        "plan_step": "Pupils label the board diagram (roots, stem, leaves, flower)",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[02:36]"
+      },
+      {
+        "plan_step": "Group matching activity: part cards to job cards",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[02:47]"
+      },
+      {
+        "plan_step": "Whole-class check: teacher points, class calls out the job",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:19]"
+      },
+      {
+        "plan_step": "Exit slip: one part and its job, collected",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[03:55]"
+      },
+      {
+        "plan_step": "Homework: draw and label a plant from home",
+        "intended_verdict": "executed",
+        "evidence_stamp": "[04:07]"
+      },
+      {
+        "plan_step": "Extension (optional, if time permits): plant a bean seed in a cup",
+        "intended_verdict": "not_done",
+        "evidence_stamp": null,
+        "optional": true,
+        "comment": "optional move not attempted; excluded from the denominator"
+      }
+    ]
+  }
+]

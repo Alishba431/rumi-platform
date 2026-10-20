@@ -258,11 +258,13 @@ function classSetupFlow() {
         prompt: () => ({
           // The phone number is optional but prompted for, because without it
           // the class cannot receive quizzes or reports — and the teacher only
-          // discovers that later, at the class picker.
+          // discovers that later, at the class picker. The example shows both
+          // forms the parser accepts (international and local), in the
+          // fictional 555 range.
           body: 'Now send me your students — *one per line*.\n\n'
             + "Add the parent's WhatsApp number if you have it, so I can send "
             + 'quizzes and reports to them.\n\nFor example:\n'
-            + 'Ahmed Khan +923001234567\nZara s/o Abdul 03007654321\nBilal Hussain',
+            + 'Ahmed Khan +1 555 0101234\nZara s/o Abdul 0555 0104321\nBilal Hussain',
         }),
       },
     ],
@@ -287,9 +289,11 @@ function classSetupFlow() {
 // CheckboxGroup over the roster — there's no text equivalent for a real
 // checkbox list, so this collects the same information as one free-text
 // reply instead: the roster is listed by number in the prompt, and the
-// teacher replies with the numbers of absent students (or "none").
-// Synthesises the exact { absent_students, flow_token, class_name,
-// date_display, session_type } response_json shape flow-type-detector.js /
+// teacher replies with the numbers of absent students (or "none"). Approved
+// leave rides in the same reply after the word "leave" ("2, 5 leave 3") —
+// marking stays one message, by exception.
+// Synthesises the exact { absent_students, leave_students, flow_token,
+// class_name, date_display, session_type } response_json shape flow-type-detector.js /
 // AttendanceFlowHandler already expect from a real Flow submission, so
 // whatsapp-bot.js's existing attendance_marking dispatch
 // (FlowResponseHandler.handleAttendanceMarkingFlow) runs completely
@@ -300,17 +304,46 @@ function classSetupFlow() {
 // handleMarkingMethodSelection's 'tap' branch), read here by userId exactly
 // like the Slack/Discord tap-to-mark screens do.
 function parseAbsentAttendanceReply(reply, students) {
-  const trimmed = String(reply || '').trim().toLowerCase();
-  const noneKeywords = ['none', 'no one', 'nobody', 'everyone present', 'everyone is here', 'all present'];
-  if (!trimmed || noneKeywords.includes(trimmed)) return [];
+  return parseAttendanceReply(reply, students).absentIds;
+}
 
-  const numbers = trimmed.match(/\d+/g) || [];
+function numbersToIds(text, students) {
   const ids = [];
-  for (const numStr of numbers) {
-    const index = parseInt(numStr, 10) - 1;
-    if (students[index]) ids.push(students[index].id);
+  for (const numStr of String(text || '').match(/\d+/g) || []) {
+    const student = students[parseInt(numStr, 10) - 1];
+    if (student && !ids.includes(student.id)) ids.push(student.id);
   }
   return ids;
+}
+
+/**
+ * One reply, two lists: the numbers before "leave" are absent, the numbers after
+ * it are on approved leave. "2, 5 leave 3" · "leave 1" · "absent 2 leave 1, 3".
+ * Someone named in both counts once, as leave — the more specific statement.
+ *
+ * @returns {{absentIds: string[], leaveIds: string[]}}
+ */
+function parseAttendanceReply(reply, students) {
+  const trimmed = String(reply || '').trim().toLowerCase();
+  const noneKeywords = ['none', 'no one', 'nobody', 'everyone present', 'everyone is here', 'all present'];
+  if (!trimmed || noneKeywords.includes(trimmed)) return { absentIds: [], leaveIds: [] };
+
+  const at = trimmed.search(/\b(on\s+)?leave\b|چھٹی|chutti/);
+  const absentPart = at === -1 ? trimmed : trimmed.slice(0, at);
+  const leavePart = at === -1 ? '' : trimmed.slice(at);
+
+  const leaveIds = numbersToIds(leavePart, students);
+  const absentIds = numbersToIds(absentPart, students).filter((id) => !leaveIds.includes(id));
+  return { absentIds, leaveIds };
+}
+
+/** The marking token flow-response.handler.js splits on ':' — class or staff. */
+function markingFlowToken(userId, sessionState) {
+  const date = sessionState.selectedDate;
+  const sessionType = sessionState.sessionType || 'full_day';
+  const name = encodeURIComponent(sessionState.selectedClass?.class_name || (sessionState.subject === 'staff' ? 'School' : 'Class'));
+  const target = sessionState.subject === 'staff' ? 'staff' : sessionState.selectedListId;
+  return `${userId}:${target}:${date}:${sessionType}:${name}`;
 }
 
 function attendanceMarkingFlow() {
@@ -335,9 +368,17 @@ function attendanceMarkingFlow() {
           }
 
           const roster = students.map((s, i) => `${i + 1}. ${s.student_name}`).join('\n');
+          // eslint-disable-next-line global-require -- see above
+          const AttendanceDates = require('../attendance-dates');
+          const day = sessionState.selectedDate && sessionState.selectedDate !== AttendanceDates.todayString()
+            ? `on ${AttendanceDates.formatDisplayDate(sessionState.selectedDate)}`
+            : 'today';
+          const where = sessionState.subject === 'staff' ? `at ${classDisplay}` : `in ${classDisplay}`;
           return {
-            header: '📋 Mark Attendance',
-            body: `${roster}\n\nWho's absent in ${classDisplay} today?\n\nReply with the numbers, separated by commas (e.g. "2, 5"), or "none" if everyone is present.`,
+            header: sessionState.subject === 'staff' ? '📋 Mark Staff Attendance' : '📋 Mark Attendance',
+            body: `${roster}\n\nWho's absent ${where} ${day}?\n\n`
+              + 'Reply with the numbers, separated by commas (e.g. "2, 5"), or "none" if everyone is present.\n'
+              + 'Anyone on approved leave? Add "leave" and their numbers (e.g. "2, 5 leave 3").',
           };
         },
       },
@@ -353,15 +394,18 @@ function attendanceMarkingFlow() {
         return { text: 'No attendance session found. Say "attendance" to start again.' };
       }
 
-      const absentIds = parseAbsentAttendanceReply(answers.absent_students?.title, students);
-      const today = sessionState.selectedDate || new Date().toISOString().split('T')[0];
+      const { absentIds, leaveIds } = parseAttendanceReply(answers.absent_students?.title, students);
+      // eslint-disable-next-line global-require -- see above
+      const AttendanceDates = require('../attendance-dates');
+      const today = sessionState.selectedDate || AttendanceDates.todayString();
       const sessionType = sessionState.sessionType || 'full_day';
       const className = sessionState.selectedClass?.class_name || 'Class';
-      const flowToken = `${userId}:${sessionState.selectedListId}:${today}:${sessionType}:${encodeURIComponent(className)}`;
+      const flowToken = markingFlowToken(userId, { ...sessionState, selectedDate: today });
 
       const responseJson = {
         flow_token: flowToken,
         absent_students: absentIds,
+        leave_students: leaveIds,
         class_name: className,
         date_display: today,
         session_type: sessionType,
@@ -422,6 +466,8 @@ module.exports = {
   _resetForTests,
   toNfmReply,
   parseAbsentAttendanceReply,
+  parseAttendanceReply,
+  markingFlowToken,
   ATTENDANCE_FREQUENCIES,
   READING_LANGUAGES,
   READING_MODES,
