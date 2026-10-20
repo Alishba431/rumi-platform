@@ -312,17 +312,17 @@ describe('feedback (§4b invariant)', () => {
     expect(msgs.find((m) => m.role === 'feedback_correct').body).toContain('“.”');
   });
 
-  test('distractor-specific feedback is used when the question has it', () => {
+  test('distractor-specific feedback is used when the question has it, behind the verdict mark', () => {
     const msgs = render.build(row({
       correct_option: 'A',
       option_feedback: { correct: 'Great! Red is an adjective.',
                          wrong: { 1: 'You picked see, an action word.' } },
     }));
     expect(msgs.find((m) => m.role === 'feedback_correct').body)
-      .toBe('Great! Red is an adjective.');
+      .toBe('\u2705 Great! Red is an adjective.');
     const wrong = msgs.filter((m) => m.role === 'feedback_incorrect');
     expect(wrong.find((m) => m.optionIndex === 1).body)
-      .toBe('You picked see, an action word.');
+      .toBe('\u274C You picked see, an action word.');
   });
 
   test('legacy questions fall back to one generic incorrect branch', () => {
@@ -376,7 +376,7 @@ describe('answer parsing round-trip', () => {
   });
 });
 
-describe('options a child can actually READ (operator round 6)', () => {
+describe('options a child can actually READ', () => {
   const longOpts = () => row({
     question_text: 'What combination of pencils will make 43 pencils?',
     option_a: '5 red pencils and 10 blue pencils',
@@ -386,24 +386,40 @@ describe('options a child can actually READ (operator round 6)', () => {
     correct_option: 'C',
   });
 
-  test('options too long for a 24-char row title are spelled out in the body', () => {
-    // The operator received "5 red pencils and 10 blu" and "23 blue pencils, and 19"
-    // as things to choose between — Meta truncates row titles silently.
+  // Meta truncates a 24-char row title silently ("5 red pencils and 10 blu").
+  // An option past the title cap but within the 72-char row DESCRIPTION rides
+  // whole in the description (sender.listRows); the body is the stem alone, so
+  // the child does not read the same options twice.
+  test('options too long for a row title go whole to the list, not into the body', () => {
     const ask = render.build(longOpts()).find((m) => m.role === 'ask');
     expect(ask.kind).toBe('list');
-    expect(ask.body).toContain('A. 5 red pencils and 10 blue pencils');
-    expect(ask.body).toContain('C. 23 blue pencils, and 19 red pencils');
+    expect(ask.body).toBe('What combination of pencils will make 43 pencils?');
+    expect(ask.options).toEqual(expect.arrayContaining([
+      '5 red pencils and 10 blue pencils', '23 blue pencils, and 19 red pencils',
+    ]));
   });
 
-  test('a picture question with long options also spells them out', () => {
-    // This branch hardcoded "Choose your answer" and printed no options at all.
+  test('an option past the row description cap IS spelled out in the body', () => {
+    const tooLong = 'a very long answer option that will not fit in a list row description at all';
+    const ask = render.build({ ...longOpts(), option_a: tooLong }).find((m) => m.role === 'ask');
+    expect(ask.kind).toBe('list');
+    expect(ask.body).toContain(tooLong);
+  });
+
+  test('a picture question with long options sends the picture first, then the list', () => {
     const msgs = render.build({
       ...longOpts(), render_pattern: 'P4',
       media: { question_image: `${I}/sum.png` },
     });
     const ask = msgs.find((m) => m.role === 'ask');
     expect(ask.kind).toBe('list');
-    expect(ask.body).toContain('5 red pencils and 10 blue pencils');
+    expect(msgs.findIndex((m) => m.role === 'question_image')).toBeLessThan(msgs.indexOf(ask));
+    expect(ask.options).toContain('5 red pencils and 10 blue pencils');
+  });
+
+  test('every ask carries the stem a typing channel draws its lettered text from', () => {
+    const ask = render.build(longOpts()).find((m) => m.role === 'ask');
+    expect(ask.stem).toBe('What combination of pencils will make 43 pencils?');
   });
 
   test('short options are NOT padded with a redundant list', () => {

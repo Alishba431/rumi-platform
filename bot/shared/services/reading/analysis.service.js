@@ -29,7 +29,10 @@ const fs = require('fs');
 const path = require('path');
 const { isR2Configured } = require('../../storage/r2');
 const { TEMP_DIR } = require('../../utils/constants');
+const { privateTempPath } = require('../../utils/private-temp');
 const { logToFile } = require('../../utils/logger');
+const { redactUrl } = require('../../utils/redact-url');
+const { displayName } = require('../../utils/display-name');
 const { getClient } = require('../llm-client');
 const { OPENAI_API_KEY } = require('../../utils/constants');
 
@@ -101,7 +104,7 @@ class AnalysisService {
         assessmentId,
         language: assessment.language,
         gradeLevel: assessment.grade_level,
-        audioUrl: assessment.audio_url
+        audioUrl: redactUrl(assessment.audio_url)
       });
 
       // STEP 1: Transcribe audio with speaker diarization
@@ -406,6 +409,12 @@ class AnalysisService {
           fs.unlinkSync(localPath);
           logToFile('🗑️ Removed local assessment artifact', { assessmentId, localPath });
         }
+        // A file kept in a private directory under TEMP_DIR (privateTempPath)
+        // takes its directory with it; rmdir refuses anything not empty.
+        const dir = path.dirname(localPath);
+        if (path.dirname(dir) === path.resolve(TEMP_DIR) && fs.existsSync(dir)) {
+          fs.rmdirSync(dir);
+        }
       } catch (error) {
         logToFile('⚠️ Could not remove local assessment artifact', {
           assessmentId, localPath, error: error.message,
@@ -443,7 +452,7 @@ class AnalysisService {
         })
         .eq('id', assessment.id);
 
-      logToFile('✅ PDF report generated', { assessmentId: assessment.id, reportUrl });
+      logToFile('✅ PDF report generated', { assessmentId: assessment.id, reportUrl: redactUrl(reportUrl) });
 
       // STEP 7: Send results to teacher
       logToFile('Step 7/8: Sending results to teacher...');
@@ -462,7 +471,7 @@ class AnalysisService {
         // Add defensive logging to understand voice feedback delivery failures
         logToFile('🔍 Voice feedback generation result', {
           assessmentId: assessment.id,
-          voiceFeedbackUrl: voiceFeedbackUrl || 'NULL/UNDEFINED',
+          voiceFeedbackUrl: redactUrl(voiceFeedbackUrl) || 'NULL/UNDEFINED',
           urlType: typeof voiceFeedbackUrl,
           hasUrl: !!voiceFeedbackUrl
         });
@@ -480,7 +489,7 @@ class AnalysisService {
           logToFile('📤 Attempting to send voice feedback to teacher', {
             assessmentId: assessment.id,
             phoneNumber,
-            voiceFeedbackUrl
+            voiceFeedbackUrl: redactUrl(voiceFeedbackUrl)
           });
 
           await WhatsAppService.sendAudioFromUrl(phoneNumber, voiceFeedbackUrl);
@@ -489,7 +498,7 @@ class AnalysisService {
           // Log when voiceFeedbackUrl is null/falsy
           logToFile('⚠️ Voice feedback URL is null/falsy - skipping delivery', {
             assessmentId: assessment.id,
-            voiceFeedbackUrl
+            voiceFeedbackUrl: redactUrl(voiceFeedbackUrl)
           });
         }
       } catch (voiceError) {
@@ -818,7 +827,7 @@ Generate a 3-4 sentence summary that:
         .eq('id', assessment.user_id)
         .single();
 
-      const teacherName = user ? `${user.first_name} ${user.last_name}`.trim() : 'Unknown';
+      const teacherName = displayName(user, 'Unknown');
 
       // Build report data
       const reportData = {
@@ -1018,7 +1027,11 @@ Output the complete enhanced summary (not just the new parts).`;
       // been RENDERED failed on upload, which marked the whole assessment 'failed'
       // and sent the teacher nothing — after a student had read the passage aloud.
       if (!isR2Configured()) {
-        const localPath = path.join(TEMP_DIR, fileName);
+        // In a directory of this report's own: the name carries only the
+        // student's label and the day, so two teachers' reports for a "Student"
+        // on the same day shared the path and one was sent the other's report.
+        // _cleanupLocalArtifacts removes the directory with the file.
+        const localPath = privateTempPath(TEMP_DIR, fileName, 'reading-report-').filePath;
         fs.writeFileSync(localPath, pdfBuffer);
         logToFile('✅ Report PDF kept on local disk (no object storage configured)', {
           path: localPath, bytes: pdfBuffer.length,
@@ -1044,7 +1057,7 @@ Output the complete enhanced summary (not just the new parts).`;
 
       const publicUrl = `${process.env.R2_ENDPOINT}/${BUCKET_NAME}/${key}`;
 
-      logToFile('✅ Report PDF uploaded to R2', { key, url: publicUrl });
+      logToFile('✅ Report PDF uploaded to R2', { key, url: redactUrl(publicUrl) });
 
       return publicUrl;
 
@@ -1122,7 +1135,7 @@ Output the complete enhanced summary (not just the new parts).`;
 
       logToFile('✅ Voice feedback generated', {
         assessmentId: assessment.id,
-        url: voiceFeedbackUrl,
+        url: redactUrl(voiceFeedbackUrl),
         size: audioBuffer.length
       });
 
@@ -1183,7 +1196,7 @@ Output the complete enhanced summary (not just the new parts).`;
       // Send report PDF
       logToFile('📄 Sending PDF report to teacher', {
         assessmentId: assessment.id,
-        reportUrl
+        reportUrl: redactUrl(reportUrl)
       });
 
       await WhatsAppService.sendDocumentFromUrl(phoneNumber, reportUrl, 'Reading_Assessment_Report.pdf');
@@ -1336,7 +1349,7 @@ Output the complete enhanced summary (not just the new parts).`;
       if (question.imageUrl && question.buttons) {
         logToFile('🖼️ Sending image question with buttons', {
           questionNumber,
-          imageUrl: question.imageUrl,
+          imageUrl: redactUrl(question.imageUrl),
           buttonCount: question.buttons.length
         });
 
@@ -1410,7 +1423,7 @@ Output the complete enhanced summary (not just the new parts).`;
         .eq('id', assessment.user_id)
         .single();
 
-      const teacherName = user ? `${user.first_name} ${user.last_name}`.trim() : 'Unknown';
+      const teacherName = displayName(user, 'Unknown');
 
       // Build report data structure (same as generateReport)
       const reportData = {
@@ -1596,7 +1609,7 @@ Output the complete enhanced summary (not just the new parts).`;
         // Add defensive logging for comprehension flow voice feedback
         logToFile('🔍 Combined voice feedback generation result', {
           assessmentId,
-          voiceFeedbackUrl: voiceFeedbackUrl || 'NULL/UNDEFINED',
+          voiceFeedbackUrl: redactUrl(voiceFeedbackUrl) || 'NULL/UNDEFINED',
           urlType: typeof voiceFeedbackUrl,
           hasUrl: !!voiceFeedbackUrl
         });
@@ -1612,7 +1625,7 @@ Output the complete enhanced summary (not just the new parts).`;
           logToFile('📤 Attempting to send combined voice feedback', {
             assessmentId,
             phoneNumber,
-            voiceFeedbackUrl
+            voiceFeedbackUrl: redactUrl(voiceFeedbackUrl)
           });
 
           await WhatsAppService.sendAudioFromUrl(phoneNumber, voiceFeedbackUrl);
@@ -1620,7 +1633,7 @@ Output the complete enhanced summary (not just the new parts).`;
         } else {
           logToFile('⚠️ Combined voice feedback URL is null/falsy - skipping delivery', {
             assessmentId,
-            voiceFeedbackUrl
+            voiceFeedbackUrl: redactUrl(voiceFeedbackUrl)
           });
         }
       } catch (voiceError) {

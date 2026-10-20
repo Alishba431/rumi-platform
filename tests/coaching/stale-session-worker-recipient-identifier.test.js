@@ -20,6 +20,7 @@ function makeSupabase({ staleSessions }) {
       eq: () => b,
       order: () => b,
       in: () => b,
+      is: () => b,
       limit: () => b,
       single: () => Promise.resolve(resolveValue.single ?? { data: null, error: { message: 'no rows' } }),
       update: () => ({ eq: () => Promise.resolve({ data: null, error: null }) }),

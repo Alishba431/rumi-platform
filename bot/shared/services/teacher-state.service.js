@@ -19,6 +19,7 @@
 const supabase = require('../config/supabase');
 const redisService = require('./cache/railway-redis.service');
 const { logToFile } = require('../utils/logger');
+const { ownCoaching } = require('./coaching/own-coaching');
 
 const ONE_HOUR_AGO = () => new Date(Date.now() - 60 * 60 * 1000).toISOString();
 const THIRTY_MIN_AGO = () => new Date(Date.now() - 30 * 60 * 1000).toISOString();
@@ -39,10 +40,10 @@ async function probeTeacherBusy(userId) {
 
   // 1. Coaching session in flight
   try {
-    const { data: coachingRows } = await supabase
+    const { data: coachingRows } = await ownCoaching(supabase
       .from('coaching_sessions')
       .select('id, status, created_at')
-      .eq('user_id', userId)
+      .eq('user_id', userId)) // a coach observing this teacher is the coach's work, not the teacher's
       .not('status', 'in', `(${COACHING_TERMINAL.join(',')})`)
       .gte('created_at', ONE_HOUR_AGO())
       .limit(1);
@@ -175,10 +176,10 @@ async function listActiveResources(userId) {
 
   // Coaching sessions
   try {
-    const { data: coachingRows } = await supabase
+    const { data: coachingRows } = await ownCoaching(supabase
       .from('coaching_sessions')
       .select('id, created_at, status')
-      .eq('user_id', userId)
+      .eq('user_id', userId)) // a coach observing this teacher is the coach's work, not the teacher's
       .not('status', 'in', `(${COACHING_TERMINAL.join(',')})`)
       .gte('created_at', ONE_HOUR_AGO())
       .limit(2);
@@ -261,11 +262,11 @@ async function cancelResource(item, userId) {
       return { ok: true, message: `🛑 Quiz cancelled. The scheduled report won't be generated for it.` };
     }
     if (item.kind === 'coaching' && item.refId) {
-      await supabase
+      await ownCoaching(supabase
         .from('coaching_sessions')
         .update({ status: 'cancelled' })
         .eq('id', item.refId)
-        .eq('user_id', userId);
+        .eq('user_id', userId)); // a teacher can never cancel a coach's observation of them
       return { ok: true, message: `🛑 Coaching session stopped on our end.` };
     }
     if (item.kind === 'lesson_plan' && item.refId) {

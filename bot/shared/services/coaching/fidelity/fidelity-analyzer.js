@@ -1,0 +1,182 @@
+'use strict';
+/**
+ * The fidelity LLM grader. Given the prescribed moves + the lesson transcript, returns per-move VERDICTS ONLY — it
+ * never computes a score (that is fidelity-scorer's job, so the rubric stays drift-free in code).
+ *
+ * Model: LP_FIDELITY_MODEL, default google/gemini-3.8-flash via OpenRouter — on a held-out set it agreed best with a
+ * three-judge LLM majority among the models compared (docs/features/lesson-plan-fidelity.md). OpenRouter client via
+ * llm-client getClient(), json_object mode, jsonrepair on parse. The client is injectable (opts.client) so unit tests
+ * never hit the network. The request carries only standard chat-completions keys: the OSS llm-client has no
+ * cost-attribution field to read.
+ *
+ * Knobs (all unset = the default request):
+ *   LP_FIDELITY_REASONING_EFFORT   minimal | low | medium | high → OpenRouter's unified `reasoning: { effort }` field.
+ *                                  Reasoning models can spend the whole completion budget thinking and answer EMPTY
+ *                                  without it.
+ *   LP_FIDELITY_EMPTY_RETRY_EFFORT effort for the one retry after an EMPTY answer; unset = retry at the same
+ *                                  configuration (a hard-coded low effort silently re-grades on a configuration
+ *                                  nobody chose).
+ *   LP_FIDELITY_MAX_TOKENS         completion cap, default 16000, at most 32000. The default grader thinks before it
+ *                                  answers, and at 4000 a 12-move grading is regularly cut off and has to be retried.
+ * And whatever the variables say:
+ *   - a grading cut off by the token cap (finish_reason length) with a prescribed move unjudged, or one whose verdicts
+ *     name no prescribed move, is retried once and then reported, never scored: the scorer reads an unjudged move as
+ *     not_done, a false miss that blames the teacher;
+ *   - verdicts keyed by move_id become the array the scorer reads, and entries that are not objects are dropped;
+ *   - a failure carries `reason` (empty_content | unparseable_json | no_verdicts | incomplete_verdicts | truncated),
+ *     which the orchestrator persists as lp_fidelity.cause.
+ */
+const { GRADER_BRIEF, buildUserPrompt } = require('./grader-prompt');
+
+// jsonrepair is a belt-and-suspenders repair for slightly-malformed model JSON (matches
+// GPT5MiniService). Load it lazily so this module still loads where the optional dep isn't resolved.
+let _jsonrepair = null;
+try { _jsonrepair = require('jsonrepair').jsonrepair; } catch (_) { /* fall back to strict parse */ }
+
+// llm-client auto-prefixes 'openai/' when there is no '/'; the full slug is explicit here. Read per call so a
+// deployment (or a test) can change it without a restart of the module.
+const DEFAULT_FIDELITY_MODEL = 'google/gemini-3.8-flash';
+function fidelityModel() {
+  return process.env.LP_FIDELITY_MODEL || DEFAULT_FIDELITY_MODEL;
+}
+const DEFAULT_MAX_TOKENS = 16000;
+const MAX_TOKENS_CEILING = 32000;
+const EFFORTS = new Set(['minimal', 'low', 'medium', 'high']);
+
+function reasoningEffort() {
+  const e = String(process.env.LP_FIDELITY_REASONING_EFFORT || '').trim().toLowerCase();
+  return EFFORTS.has(e) ? e : null;
+}
+
+// Unset = an empty answer is retried at the same configuration. Set it only for a model that answers with empty
+// content unless it is given a reasoning budget.
+function emptyRetryEffort() {
+  const e = String(process.env.LP_FIDELITY_EMPTY_RETRY_EFFORT || '').trim().toLowerCase();
+  return EFFORTS.has(e) ? e : null;
+}
+
+function maxTokens() {
+  const n = Math.floor(Number(process.env.LP_FIDELITY_MAX_TOKENS));
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, MAX_TOKENS_CEILING) : DEFAULT_MAX_TOKENS;
+}
+
+function isPlainObject(x) {
+  return !!x && typeof x === 'object' && !Array.isArray(x);
+}
+
+function safeJsonParse(content) {
+  try {
+    return JSON.parse(content);
+  } catch (e) {
+    if (!_jsonrepair) throw e;
+    return JSON.parse(_jsonrepair(content)); // throws if unrepairable — caller guards
+  }
+}
+
+function failure(reason, message) {
+  const e = new Error(message);
+  e.reason = reason;
+  return e;
+}
+
+/**
+ * The verdicts a grading can be scored from, and how many prescribed moves it left unjudged — or a failure with its
+ * reason. jsonrepair can coerce garbage into a verdict-less object, and a truncated answer can look complete; either
+ * would let the scorer read every missing move as not_done.
+ */
+function readVerdicts(parsed, moves, finishReason) {
+  if (!isPlainObject(parsed)) throw failure('no_verdicts', 'grader response is not a JSON object');
+  let verdicts = parsed.verdicts;
+  // Some providers key the verdicts by move_id; the scorer reads an array.
+  if (isPlainObject(verdicts)) {
+    verdicts = Object.entries(verdicts)
+      .map(([moveId, v]) => (isPlainObject(v) ? { move_id: moveId, ...v } : { move_id: moveId, verdict: v }));
+  }
+  if (!Array.isArray(verdicts)) throw failure('no_verdicts', 'grader response has no verdicts');
+  verdicts = verdicts.filter(isPlainObject);
+  const prescribed = new Set((Array.isArray(moves) ? moves : []).map((m) => String(m && m.move_id)));
+  if (!prescribed.size) return { verdicts, missing: 0 };
+  if (!verdicts.length) throw failure('no_verdicts', 'grader response has no usable verdicts');
+  const judged = new Set(verdicts.map((v) => String(v.move_id)).filter((id) => prescribed.has(id)));
+  if (!judged.size) throw failure('incomplete_verdicts', 'no verdict names a prescribed move');
+  const missing = prescribed.size - judged.size;
+  if (missing > 0 && finishReason === 'length') {
+    throw failure('truncated', `grading cut off by the token cap with ${missing} prescribed move(s) unjudged`);
+  }
+  return { verdicts, missing };
+}
+
+/**
+ * @param {Array<object>} moves       prescribed move list (fidelity-moves-v1 objects)
+ * @param {string}        transcript  the lesson transcript (timestamped, any language)
+ * @param {object}        meta        { lesson_id, template, goal, total_minutes }
+ * @param {object}        opts        { client, model, maxTokens, reasoningEffort }
+ * @returns {Promise<{verdicts, narrative, language_note, moderators, usage, model, reasoning_effort, missing_verdicts}>}
+ */
+async function analyzeFidelity(moves, transcript, meta = {}, opts = {}) {
+  const model = opts.model || fidelityModel();
+  const maxTok = opts.maxTokens || maxTokens();
+  const client = opts.client || require('../../llm-client').getClient();
+  const effort = EFFORTS.has(opts.reasoningEffort) ? opts.reasoningEffort : reasoningEffort();
+  const brief = GRADER_BRIEF;
+  const user = buildUserPrompt(meta, moves, transcript);
+
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const isEmptyRetry = Boolean(lastErr && lastErr.reason === 'empty_content');
+    const request = {
+      model,
+      temperature: 0, // minimises the run-to-run wobble; LP_FIDELITY_RUNS takes the median on top
+      messages: [
+        { role: 'system', content: brief },
+        { role: 'user', content: user },
+      ],
+      max_completion_tokens: maxTok,
+      response_format: { type: 'json_object' },
+    };
+    // A retry re-grades at the SAME configuration unless LP_FIDELITY_EMPTY_RETRY_EFFORT asks otherwise: a hard-coded
+    // low effort would silently re-grade one teacher's lesson on a configuration nobody chose, and the only trace
+    // would be a stored field.
+    const retryEffort = !effort && isEmptyRetry ? emptyRetryEffort() : null;
+    if (effort || retryEffort) request.reasoning = { effort: effort || retryEffort };
+    const response = await client.chat.completions.create(request);
+    const choice = response.choices && response.choices[0];
+    const content = choice && choice.message && choice.message.content;
+    const finishReason = (choice && choice.finish_reason) || null;
+    try {
+      if (!content || !String(content).trim()) {
+        throw failure('empty_content', `grader returned empty content (finish_reason=${finishReason || 'unknown'})`);
+      }
+      let parsed;
+      try {
+        parsed = safeJsonParse(content);
+      } catch (parseErr) {
+        throw failure('unparseable_json', `grader returned unparseable JSON: ${parseErr.message}`);
+      }
+      const { verdicts, missing } = readVerdicts(parsed, moves, finishReason);
+      return {
+        verdicts,
+        narrative: parsed.narrative || null,
+        language_note: parsed.language_note || null,
+        moderators: parsed.moderators || null,
+        usage: response.usage || {},
+        model,
+        reasoning_effort: request.reasoning ? request.reasoning.effort : null,
+        // A grading produced after an empty first answer is marked, so a degraded answer is never invisible. The
+        // orchestrator persists it onto the blob beside reasoning_effort.
+        empty_retry: isEmptyRetry,
+        missing_verdicts: missing,
+      };
+    } catch (e) {
+      lastErr = e; // empty / malformed / unusable → retry once, then give up
+    }
+  }
+  const reason = (lastErr && lastErr.reason) || 'unparseable_json';
+  const err = new Error(`fidelity_unavailable: ${reason}`);
+  err.cause = lastErr;
+  err.code = 'fidelity_unavailable';
+  err.reason = reason;
+  throw err;
+}
+
+module.exports = { analyzeFidelity, DEFAULT_FIDELITY_MODEL, fidelityModel, safeJsonParse };

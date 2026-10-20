@@ -438,8 +438,9 @@ async function handleAttendanceMarkingFlow(message, phoneNumber, userId) {
   try {
     logToFile('📋 Processing attendance marking flow', { phoneNumber, userId });
 
-    // Parse flow response to get flow_token and absent_students
-    // Flow token format: "userId:classId:date:sessionType:encodedClassName"
+    // Parse flow response to get flow_token, absent_students and leave_students
+    // Flow token format: "userId:target:date:sessionType:encodedName", where target
+    // is a class's list id, or "staff" for a head teacher's staff attendance.
     let responseJson = {};
     try {
       responseJson = JSON.parse(message.interactive?.nfm_reply?.response_json || '{}');
@@ -460,16 +461,20 @@ async function handleAttendanceMarkingFlow(message, phoneNumber, userId) {
       return false;
     }
 
-    const sessionDate = dateStr || new Date().toISOString().split('T')[0];
+    const AttendanceDates = require('../services/attendance-dates');
+    const sessionDate = AttendanceDates.toDateString(dateStr);
     const className = encodedClassName ? decodeURIComponent(encodedClassName) : 'Class';
+    const isStaff = listId === AttendanceFlowHandler.STAFF_TARGET;
 
     logToFile('📋 Parsed flow token', {
       userId,
       listId,
+      subject: isStaff ? 'staff' : 'class',
       sessionDate,
       sessionType,
       className,
-      absentCount: responseJson.absent_students?.length || 0
+      absentCount: responseJson.absent_students?.length || 0,
+      leaveCount: responseJson.leave_students?.length || 0
     });
 
     const result = await AttendanceFlowHandler.handleMarkingFlowSubmission(
@@ -477,7 +482,7 @@ async function handleAttendanceMarkingFlow(message, phoneNumber, userId) {
       phoneNumber,
       userId,
       listId,
-      new Date(sessionDate),
+      sessionDate,
       sessionType || 'full_day'
     );
 
@@ -489,24 +494,8 @@ async function handleAttendanceMarkingFlow(message, phoneNumber, userId) {
       return false;
     }
 
-    // Send confirmation
-    const confirmMessage = AttendanceFlowHandler.generateConfirmationMessage(
-      className,
-      result.stats
-    );
-
-    await WhatsAppService.sendMessage(phoneNumber, confirmMessage);
-
-    // Generate and send Excel file
-    // Note: "Your Excel file is being generated..." is already in confirmMessage
-    try {
-      // Transform stats to match generateCaption expected format
-      const summary = {
-        present: result.stats.present,
-        absent: result.stats.absent,
-        attendancePercentage: parseFloat(result.stats.attendanceRate) || 0
-      };
-
+    let selectedClass = { class_name: className, section: null, id: listId };
+    if (!isStaff) {
       // Fetch class info from DB to get proper section
       // Also validates that listId exists in database
       const StudentListService = require('../services/student-list.service');
@@ -525,57 +514,56 @@ async function handleAttendanceMarkingFlow(message, phoneNumber, userId) {
         );
         return false;
       }
+      selectedClass = { class_name: classInfo.class_name || className, section: classInfo.section || null, id: listId };
+    }
+
+    // Send confirmation, naming the class as the teacher knows it (with its section)
+    const displayName = selectedClass.section
+      ? `${selectedClass.class_name} - ${selectedClass.section}`
+      : selectedClass.class_name;
+    const confirmMessage = AttendanceFlowHandler.generateConfirmationMessage(
+      displayName,
+      result.stats,
+      { subject: isStaff ? 'staff' : 'class' }
+    );
+
+    await WhatsAppService.sendMessage(phoneNumber, confirmMessage);
+
+    // Generate and send the month's register
+    // Note: "Your Excel file is being generated..." is already in confirmMessage
+    try {
+      const summary = {
+        present: result.stats.present,
+        absent: result.stats.absent,
+        leave: result.stats.leave,
+        attendancePercentage: parseFloat(result.stats.attendanceRate) || 0
+      };
 
       const deliveryResult = await AttendanceDeliveryService.processAndDeliver(
         userId,
         phoneNumber,
         {
-          selectedClass: {
-            class_name: classInfo?.class_name || className,
-            section: classInfo?.section || null,
-            id: listId
-          },
-          selectedListId: listId,
+          subject: isStaff ? 'staff' : 'class',
+          selectedClass,
+          selectedListId: isStaff ? null : listId,
           records: result.records,
           markingMethod: 'tap', // DB constraint only allows 'voice', 'tap', 'everyone_present'
           summary: summary,
-          sessionDate: sessionDate // Pass the actual date
+          sessionDate: sessionDate,
+          sessionType: sessionType || 'full_day'
         }
       );
 
       if (!deliveryResult.success) {
-        // Handle duplicate attendance gracefully
-        if (deliveryResult.isDuplicate) {
-          logToFile('⚠️ Duplicate attendance detected - showing friendly message', {
-            userId,
-            existingSessionId: deliveryResult.existingSession?.id
-          });
-
-          const sessionTypeLabel = deliveryResult.sessionType === 'morning' ? 'morning'
-            : deliveryResult.sessionType === 'afternoon' ? 'afternoon'
-            : "today's";
-
-          const classLabel = deliveryResult.section
-            ? `${deliveryResult.className} - ${deliveryResult.section}`
-            : deliveryResult.className;
-
-          const duplicateMessage = [
-            `📋 *Attendance Already Recorded*`,
-            ``,
-            `You already marked ${sessionTypeLabel} attendance for ${classLabel}!`,
-            ``,
-            `Present: ${deliveryResult.summary.present} | Absent: ${deliveryResult.summary.absent} | Rate: ${deliveryResult.summary.attendanceRate}`,
-            ``,
-            `To view your Excel file again, just say "attendance" and select "View Register".`
-          ].join('\n');
-
-          await WhatsAppService.sendMessage(phoneNumber, duplicateMessage);
-        } else {
-          logToFile('❌ Excel delivery failed', { userId, error: deliveryResult.error });
-          await WhatsAppService.sendMessage(phoneNumber, `Sorry, there was an error generating your Excel file: ${deliveryResult.error}`);
-        }
+        logToFile('❌ Register delivery failed', { userId, saved: deliveryResult.saved, error: deliveryResult.error });
+        await WhatsAppService.sendMessage(
+          phoneNumber,
+          deliveryResult.saved
+            ? deliveryResult.error
+            : `Sorry, there was an error saving attendance: ${deliveryResult.error}`
+        );
       } else {
-        logToFile('✅ Excel delivered successfully', { userId, fileUrl: deliveryResult.fileUrl });
+        logToFile('✅ Attendance marked, register sent', { userId, fileName: deliveryResult.fileName, replaced: deliveryResult.replaced });
       }
     } catch (deliveryError) {
       logToFile('❌ Excel delivery exception', { userId, error: deliveryError.message });
@@ -638,8 +626,7 @@ async function handleRegistrationFlow(message, phoneNumber, userId) {
     const firstName = fullName.split(/\s+/)[0] || fullName;
 
     // Generate portal token
-    const { v4: uuidv4 } = require('uuid');
-    const portalToken = uuidv4();
+    const portalToken = require('crypto').randomUUID();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
 

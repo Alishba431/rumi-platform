@@ -43,7 +43,9 @@ describe('BUG-002: Registration Recovery Path', () => {
       supabase.from.mockImplementation((table) => ({
         select: jest.fn().mockReturnValue({
           eq: jest.fn().mockReturnValue({
-            count: 0
+            count: 0,
+            // coaching_sessions also filters out coaches' observations
+            is: jest.fn().mockReturnValue({ count: 0 })
           })
         })
       }));

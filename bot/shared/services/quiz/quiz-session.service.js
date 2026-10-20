@@ -587,10 +587,15 @@ class QuizSessionService {
       // or in_progress. The previous .in() filter could pick up an older
       // 'invited' session even when a newer 'completed' or 'cancelled' session
       // existed — making post-quiz text trigger the active-quiz nudge.
+      // Only this engine's own sessions (source 'roster'): the class-quiz
+      // engine (video-quiz.service) writes the child's id into parent_phone
+      // too, and a child mid-way through a class quiz who typed a word was
+      // claimed here and told to "Reply Start Quiz".
       let { data: session } = await supabase
         .from('quiz_sessions')
         .select('id, quiz_id, student_id, current_difficulty, total_questions_answered, correct_answers, status')
         .eq('parent_phone', withPlus)
+        .eq('source', 'roster')
         .order('created_at', { ascending: false })
         .limit(1)
         .single();
@@ -599,6 +604,7 @@ class QuizSessionService {
           .from('quiz_sessions')
           .select('id, quiz_id, student_id, current_difficulty, total_questions_answered, correct_answers, status')
           .eq('parent_phone', noPlus)
+          .eq('source', 'roster')
           .order('created_at', { ascending: false })
           .limit(1)
           .single();

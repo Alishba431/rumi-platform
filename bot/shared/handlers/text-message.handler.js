@@ -1,4 +1,6 @@
 const WhatsAppService = require('../services/whatsapp.service');
+const DailyCaps = require('../services/limits/daily-caps');
+const LessonPlanAvailability = require('../services/lesson-plan-availability');
 const OpenAIService = require('../services/openai.service');
 const ContentService = require('../services/content.service');
 const LanguageDetectorService = require('../services/language-detector.service');
@@ -20,10 +22,9 @@ const RegionFeaturesService = require('../services/region-features.service');
 const { getUserRegion, getUserLanguageRegion } = require('../utils/region');
 const VideoOrchestrator = require('../services/video/video-orchestrator.service');
 const AttendanceDetectorService = require('../services/attendance-detector.service');
-const AttendanceConversationService = require('../services/attendance-conversation.service');
-const AttendanceDeliveryService = require('../services/attendance-delivery.service');
+const AttendanceEntryService = require('../services/attendance-entry.service');
 const { logToFile } = require('../utils/logger');
-const { TEMP_DIR, LOADING_STICKER_PATH, LOADING_STICKER_MEDIA_ID, OPENAI_API_KEY, ATTENDANCE_SETUP_FLOW_ID, ATTENDANCE_MARKING_FLOW_ID } = require('../utils/constants');
+const { TEMP_DIR, LOADING_STICKER_PATH, LOADING_STICKER_MEDIA_ID, OPENAI_API_KEY, ATTENDANCE_SETUP_FLOW_ID } = require('../utils/constants');
 const { getClient } = require('../services/llm-client');
 
 const openai = getClient();
@@ -41,19 +42,14 @@ const {
   storeConversation,
   storeLessonPlan
 } = require('../database/bot-helpers');
-const { driverForIdentifier } = require('../services/messaging/channel-registry');
+// resolveChannelIdentity: the one split of a prefixed sender, shared with
+// whatsapp-bot.js. A copy here once sliced by the driver name's length, which
+// cut "mtx:1555…" short and made a second account for the same teacher.
+const { driverForIdentifier, resolveChannelIdentity } = require('../services/messaging/channel-registry');
+const { normalizeCommand } = require('../services/messaging/command-words');
+const { nativeFlowIdFor } = require('../services/messaging/channel-capabilities');
 const supabase = require('../config/supabase');
 const fs = require('fs');
-
-const CHANNEL_FAMILY = { slack: 'slack', discord: 'discord' };
-
-/** Mirrors whatsapp-bot.js's resolveChannelIdentity — see that file for the full rationale. */
-function resolveChannelIdentity(from) {
-  const driverName = driverForIdentifier(from);
-  if (!driverName) return null;
-  const prefix = `${driverName}:`;
-  return { channel: CHANNEL_FAMILY[driverName] || driverName, channelUserId: String(from).slice(prefix.length) };
-}
 
 /**
  * Curriculum pre-gen intercept. If the teacher's region enables curriculum LPs
@@ -94,6 +90,101 @@ async function tryCurriculumLessonPlanServe(from, topic, user, language) {
 
 const { evaluateHomeworkTrigger } = require('./homework-trigger');
 const { detectEditClassIntent } = require('./edit-class-trigger');
+const { routeTestPaperText } = require('./testpaper-trigger');
+const { ownCoaching } = require('../services/coaching/own-coaching');
+
+/**
+ * May this share code join on this deployment? True unless video quizzes are
+ * switched off for the region AND the code is a video quiz's or names nothing.
+ * The same rule as video-quiz-share's videoQuizzesAllowed; asked here so the
+ * answer is known before the join is acked. A failed read says yes: the join
+ * itself then decides, as before.
+ */
+async function shareCodeAdmitted(from, code) {
+  try {
+    const { isVideoQuizzesEnabled } = require('../services/region-features.service');
+    const { detectRegion } = require('../utils/region');
+    if (await isVideoQuizzesEnabled(detectRegion())) return true;
+    // This lookup is a code check too, so it counts wrong codes like the join
+    // does: past the limit a sender's codes are not looked up at all.
+    const VideoQuizShare = require('../services/quiz/video-quiz-share.service');
+    if (await VideoQuizShare.guessesExhausted(from)) return false;
+    const sc = await require('../services/quiz/video-quiz-invite.service').resolveInvite(code);
+    if (!sc) await VideoQuizShare.countWrongGuess(from);
+    return !!(sc && !sc.video_id);
+  } catch (err) {
+    logToFile('⚠️ video-quiz: share-code region check failed — the join decides', { error: err.message });
+    return true;
+  }
+}
+
+/**
+ * Runs before the quiz-state intercepts below, so a `QUIZ-<code>` text always
+ * reaches the join, even when the sender already has a post-quiz chat state or
+ * an active/invited session from an earlier quiz (a child tapping a SECOND
+ * teacher's forwarded link). Only the code-parse branch sits up here;
+ * `consumeJoinReply` (which claims the next two free-text messages as a child's
+ * name and class) stays further down so it never eats a quiz answer.
+ * Returns true when it short-circuited the message.
+ */
+async function tryShareCodeJoin(from, messageBody, typingController) {
+  try {
+    const VideoQuizShare = require('../services/quiz/video-quiz-share.service');
+    const code = VideoQuizShare.parseShareCode(messageBody);
+    if (!code) return false;
+
+    // The region gate, decided BEFORE the ack. With video quizzes off for this
+    // region a video code (or a code that names nothing) is not ours: on main
+    // beginFromCode returned false and the message went on to ordinary chat.
+    // Acked first, that false would reach nobody and the text would be
+    // swallowed. A lesson quiz's code (no video) still joins. The common case
+    // (video quizzes on) costs no extra read.
+    if (!(await shareCodeAdmitted(from, code))) return false;
+
+    // ACK FIRST. A class tapping a forwarded link within the same minute would
+    // otherwise run every join (identity lookup, share-code resolution, the
+    // first question) inline before this webhook answers; the channel retries
+    // the slow ones and the retries collide. The join runs after the handler
+    // returns, under a per-phone+code lock so a retry cannot start a second
+    // session.
+    typingController.stop();
+    setImmediate(() => VideoQuizShare.beginFromCodeLocked(from, code)
+      .catch((err) => logToFile('❌ video-quiz join failed', { phoneTail: String(from).slice(-4), code, error: err.message }, 'error')));
+    return true;
+  } catch (vqErr) {
+    logToFile('Video Quiz share: routing error', { error: vqErr.message });
+    return false;
+  }
+}
+
+/**
+ * One step of the quiz-state intercept, failing on its own: a throw is logged at
+ * error and the message goes on to the next step, instead of skipping every
+ * step after it. Returns what the step returned (true = the message was
+ * handled), or false when it threw.
+ */
+async function quizInterceptStep(name, fn) {
+  try {
+    return Boolean(await fn());
+  } catch (err) {
+    logToFile(`❌ quiz intercept: the ${name} threw — going on to the next step`, { error: err.message }, 'error');
+    return false;
+  }
+}
+
+/**
+ * Is the lesson quiz (TRANSCRIPT_QUIZ_ENABLED) switched on? Asked of the offer
+ * service, which owns the flag. If that service cannot even load, the answer
+ * is no: /quiz then stays on the classic path rather than failing outright.
+ */
+function lessonQuizEnabled() {
+  try {
+    return require('../services/quiz/transcript-quiz-offer.service').enabled() === true;
+  } catch (err) {
+    logToFile('❌ lesson quiz: the offer service failed to load — /quiz stays on the classic path', { error: err.message }, 'error');
+    return false;
+  }
+}
 
 async function handleTextMessage(message, from, messageBody, user = null) {
   logToFile(`Processing TEXT message: ${messageBody}`);
@@ -101,61 +192,105 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // Start continuous typing indicator immediately
   const typingController = WhatsAppService.startContinuousTypingIndicator(from, message.id);
 
+  // A bare command word ("menu", "quiz", "reading test") is the slash command,
+  // on every channel: Element (Matrix) eats anything starting with "/" as its
+  // own client command, so there the bare word is the only way to send one.
+  // Done first, so every check below — the `=== '/menu'` matches and each
+  // "a slash command is never an answer" guard — sees the slash form. The exam
+  // checker reads the message object, so it gets the same text.
+  const normalizedBody = normalizeCommand(messageBody, from);
+  if (normalizedBody !== messageBody) {
+    logToFile('⌨️ Bare command word taken as the slash command', { command: normalizedBody.split(' ')[0] });
+    messageBody = normalizedBody;
+    if (message && message.text) message = { ...message, text: { ...message.text, body: normalizedBody } };
+  }
+
   try {
+    // The share-code JOIN itself runs before anything else, including the
+    // quiz-state intercept below, so a second teacher's link is never
+    // swallowed by a stale post-quiz/active-session state.
+    if (messageBody && await tryShareCodeJoin(from, messageBody, typingController)) {
+      return;
+    }
+
     // ============================================================
-    // QUIZ STATE INTERCEPT — runs BEFORE user creation so parents (who may
-    // not have a Rumi account) can answer quizzes. Post-quiz AI chat is checked
-    // FIRST (it is the most-recent state; running getActiveState first could
-    // recover a stale 'invited' session and send the wrong nudge), then an
-    // active quiz session.
+    // QUIZ STATE INTERCEPT — runs BEFORE user creation so parents and children
+    // (who may not have a Rumi account) can answer quizzes. Post-quiz AI chat is
+    // checked FIRST (it is the most-recent state; running getActiveState first
+    // could recover a stale 'invited' session and send the wrong nudge), then a
+    // STOP or a letter typed during a class quiz (video or lesson quiz), then
+    // the adaptive quiz's active session.
+    //
+    // Each step fails ON ITS OWN (quizInterceptStep): with one try/catch around
+    // them all, a throw in one step skipped every step after it.
     // ============================================================
     if (messageBody) {
-      try {
-        const QuizSessionService = require('../services/quiz/quiz-session.service');
+      const QuizSessionService = require('../services/quiz/quiz-session.service');
 
+      const postQuizHandled = await quizInterceptStep('post-quiz chat', async () => {
         const postQuizState = await QuizSessionService.getPostQuizState(from);
-        if (postQuizState) {
-          const lowerQ = (messageBody || '').trim().toLowerCase();
-          if (lowerQ === 'stop' || lowerQ === 'done') {
-            await QuizSessionService.endPostQuizChat(from);
-          } else {
-            await QuizSessionService.handlePostQuizChat(from, messageBody, postQuizState);
-          }
-          typingController.stop();
-          return;
+        if (!postQuizState) return false;
+        const lowerQ = (messageBody || '').trim().toLowerCase();
+        if (lowerQ === 'stop' || lowerQ === 'done') {
+          await QuizSessionService.endPostQuizChat(from);
+        } else {
+          await QuizSessionService.handlePostQuizChat(from, messageBody, postQuizState);
         }
+        return true;
+      });
+      if (postQuizHandled) { typingController.stop(); return; }
 
+      // STOP typed during a class quiz ends it, unfinished, and says so in the
+      // quiz's language. Asked before the typed letter so a stop is never read
+      // as an answer.
+      const quizStopped = await quizInterceptStep('class quiz stop', () => {
+        const VideoQuizService = require('../services/quiz/video-quiz.service');
+        return VideoQuizService.stopTyped(from, messageBody);
+      });
+      if (quizStopped) { typingController.stop(); return; }
+
+      // A letter TYPED during a class quiz ("b", or "A C" for a pick-every-right-
+      // answer question) answers the question it is waiting on, as the option
+      // the child saw under that letter. On text channels (Baileys, Matrix) the
+      // question arrives as lettered text and a typed letter never matches a
+      // pending menu, so this is the only way such a child can answer. Class
+      // quizzes run on the video engine and its own state; the adaptive quiz
+      // below never sees them.
+      const typedAnswer = await quizInterceptStep('typed quiz answer', () => {
+        const VideoQuizService = require('../services/quiz/video-quiz.service');
+        return VideoQuizService.answerTypedLetter(from, messageBody);
+      });
+      if (typedAnswer) { typingController.stop(); return; }
+
+      const activeQuizHandled = await quizInterceptStep('adaptive quiz answer', async () => {
         const quizState = await QuizSessionService.getActiveState(from);
         // A slash command is never a quiz answer. Without this, ANY user with a
         // live quiz session could not run a single command — every /menu, /video
         // or /quiz came back as "Tap one of the answer buttons above". A teacher
         // is often also a parent on the same number, so this is not a corner case.
-        if (quizState && !messageBody.trim().startsWith('/')) {
-          const trimmedQ = messageBody.trim();
-          const lowerQ = trimmedQ.toLowerCase();
-          if (/^(start quiz|start_quiz|کوئز شروع کریں)$/i.test(trimmedQ)) {
-            await QuizSessionService.startQuizFromInvite(from);
-          } else if (lowerQ === 'stop' || trimmedQ === 'روکیں') {
-            await QuizSessionService.endSession(from, quizState, 'incomplete');
-          } else if (/^[abc]$/i.test(trimmedQ) && quizState.currentQuestionId) {
-            await QuizSessionService.handleAnswer(from, trimmedQ, quizState);
-          } else if (quizState.currentQuestionId) {
-            await WhatsAppService.sendMessage(from,
-              '❓ Tap one of the answer buttons above, or type A, B, or C.\n\nType STOP to exit the quiz.'
-            );
-          } else {
-            // Invited but not started: there is no question "above" to answer,
-            // so pointing at answer buttons is simply wrong.
-            await WhatsAppService.sendMessage(from,
-              '❓ Reply *Start Quiz* when you are ready to begin.\n\nType STOP if you would rather not.'
-            );
-          }
-          typingController.stop();
-          return;
+        if (!quizState || messageBody.trim().startsWith('/')) return false;
+        const trimmedQ = messageBody.trim();
+        const lowerQ = trimmedQ.toLowerCase();
+        if (/^(start quiz|start_quiz|کوئز شروع کریں)$/i.test(trimmedQ)) {
+          await QuizSessionService.startQuizFromInvite(from);
+        } else if (lowerQ === 'stop' || trimmedQ === 'روکیں') {
+          await QuizSessionService.endSession(from, quizState, 'incomplete');
+        } else if (/^[abc]$/i.test(trimmedQ) && quizState.currentQuestionId) {
+          await QuizSessionService.handleAnswer(from, trimmedQ, quizState);
+        } else if (quizState.currentQuestionId) {
+          await WhatsAppService.sendMessage(from,
+            '❓ Tap one of the answer buttons above, or type A, B, or C.\n\nType STOP to exit the quiz.'
+          );
+        } else {
+          // Invited but not started: there is no question "above" to answer,
+          // so pointing at answer buttons is simply wrong.
+          await WhatsAppService.sendMessage(from,
+            '❓ Reply *Start Quiz* when you are ready to begin.\n\nType STOP if you would rather not.'
+          );
         }
-      } catch (qErr) {
-        logToFile('⚠️ Quiz state intercept error (non-fatal)', { error: qErr.message });
-      }
+        return true;
+      });
+      if (activeQuizHandled) { typingController.stop(); return; }
     }
 
     // ============================================================
@@ -179,6 +314,19 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // NOTE: Funnel tracking (chat start) is handled centrally in whatsapp-bot.js
   // before routing to this handler
 
+  // ============================================================
+  // LESSON PLAN PASTED AS TEXT — while a coaching session waits for its plan
+  // (lesson-plan fidelity on), a long message is the plan, not chat.
+  // ============================================================
+  if (user && messageBody) {
+    try {
+      const { handlePastedLessonPlan } = require('../services/coaching/lp-coaching/lp-text-paste.service');
+      if (await handlePastedLessonPlan(user, from, messageBody)) return;
+    } catch (error) {
+      logToFile('⚠️ Pasted lesson plan check failed (non-fatal)', { error: error.message });
+    }
+  }
+
   // Get or create session for this user
   let sessionId = null;
   if (user) {
@@ -195,24 +343,95 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // ============================================================
   if (user) {
     try {
-      const isPendingName = await FeatureRegistrationService.isPendingName(user.id);
+      // A command (/menu, /reading test) still runs while a name is pending;
+      // it is not the name. The name question comes back after a feature.
+      // Nor is a short exam request ("check my papers"): it opens the exam
+      // checker. Nor is a cancel word ("منسوخ") while an exam session is open:
+      // it ends it. Nor is anything sent while Rumi collects an answer key: a
+      // one-word answer ("Paris") is the answer, not the teacher's name.
+      let isPendingName = !String(messageBody || '').trim().startsWith('/')
+        && await FeatureRegistrationService.isPendingName(user.id);
+      if (isPendingName) {
+        const ExamCheckerHandler = require('./exam-checker.handler');
+        if (ExamCheckerHandler.isExamCheckerEnabled()
+          && ExamCheckerHandler.shouldTriggerExamChecker(messageBody)) {
+          isPendingName = false;
+        } else if (ExamCheckerHandler.isExamCancelCommand(messageBody)
+          && await ExamCheckerHandler.hasActiveExamSession(user.id)) {
+          isPendingName = false;
+        } else if (ExamCheckerHandler.isExamCheckerEnabled()
+          && await ExamCheckerHandler.isCollectingAnswerKey(user.id)) {
+          isPendingName = false;
+        }
+      }
+
+      // On Matrix the name question may have been offered unasked (see
+      // handleGeneralConversation), so it must not block use: "no thanks"
+      // closes it, and a reply that is not a name is handled as a normal
+      // message with the question left open. Keeping chatting is often one
+      // word ("fractions"), which reads like a name, so a bare word is asked
+      // about before it is stored (resolveOfferedNameReply). Everywhere else
+      // the question follows a feature the teacher just used, and the next
+      // message is the answer.
+      const offered = isPendingName && driverForIdentifier(from) === 'matrix';
+      let result = null;
+      if (offered) {
+        if (FeatureRegistrationService.isDeclineReply(messageBody)) {
+          await FeatureRegistrationService.declineRegistration(user.id, from, user.preferred_language || 'en');
+          if (typingController) typingController.stop();
+          return;
+        }
+        result = await FeatureRegistrationService.handleNameResponse(
+          user.id, messageBody, from, user.preferred_language || 'en', 'text', { confirmBareWord: true }
+        );
+        if (result.chat) {
+          logToFile('📝 Name pending, but this reply is not a name; handling it as a message', { userId: user.id });
+          isPendingName = false;
+        }
+      }
+
       if (isPendingName) {
         logToFile('📝 User is pending name registration, handling name response', { userId: user.id });
 
         // Get user's current language
         const userLanguage = user.preferred_language || 'en';
 
-        // Handle the name response
-        const result = await FeatureRegistrationService.handleNameResponse(
-          user.id,
-          messageBody,
-          from,
-          userLanguage,
-          'text'
-        );
+        // Handle the name response (on Matrix, already read above)
+        if (!result) {
+          result = await FeatureRegistrationService.handleNameResponse(
+            user.id,
+            messageBody,
+            from,
+            userLanguage,
+            'text'
+          );
+        }
 
         if (result.success) {
           logToFile('✅ Name registration completed via text', { userId: user.id, firstName: result.firstName });
+        } else if (result.confirm && offered) {
+          // A bare word on Matrix may be chat or the name: ask once. "Yes" or
+          // the same word again takes it; anything else is chat.
+          const name = result.confirm;
+          const confirmMessages = {
+            en: `Shall I call you ${name}? Reply yes, or tell me your name.`,
+            ur: `کیا میں آپ کو ${name} کہہ کر بلاؤں؟ ہاں لکھ دیں، یا اپنا نام بتا دیں۔`,
+            ar: `هل أناديك ${name}؟ أجب بنعم، أو أخبرني باسمك.`,
+            es: `¿Te llamo ${name}? Responde sí, o dime tu nombre.`
+          };
+          await WhatsAppService.sendMessage(from, confirmMessages[userLanguage] || confirmMessages.en);
+        } else if (result.confirm) {
+          // A lone greeting word ("Salam") may be a greeting or the name.
+          // Ask in words that make plain it can be the name; the same word
+          // sent again is taken (FeatureRegistrationService.resolveNameReply).
+          const name = result.confirm;
+          const confirmMessages = {
+            en: `Is "${name}" your name? Send it again and I'll use it, or tell me the name you'd like me to use.`,
+            ur: `کیا "${name}" آپ کا نام ہے؟ یہی دوبارہ بھیج دیں تو میں یہی نام رکھوں گی، یا وہ نام بتا دیں جس سے آپ کو بلاؤں۔`,
+            ar: `هل "${name}" اسمك؟ أرسله مرة أخرى وسأستخدمه، أو أخبرني بالاسم الذي تريد أن أناديك به.`,
+            es: `¿"${name}" es tu nombre? Envíalo otra vez y lo usaré, o dime el nombre que quieres que use.`
+          };
+          await WhatsAppService.sendMessage(from, confirmMessages[userLanguage] || confirmMessages.en);
         } else {
           logToFile('⚠️ Name extraction failed, asking again', { userId: user.id });
           // Ask again if extraction failed
@@ -278,25 +497,18 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // ============================================================
   const trimmedMessage = messageBody.trim().toLowerCase();
 
-  // Video-quiz share links.
+  // Video-quiz share links: the join replies.
   //
   // Deliberately BEFORE every other consumer: a child arriving from a
-  // forwarded wa.me link may have no users row at all, and their first
-  // message is the auto-filled "QUIZ-ABC123". Routing that through normal
-  // onboarding would answer a code with a menu.
-  //
-  // Two steps, both short-circuiting:
-  //   1. the code itself -> greet, naming the teacher and the topic
-  //   2. the join replies -> the child's name and class
+  // forwarded link may have no users row at all. The code itself
+  // ("QUIZ-ABC123") is taken at the very top of this handler
+  // (tryShareCodeJoin), ahead of the quiz-state intercepts; this block only
+  // claims the next free-text messages as the child's name, then their class.
   if (messageBody) {
     try {
       const VideoQuizShare = require('../services/quiz/video-quiz-share.service');
-      const code = VideoQuizShare.parseShareCode(messageBody);
-      if (code) {
-        if (await VideoQuizShare.beginFromCode(from, code)) return;
-      }
       if (await VideoQuizShare.consumeJoinReply(from, messageBody)) {
-        logToFile('Text consumed as video-quiz join detail — short-circuit', { from });
+        logToFile('Text consumed as video-quiz join detail — short-circuit', { phoneTail: String(from).slice(-4) });
         return;
       }
     } catch (vqErr) {
@@ -319,6 +531,14 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     } catch (svFbErr) {
       logToFile('Student Video Feedback: consumeReasonIfPending error', { error: svFbErr.message });
     }
+  }
+
+  // Test papers: /testpaper, /paper, /mypapers — and, while a pick is pending,
+  // the teacher's numbers, typed mix, pasted chapter or edit request. Slash
+  // commands other than these always pass through (see testpaper-trigger.js).
+  if (messageBody && await routeTestPaperText({ user, from, messageBody, language: responseLanguage })) {
+    typingController.stop();
+    return;
   }
 
   // When user taps ice breaker, WhatsApp sends the ice breaker text as message
@@ -424,6 +644,19 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     }
 
     return; // Stop further processing
+  }
+
+  // ============================================================
+  // OBSERVE (the coach's assistant): /observe, and any reply a pending
+  // observe step is waiting for. Off unless OBSERVE_ENABLED=true; for anyone
+  // outside the coach role family only /observe itself is looked at. The
+  // original-case message is passed — a teacher's name keeps its capitals.
+  // ============================================================
+  try {
+    const { handleObserveText } = require('./observe-command.handler');
+    if (await handleObserveText(user, from, messageBody)) return;
+  } catch (error) {
+    logToFile('❌ Error in observe text handling', { userId: user?.id, error: error.message });
   }
 
   // ============================================================
@@ -558,18 +791,75 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   }
 
   // ============================================================
-  // QUIZ COMMAND: /quiz [topic] — generate + send a quiz to the class.
-  // Direct path (QuizOrchestrator). A Quiz Manager Flow can be layered later
-  // via QUIZ_FLOW_ID, but the direct path needs no Meta-flow registration.
+  // LESSON QUIZ TOPIC REPLY: the teacher picked "Quiz on any topic" in the
+  // /quiz menu and was asked to type the topic. This reply is that topic.
+  // Only with the lesson quiz on; a slash command is never a topic.
   // ============================================================
-  if (trimmedMessage === '/quiz' || trimmedMessage.startsWith('/quiz ')) {
-    logToFile('📝 /quiz command detected', { userId: user?.id, phoneNumber: from });
+  const lessonQuizOn = lessonQuizEnabled();
+  if (lessonQuizOn && user?.id && messageBody && !messageBody.trim().startsWith('/')) {
+    try {
+      const TranscriptQuizList = require('../services/quiz/transcript-quiz-list.service');
+      if (typeof TranscriptQuizList.consumeTopicReply === 'function'
+          && await TranscriptQuizList.consumeTopicReply(from, messageBody.trim(), user)) {
+        typingController.stop();
+        return;
+      }
+    } catch (error) {
+      logToFile('❌ lesson quiz: topic reply check failed', { userId: user.id, error: error.message }, 'error');
+    }
+  }
+
+  // ============================================================
+  // QUIZ COMMAND: /quiz [topic] — generate + send a quiz to the class.
+  //
+  // With the lesson quiz on (TRANSCRIPT_QUIZ_ENABLED=true), /quiz — and a bare
+  // "quiz" (TranscriptQuizList.isQuizCommand) — opens the teacher's quiz menu:
+  // their recorded lessons and lesson plans, the quizzes made from them, a quiz
+  // on any topic, and the classic quiz to parents' phones. WHICH menu, for
+  // whoever holds this phone, is decided in one place: quiz-menu-entry.service.
+  // `/quiz <topic>` skips the menu and starts a topic quiz.
+  //
+  // Flag off: the direct path (QuizOrchestrator), exactly as before. A Quiz
+  // Manager Flow can be layered later via QUIZ_FLOW_ID, but the direct path
+  // needs no Meta-flow registration.
+  // ============================================================
+  const isQuizCommand = lessonQuizOn
+    ? require('../services/quiz/transcript-quiz-list.service').isQuizCommand(messageBody)
+    : (trimmedMessage === '/quiz' || trimmedMessage.startsWith('/quiz '));
+  if (isQuizCommand) {
+    logToFile('📝 /quiz command detected', { userId: user?.id, phoneTail: String(from).slice(-4), lessonQuiz: lessonQuizOn });
     if (!user) {
       typingController.stop();
       await WhatsAppService.sendMessage(
         from,
         'Sorry, I could not find your account. Please send me a message first to register.\n\nمعذرت، میں آپ کا اکاؤنٹ نہیں مل سکا۔'
       );
+      return;
+    }
+    if (lessonQuizOn) {
+      typingController.stop();
+      const rawBody = messageBody.trim();
+      const topic = /^\/quiz(\s|$)/i.test(rawBody)
+        ? rawBody.replace(/^\/quiz[\s,:;\-]*/i, '').trim() || null
+        : null;
+      try {
+        const language = await getUserLanguage(user.id) || null;
+        if (topic) {
+          const TopicQuiz = require('../services/quiz/providers/topic.provider');
+          await TopicQuiz.startTopicQuiz(user, from, topic, language);
+        } else {
+          const QuizMenuEntry = require('../services/quiz/quiz-menu-entry.service');
+          await QuizMenuEntry.openQuizMenu({
+            user, from, language, sessionId, trigger: 'text',
+          });
+        }
+      } catch (error) {
+        logToFile('❌ lesson quiz: /quiz failed', { userId: user.id, topic, error: error.message }, 'error');
+        await WhatsAppService.sendMessage(
+          from,
+          'Sorry, something went wrong starting the quiz. Please try again.\n\nمعذرت، کوئز شروع کرنے میں کچھ غلط ہو گیا۔'
+        );
+      }
       return;
     }
     try {
@@ -615,7 +905,8 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     // library and went to the generator, which then needs its own API keys.
     const STUDENT_VIDEOS_FLOW_ID = process.env.STUDENT_VIDEOS_FLOW_ID || '';
     typingController.stop();
-    const videoFlowToken = `${user?.id || 'anon'}:student-videos:${Date.now()}`;
+    // The chat rides on the token so the video reaches a teacher on any channel.
+    const videoFlowToken = `${user?.id || 'anon'}:student-videos:${Date.now()}:${from}`;
     const pickerSent = await WhatsAppService.sendFlow(from, {
       flowId: STUDENT_VIDEOS_FLOW_ID,
       flowKind: 'student-videos',
@@ -1035,10 +1326,10 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // Detect stuck sessions but DON'T block user - store reminder for later
   if (user) {
     try {
-      const { data: stuckSession } = await supabase
+      const { data: stuckSession } = await ownCoaching(supabase
         .from('coaching_sessions')
         .select('id, status, updated_at, conversation_state')
-        .eq('user_id', user.id)
+        .eq('user_id', user.id)) // a coach's observation of this teacher is not their unfinished session
         .in('status', ['conducting_conversation', 'analyzing'])
         .order('updated_at', { ascending: false })
         .limit(1)
@@ -1090,10 +1381,10 @@ async function handleTextMessage(message, from, messageBody, user = null) {
         });
 
         // Fetch the stuck session
-        const { data: stuckSession } = await supabase
+        const { data: stuckSession } = await ownCoaching(supabase
           .from('coaching_sessions')
           .select('*')
-          .eq('id', stuckSessionId)
+          .eq('id', stuckSessionId)) // the reply below can fail or re-run it: never a coach's observation
           .single();
 
         if (stuckSession) {
@@ -1220,6 +1511,14 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     // instead of ever seeing the actual registration form.
     if (user?.id && (driverForIdentifier(from) === 'slack' || driverForIdentifier(from) === 'discord')) {
       await FeatureRegistrationService.sendNameQuestion(user.id, from, responseLanguage, 'text');
+      return;
+    }
+
+    // Matrix has no form, but the same reasoning holds: the person opened a
+    // room with Rumi and asked to register, so the name question is not a
+    // cold message there. Ask it now, worded as the answer to their request.
+    if (user?.id && driverForIdentifier(from) === 'matrix') {
+      await FeatureRegistrationService.sendNameQuestion(user.id, from, responseLanguage, 'text', { variant: 'requested' });
       return;
     }
 
@@ -1396,7 +1695,7 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     }
     try {
       typingController.stop();
-      const STATUS_FLOW_ID = process.env.STATUS_FLOW_ID || '';
+      const STATUS_FLOW_ID = nativeFlowIdFor(from, process.env.STATUS_FLOW_ID);
       if (STATUS_FLOW_ID) {
         await WhatsAppService.sendFlow(from, {
           flowId: STATUS_FLOW_ID,
@@ -1429,7 +1728,7 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // HOMEWORK_FLOW_ID; offers the homework request flow.
   // ============================================================
   {
-    const HOMEWORK_FLOW_ID = process.env.HOMEWORK_FLOW_ID || '';
+    const HOMEWORK_FLOW_ID = nativeFlowIdFor(from, process.env.HOMEWORK_FLOW_ID);
     const hwDecision = evaluateHomeworkTrigger({ messageBody, user, homeworkFlowId: HOMEWORK_FLOW_ID });
     if (hwDecision.match) {
       typingController.stop();
@@ -1466,7 +1765,7 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     logToFile('📋 Edit class keyword detected', { userId: user.id });
     typingController.stop();
 
-    const EDIT_CLASS_FLOW_ID = process.env.EDIT_CLASS_FLOW_ID || '';
+    const EDIT_CLASS_FLOW_ID = nativeFlowIdFor(from, process.env.EDIT_CLASS_FLOW_ID);
     if (!EDIT_CLASS_FLOW_ID) {
       await WhatsAppService.sendMessage(from, 'Sorry, class editing is not available yet. Please try again later.');
       return;
@@ -1512,247 +1811,10 @@ async function handleTextMessage(message, from, messageBody, user = null) {
   // ============================================================
   // ATTENDANCE SYSTEM INTEGRATION
   // ============================================================
-  // Check if user is in an active attendance session
-  if (user?.id) {
-    try {
-      const isInAttendanceSession = await AttendanceConversationService.isInAttendanceSession(user.id);
-
-      if (isInAttendanceSession) {
-        logToFile('📋 User in active attendance session, routing message', { userId: user.id });
-
-        // Get current session state
-        const sessionState = await AttendanceConversationService.getSessionState(user.id);
-
-        // Handle cancel command
-        if (messageBody.toLowerCase() === 'cancel' || messageBody.toLowerCase() === 'منسوخ') {
-          typingController.stop();
-          const result = await AttendanceConversationService.cancelSession(user.id);
-          await WhatsAppService.sendMessage(from, result.message);
-          return;
-        }
-
-        let result;
-
-        // A fresh attendance trigger ("attendance", "حاضری", ...) sent while
-        // already mid-flow means the teacher wants to start over, not answer
-        // whatever state-specific prompt is pending — without this, a stuck
-        // or half-abandoned session (e.g. a channel that silently dropped a
-        // step) has no way back in except explicitly typing "cancel" first,
-        // and instead gets misread as an answer to that prompt (e.g.
-        // AWAITING_VERIFICATION's yes/edit/cancel check). Excluded from
-        // PROCESSING, which already has its own wait/timeout handling and
-        // shouldn't be interrupted mid-generation by this.
-        const attendanceRetrigger = AttendanceDetectorService.detectAttendanceIntent(messageBody);
-        if (sessionState.state !== AttendanceConversationService.STATES.PROCESSING && attendanceRetrigger.detected) {
-          logToFile('📋 Attendance trigger received mid-session, restarting', { userId: user.id, previousState: sessionState.state });
-          await AttendanceConversationService.clearSessionState(user.id);
-          result = await AttendanceConversationService.startAttendanceSession(user.id);
-        } else {
-        // Route based on current state
-        switch (sessionState.state) {
-          case AttendanceConversationService.STATES.AWAITING_CLASS_SELECTION:
-            result = await AttendanceConversationService.handleClassSelection(user.id, messageBody);
-            break;
-
-          case AttendanceConversationService.STATES.AWAITING_MARKING_METHOD:
-            // Check for "everyone present" shortcut
-            const everyonePresentKeywords = ['everyone present', 'all present', 'سب حاضر', 'سب موجود', '3'];
-            if (everyonePresentKeywords.some(kw => messageBody.toLowerCase().includes(kw))) {
-              result = await AttendanceConversationService.handleEveryonePresent(user.id);
-            } else {
-              result = await AttendanceConversationService.handleMarkingMethodSelection(user.id, messageBody);
-            }
-            break;
-
-          case AttendanceConversationService.STATES.AWAITING_VOICE_INPUT:
-            // User sent text when expecting voice - prompt them
-            result = {
-              action: 'PROMPT_VOICE',
-              message: 'Please send a *voice message* with your roll call.\n\nOr reply "2" to switch to Tap to Mark.'
-            };
-            // Allow switching to tap method
-            if (messageBody === '2' || messageBody.toLowerCase().includes('tap')) {
-              result = await AttendanceConversationService.handleMarkingMethodSelection(user.id, '2');
-            }
-            break;
-
-          case AttendanceConversationService.STATES.AWAITING_VERIFICATION:
-            // User is verifying attendance results (yes/edit/cancel)
-            result = await AttendanceConversationService.handleVerificationResponse(user.id, messageBody);
-            break;
-
-          case AttendanceConversationService.STATES.AWAITING_DATE_SELECTION:
-            // User selecting date for attendance
-            result = await AttendanceConversationService.handleDateSelection(user.id, messageBody);
-            break;
-
-          case AttendanceConversationService.STATES.AWAITING_SESSION_TYPE:
-            // User selecting AM/PM session type
-            result = await AttendanceConversationService.handleSessionTypeSelection(user.id, messageBody);
-            break;
-
-          case AttendanceConversationService.STATES.IDLE:
-          case AttendanceConversationService.STATES.COMPLETED:
-            // Session is idle or completed - restart fresh
-            logToFile('📋 Attendance session idle/completed, restarting', { userId: user.id, state: sessionState.state });
-            await AttendanceConversationService.clearSessionState(user.id);
-            result = await AttendanceConversationService.startAttendanceSession(user.id);
-            break;
-
-          case AttendanceConversationService.STATES.PROCESSING:
-            // Check if processing has timed out
-            if (AttendanceConversationService.isProcessingTimedOut(sessionState)) {
-              logToFile('⚠️ Processing timeout detected, clearing stuck state', { userId: user.id, processingStartedAt: sessionState.processingStartedAt });
-              await AttendanceConversationService.clearSessionState(user.id);
-              result = {
-                action: 'ERROR',
-                message: 'Your previous attendance session timed out. Say "attendance" to start a new one.'
-              };
-            } else {
-              // Still processing - ask user to wait
-              result = {
-                action: 'PROCESSING',
-                message: 'Your attendance is being processed. Please wait a moment...'
-              };
-            }
-            break;
-
-          default:
-            // Unknown state - log and restart
-            logToFile('⚠️ Unknown attendance state, clearing session', { userId: user.id, state: sessionState?.state });
-            await AttendanceConversationService.clearSessionState(user.id);
-            result = {
-              action: 'ERROR',
-              message: 'Something went wrong with attendance. Say "attendance" to start again.'
-            };
-        }
-        }
-
-        typingController.stop();
-
-        // Handle the result
-        if (result.action === 'ASK_MARKING_METHOD' || result.action === 'ASK_CLASS_SELECTION') {
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'AWAIT_VOICE_INPUT' || result.action === 'PROMPT_VOICE') {
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'SEND_MARKING_FLOW') {
-          // Slack has a real Flow-equivalent (attendance_mark's checkbox
-          // modal — see slack-flow-registry.js), not sendFlow()'s Meta/
-          // Baileys-shaped {flowId, flowToken} contract. Same
-          // driverForIdentifier() branch shape as the addClassDetection
-          // block below and /settings above. The roster this modal needs
-          // is already sitting in the Redis session handleMarkingMethodSelection
-          // just saved — the modal's own INIT reads it back by userId.
-          if (driverForIdentifier(from) === 'slack') {
-            await WhatsAppService.sendInteractiveButtons(from, {
-              body: result.message,
-              buttons: [{ id: 'open_modal:attendance_mark', title: 'Mark Attendance' }],
-            });
-          } else if (driverForIdentifier(from) === 'discord') {
-            await WhatsAppService.sendInteractiveButtons(from, {
-              body: result.message,
-              buttons: [{ id: 'discord_start_flow:attendance_mark', title: 'Mark Attendance' }],
-            });
-          } else {
-            const sessionState = await AttendanceConversationService.getSessionState(user.id);
-            const today = new Date().toISOString().split('T')[0];
-            // Flow token format: userId:classId:date:sessionType:className - all data for response handling
-            const sessionType = sessionState?.selectedSession || 'morning';
-            const className = result.selectedClass?.class_name || 'Class';
-            const section = result.selectedClass?.section || '';
-            const flowToken = `${user.id}:${sessionState?.selectedListId}:${today}:${sessionType}:${encodeURIComponent(className)}`;
-            // Dynamic header with class + section (e.g., "5A Attendance")
-            const displayName = section ? `${className}${section}` : className;
-
-            // Baileys has no real Flow support at all — sendFlow() degrades
-            // to the 'attendance-mark' text-flow definition
-            // (text-flow-definitions.js) via flowKind, exactly like
-            // class-setup's own sendFlow() call above already does. Meta
-            // simply ignores flowKind and uses flowId for the real Flow.
-            // Called unconditionally (not gated behind ATTENDANCE_MARKING_FLOW_ID)
-            // so Baileys gets tap-to-mark even with no Meta Flow registered —
-            // the boolean return value decides whether to fall back.
-            const markingSent = await WhatsAppService.sendFlow(from, {
-              flowId: ATTENDANCE_MARKING_FLOW_ID,
-              flowKind: 'attendance-mark',
-              header: `📋 ${displayName} Attendance`,
-              body: result.message,
-              buttonText: 'Mark Attendance',
-              // Note: Don't specify screen for data_api_version 3.0+ flows with endpoint
-              // The endpoint determines first screen via INIT response
-              flowToken: flowToken
-            });
-
-            if (markingSent) {
-              logToFile('📋 Sent attendance marking flow', {
-                userId: user.id,
-                flowId: ATTENDANCE_MARKING_FLOW_ID,
-                classId: sessionState?.selectedListId,
-                studentCount: result.students?.length,
-                className: className
-              });
-            } else {
-              await WhatsAppService.sendMessage(from, 'The marking form is not configured. Please use voice marking instead.\n\nSay something like: "Everyone is here except Ali and Sara"');
-              logToFile('⚠️ Attendance marking flow unavailable on this channel', { userId: user.id });
-            }
-          }
-        } else if (result.action === 'GENERATE_ATTENDANCE') {
-          // Send initial "generating" message
-          await WhatsAppService.sendMessage(from, result.message);
-
-          // Generate, upload, and deliver Excel
-          try {
-            const sessionState = await AttendanceConversationService.getSessionState(user.id);
-            const deliveryResult = await AttendanceDeliveryService.processAndDeliver(
-              user.id,
-              from,
-              {
-                selectedClass: result.selectedClass,
-                selectedListId: sessionState?.selectedListId,
-                records: result.records,
-                summary: sessionState?.summary,
-                transcript: sessionState?.transcript,
-                markingMethod: sessionState?.markingMethod || 'voice'
-              }
-            );
-
-            if (!deliveryResult.success) {
-              // Clear state on delivery failure to prevent stuck PROCESSING
-              await AttendanceConversationService.clearSessionState(user.id);
-              logToFile('📋 Cleared session state after delivery failure', { userId: user.id, error: deliveryResult.error });
-              await WhatsAppService.sendMessage(from, `Sorry, there was an error generating your attendance file: ${deliveryResult.error}\n\nSay "attendance" to try again.`);
-            } else {
-              // Clear state on successful completion
-              await AttendanceConversationService.clearSessionState(user.id);
-              logToFile('📋 Cleared session state after successful delivery', { userId: user.id });
-            }
-          } catch (deliveryError) {
-            // Clear state on exception to prevent stuck PROCESSING
-            await AttendanceConversationService.clearSessionState(user.id);
-            logToFile('Attendance delivery error - state cleared', { error: deliveryError.message, userId: user.id });
-            await WhatsAppService.sendMessage(from, 'Sorry, something went wrong delivering your attendance file. Say "attendance" to try again.');
-          }
-        } else if (result.action === 'VERIFY_ATTENDANCE') {
-          // Verification message already sent by handleVoiceInput
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'SESSION_CANCELLED') {
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'INVALID_SELECTION' || result.action === 'INVALID_STATE') {
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'PROCESSING') {
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'SESSION_COMPLETED') {
-          await WhatsAppService.sendMessage(from, result.message);
-        } else if (result.action === 'ERROR') {
-          await WhatsAppService.sendMessage(from, result.message);
-        }
-
-        return; // Exit early - handled by attendance system
-      }
-    } catch (error) {
-      logToFile('Error checking attendance session', { error: error.message, userId: user?.id });
-      // Continue with normal flow if attendance check fails
-    }
+  // A message from someone mid-session is attendance's to route by state
+  // (attendance-entry.service owns both attendance doors and the messages).
+  if (await AttendanceEntryService.handleInSession({ user, from, messageBody, typingController })) {
+    return; // Exit early - handled by attendance system
   }
 
   // ============================================================
@@ -1801,63 +1863,10 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     return;
   }
 
-  // Check for attendance keyword trigger
-  const attendanceDetection = AttendanceDetectorService.detectAttendanceIntent(messageBody);
-  if (user?.id && attendanceDetection.detected) {
-    logToFile('📋 Attendance keyword detected, starting session', { userId: user.id, message: messageBody, confidence: attendanceDetection.confidence });
-    typingController.stop();
-
-    try {
-      const result = await AttendanceConversationService.startAttendanceSession(user.id);
-
-      if (result.action === 'SEND_SETUP_FLOW') {
-        // Slack/Discord have a real Flow-equivalent for attendance/class-setup
-        // — same driverForIdentifier() branch shape as /settings and the
-        // "add class" keyword branch above.
-        if (driverForIdentifier(from) === 'slack') {
-          await WhatsAppService.sendInteractiveButtons(from, {
-            body: result.message,
-            buttons: [{ id: 'open_modal:attendance', title: 'Set Up Class' }],
-          });
-          return;
-        }
-        if (driverForIdentifier(from) === 'discord') {
-          await WhatsAppService.sendInteractiveButtons(from, {
-            body: result.message,
-            buttons: [{ id: 'discord_start_flow:attendance', title: 'Set Up Class' }],
-          });
-          return;
-        }
-
-        // User has no classes — set one up, as a Flow or as the text equivalent.
-        const setupSent = await WhatsAppService.sendFlow(from, {
-          flowId: ATTENDANCE_SETUP_FLOW_ID,
-          flowKind: 'class-setup',
-          header: '📋 Class Setup',
-          body: result.message,
-          buttonText: 'Set Up Class',
-          screen: 'CLASS_INFO',
-          flowToken: user.id  // Pass user ID so endpoint can create class for correct user
-        });
-        if (setupSent) {
-          logToFile('📋 Sent attendance setup flow', { userId: user.id, flowId: ATTENDANCE_SETUP_FLOW_ID });
-        } else {
-          // Neither a Flow nor a text flow is available — say what we know.
-          await WhatsAppService.sendMessage(from, result.message);
-          logToFile('⚠️ Class setup unavailable on this channel, sent text message instead', { userId: user.id });
-        }
-      } else if (result.action === 'ASK_CLASS_SELECTION' || result.action === 'ASK_MARKING_METHOD') {
-        await WhatsAppService.sendMessage(from, result.message);
-      } else if (result.action === 'ERROR') {
-        await WhatsAppService.sendMessage(from, result.message);
-      }
-
-      return; // Exit early - handled by attendance system
-    } catch (error) {
-      logToFile('Error starting attendance session', { error: error.message, userId: user?.id });
-      await WhatsAppService.sendMessage(from, 'Sorry, something went wrong. Please try again.');
-      return;
-    }
+  // Check for attendance keyword trigger ("attendance", "attendance 30 sep",
+  // "class attendance") — role-aware: a head teacher's is staff attendance.
+  if (await AttendanceEntryService.handleTrigger({ user, from, messageBody, typingController })) {
+    return; // Exit early - handled by attendance system
   }
 
   // ============================================================
@@ -1883,6 +1892,12 @@ async function handleTextMessage(message, from, messageBody, user = null) {
     // command above for the full rationale.
     if (user?.id && (driverForIdentifier(from) === 'slack' || driverForIdentifier(from) === 'discord')) {
       await FeatureRegistrationService.sendNameQuestion(user.id, from, responseLanguage, 'text');
+      return;
+    }
+
+    // Matrix asks for the name straight away too (see /register above).
+    if (user?.id && driverForIdentifier(from) === 'matrix') {
+      await FeatureRegistrationService.sendNameQuestion(user.id, from, responseLanguage, 'text', { variant: 'requested' });
       return;
     }
 
@@ -2232,6 +2247,19 @@ async function handleTextMessage(message, from, messageBody, user = null) {
  */
 async function handleLessonPlanRequest(from, messageBody, user, sessionId, responseLanguage, typingController) {
   try {
+    // Not configured here (no GAMMA_API_KEY): say so, queue nothing (lesson-plan-availability.js).
+    if (await LessonPlanAvailability.explainIfUnavailable(from, { user, language: responseLanguage })) {
+      typingController.stop();
+      return;
+    }
+
+    // Today's lesson-plan allowance for an unregistered account
+    // (limits/daily-caps.js) — checked before the topic is read or a plan queued.
+    if (!(await DailyCaps.allowOrExplain(user, 'lesson_plan', from))) {
+      typingController.stop();
+      return;
+    }
+
     // Multi-language message maps
     const lessonPlanMessages = {
       en: {
@@ -2350,6 +2378,19 @@ async function handleLessonPlanRequest(from, messageBody, user, sessionId, respo
  */
 async function handlePresentationRequest(from, messageBody, user, sessionId, responseLanguage, typingController) {
   try {
+    // Not configured here (no GAMMA_API_KEY): say so, queue nothing (lesson-plan-availability.js).
+    if (await LessonPlanAvailability.explainIfUnavailable(from, { user, language: responseLanguage })) {
+      typingController.stop();
+      return;
+    }
+
+    // Today's lesson-plan allowance for an unregistered account
+    // (limits/daily-caps.js) — checked before the topic is read or a plan queued.
+    if (!(await DailyCaps.allowOrExplain(user, 'lesson_plan', from))) {
+      typingController.stop();
+      return;
+    }
+
     // Multi-language message maps
     const presentationMessages = {
       en: {
@@ -2522,6 +2563,16 @@ async function handleGeneralConversation(from, messageBody, user, sessionId, res
 
     // Show stuck session reminder (non-blocking) if applicable
     await showStuckSessionReminder(from, user.id, responseLanguage);
+  }
+
+  // On Matrix a person can register without first using a feature, so the
+  // first conversation ends with an optional offer to register
+  // (offerRegistration skips anyone registered or already asked, and never
+  // throws). After the reply, so the offer never delays or replaces it.
+  // WhatsApp keeps asking only after a feature, where an unprompted name
+  // question reads as spam.
+  if (user?.id && driverForIdentifier(from) === 'matrix') {
+    await FeatureRegistrationService.offerRegistration(user.id, from, responseLanguage);
   }
 }
 

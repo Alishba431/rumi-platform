@@ -57,6 +57,9 @@ const CRON_WORKERS = new Set([
   // "nothing sent" and exits 1 so the scheduler can see the failed run — that is the
   // contract, not a boot failure.
   path.join(BOT_ROOT, 'workers', 'brief.worker.js'),
+  // The teacher-nudge worker is a one-shot cron: off by default it exits 0; switched on
+  // with an unreachable database it reports the failed run and exits non-zero.
+  path.join(BOT_ROOT, 'workers', 'teacher-nudges.worker.js'),
 ]);
 
 function discoverWorkerEntries() {

@@ -45,7 +45,7 @@ function load() {
   jest.doMock('bullmq', () => ({ Queue, Worker, Job }), { virtual: true });
   jest.doMock('ioredis', () => function IORedis() { return {}; }, { virtual: true });
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
-  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: redisSet }), { virtual: true });
+  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: redisSet }));
   jest.doMock('../../bot/shared/utils/structured-logger', () => ({ getCurrentCorrelationId: () => 'c1', logEvent: jest.fn() }));
 
   process.env.REDIS_URL = 'redis://localhost:6379';
@@ -61,6 +61,13 @@ describe('BullMQ driver — producers', () => {
     expect(id).toBe('s1-transcription');
     const job = registry.get('rumi-main')[0];
     expect(job.data).toMatchObject({ sessionId: 's1', jobType: 'transcription', version: '1.0' });
+  });
+
+  it('queueCoachingJob folds payload.phase / dedupNonce into the jobId so a deliver after a preview is not dropped', async () => {
+    const q = load();
+    expect(await q.queueCoachingJob('s9', 'observe_teacher_report', { phase: 'preview' })).toBe('s9-observe_teacher_report-preview');
+    expect(await q.queueCoachingJob('s9', 'observe_teacher_report', { phase: 'deliver' })).toBe('s9-observe_teacher_report-deliver');
+    expect(await q.queueCoachingJob('s9', 'observe_debrief', { dedupNonce: 'n1' })).toBe('s9-observe_debrief-n1');
   });
 
   it('queueVideoJob enqueues on the video queue', async () => {

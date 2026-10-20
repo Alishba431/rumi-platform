@@ -8,11 +8,16 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const fs = require('fs');
 const path = require('path');
 const { lazyClient } = require('../utils/lazy-client');
+const { redactUrl } = require('../utils/redact-url');
 
 // R2 client is lazy-initialised. The bot can boot without R2 credentials set —
 // every R2 helper below calls getR2Client() at the moment the actual S3-API
 // command is sent. If R2 isn't configured, the upload throws a structured
 // "missing env" error that the caller can catch (or surface to the user).
+// R2_FORCE_PATH_STYLE=true addresses objects as <endpoint>/<bucket>/<key>,
+// which other S3-compatible stores (a local MinIO, most self-hosted ones)
+// require. Off by default: an R2 deployment sends what it always sent. (Read
+// from process.env: buildArgs only sees the required vars.)
 const getR2Client = lazyClient(S3Client, ['R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'], (env) => ({
   region: 'auto',
   endpoint: env.R2_ENDPOINT,
@@ -20,9 +25,20 @@ const getR2Client = lazyClient(S3Client, ['R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2
     accessKeyId: env.R2_ACCESS_KEY_ID,
     secretAccessKey: env.R2_SECRET_ACCESS_KEY,
   },
+  ...(String(process.env.R2_FORCE_PATH_STYLE || '').toLowerCase() === 'true' ? { forcePathStyle: true } : {}),
 }));
 
 const BUCKET_NAME = process.env.R2_BUCKET_NAME;
+
+/**
+ * One path segment of an object key, built from a channel identifier or a
+ * message/session id. A Matrix identity ("mtx:1555…", "matrix:@teacher:server")
+ * or event id ("$abc:server") carries characters several S3-compatible
+ * stores refuse; a WhatsApp number or message id passes through unchanged.
+ */
+function keySegment(value) {
+  return String(value).replace(/[^A-Za-z0-9._-]/g, '_');
+}
 
 /**
  * Upload audio file to R2 storage
@@ -38,7 +54,7 @@ async function uploadAudio(filePath, userId, messageId) {
     const timestamp = Date.now();
 
     // Create organized path: audio/{userId}/{timestamp}_{messageId}.ext
-    const key = `audio/${userId}/${timestamp}_${messageId}${fileExt}`;
+    const key = `audio/${keySegment(userId)}/${timestamp}_${keySegment(messageId)}${fileExt}`;
 
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
@@ -88,7 +104,7 @@ function buildR2PublicUrl(key) {
 
 async function uploadLessonPlanBuffer({ buffer, userId, sessionId, fileType = 'pdf' }) {
   const normalizedExt = fileType.startsWith('.') ? fileType.toLowerCase() : `.${fileType.toLowerCase()}`;
-  const key = `lesson_plans/${userId}/${sessionId}_lesson_plan${normalizedExt}`;
+  const key = `lesson_plans/${keySegment(userId)}/${keySegment(sessionId)}_lesson_plan${normalizedExt}`;
 
   const command = new PutObjectCommand({
     Bucket: BUCKET_NAME,
@@ -153,7 +169,7 @@ async function uploadClassroomAudio(filePath, userId, sessionId, metadata = {}) 
     const yearMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
 
     // Create organized path: classroom_audio/{userId}/{YYYY-MM}/{sessionId}_{timestamp}.ext
-    const key = `classroom_audio/${userId}/${yearMonth}/${sessionId}_${timestamp}${fileExt}`;
+    const key = `classroom_audio/${keySegment(userId)}/${yearMonth}/${keySegment(sessionId)}_${timestamp}${fileExt}`;
 
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
@@ -196,7 +212,7 @@ async function uploadLessonPlan(filePath, userId, sessionId) {
     const fileExt = path.extname(filePath);
 
     // Create path: lesson_plans/{userId}/{sessionId}_lesson_plan.{ext}
-    const key = `lesson_plans/${userId}/${sessionId}_lesson_plan${fileExt}`;
+    const key = `lesson_plans/${keySegment(userId)}/${keySegment(sessionId)}_lesson_plan${fileExt}`;
 
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
@@ -233,7 +249,7 @@ async function uploadLessonPlan(filePath, userId, sessionId) {
 async function uploadVoiceDebrief(audioBuffer, userId, sessionId, language) {
   try {
     // Create path: voice_debriefs/{userId}/{sessionId}_debrief.mp3
-    const key = `voice_debriefs/${userId}/${sessionId}_debrief.mp3`;
+    const key = `voice_debriefs/${keySegment(userId)}/${keySegment(sessionId)}_debrief.mp3`;
 
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
@@ -270,7 +286,7 @@ async function uploadVoiceDebrief(audioBuffer, userId, sessionId, language) {
 async function uploadReportPDF(pdfBuffer, userId, sessionId) {
   try {
     // Create path: reports/{userId}/{sessionId}_report.pdf
-    const key = `reports/${userId}/${sessionId}_report.pdf`;
+    const key = `reports/${keySegment(userId)}/${keySegment(sessionId)}_report.pdf`;
 
     const command = new PutObjectCommand({
       Bucket: BUCKET_NAME,
@@ -401,7 +417,7 @@ function extractKeyFromUrl(url) {
   // We need to extract everything after the bucket name
   const bucketIndex = url.indexOf(`/${BUCKET_NAME}/`);
   if (bucketIndex === -1) {
-    throw new Error(`Could not extract R2 key from URL: ${url}`);
+    throw new Error(`Could not extract R2 key from URL: ${redactUrl(url)}`);
   }
   return url.substring(bucketIndex + `/${BUCKET_NAME}/`.length);
 }
@@ -555,7 +571,7 @@ async function getPresignedUrl(r2Url, expiresIn = 3600) {
 
   // If it's already a presigned URL or not an R2 URL, return as-is
   if (r2Url.includes('X-Amz-Signature') || !isPermanentR2Url(r2Url)) {
-    console.log(`⏭️ Skipping presign (already signed or not R2): ${r2Url.substring(0, 80)}...`);
+    console.log(`⏭️ Skipping presign (already signed or not R2): ${redactUrl(r2Url)}`);
     return r2Url;
   }
 
@@ -565,7 +581,7 @@ async function getPresignedUrl(r2Url, expiresIn = 3600) {
   const bucketIndex = r2Url.indexOf(`/${bucketName}/`);
 
   console.log(`🔑 Presigned URL generation:`, {
-    r2Url: r2Url.substring(0, 100),
+    r2Url: redactUrl(r2Url),
     bucketName,
     bucketIndex,
     r2Endpoint: process.env.R2_ENDPOINT?.substring(0, 50)
@@ -573,7 +589,7 @@ async function getPresignedUrl(r2Url, expiresIn = 3600) {
 
   if (bucketIndex === -1) {
     console.warn('⚠️ Could not extract key from R2 URL - bucket pattern not found:', {
-      r2Url,
+      r2Url: redactUrl(r2Url),
       bucketName,
       lookingFor: `/${bucketName}/`
     });
@@ -592,8 +608,8 @@ async function getPresignedUrl(r2Url, expiresIn = 3600) {
     const presignedUrl = await getSignedUrl(getR2Client(), command, { expiresIn });
 
     console.log(`✅ Generated presigned URL for ${key}:`);
-    console.log(`   Original: ${r2Url.substring(0, 80)}...`);
-    console.log(`   Presigned: ${presignedUrl.substring(0, 100)}...`);
+    console.log(`   Original: ${redactUrl(r2Url)}`);
+    console.log(`   Presigned: ${redactUrl(presignedUrl)}`);
     console.log(`   Expires in: ${expiresIn}s`);
     console.log(`   Has signature: ${presignedUrl.includes('X-Amz-Signature')}`);
 
@@ -642,7 +658,7 @@ async function uploadImageWithRetry(imageBuffer, userId, imageId, mimeType) {
                     mimeType === 'image/gif' ? 'gif' :
                     mimeType === 'image/webp' ? 'webp' : 'jpg';
   const timestamp = Date.now();
-  const key = `images/${userId}/${imageId}_${timestamp}.${extension}`;
+  const key = `images/${keySegment(userId)}/${keySegment(imageId)}_${timestamp}.${extension}`;
 
   let lastError;
 
@@ -667,7 +683,7 @@ async function uploadImageWithRetry(imageBuffer, userId, imageId, mimeType) {
 
       logToFile('Image uploaded to R2', {
         key,
-        publicUrl,
+        publicUrl: redactUrl(publicUrl),
         attempt: attempt + 1,
         sizeBytes: imageBuffer.length,
       });

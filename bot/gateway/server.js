@@ -3,7 +3,7 @@
  * Standalone Webhook Ingestion Gateway Server (rumi-gateway)
  *
  * Runs the channel-agnostic webhook gateway as an independent microservice.
- * Handles incoming webhooks for WhatsApp (Meta Cloud API) and Slack.
+ * Handles incoming WhatsApp (Meta Cloud API) webhooks; Slack stays on the bot.
  *
  * Requirements:
  * - Independent port resolution (GATEWAY_PORT || PORT || 4000)
@@ -27,10 +27,10 @@ const portEnv = process.env.GATEWAY_PORT || process.env.PORT;
 const DEFAULT_PORT = portEnv !== undefined ? Number(portEnv) : 4000;
 const CORS_ORIGIN = process.env.GATEWAY_CORS_ORIGIN || '*';
 
-// 2. Import Gateway Router, Dispatcher, and Queue Service
+// 2. Import Gateway Router and Dispatcher (the queue driver is resolved per job,
+//    so QUEUE_DRIVER=memory never loads the SQS/BullMQ client libraries)
 const { createWebhookRoutes } = require('./webhook.routes');
 const { IngressDispatcher } = require('./ingress-dispatcher');
-const queueService = require('../shared/services/queue');
 
 // 3. Express App Setup
 const app = express();
@@ -73,7 +73,7 @@ function resolveQueueService() {
   if (driver === 'bullmq') {
     return require('../shared/services/queue/bullmq-queue.service');
   }
-  return queueService;
+  return require('../shared/services/queue');
 }
 
 const queueProducer = async (envelope) => {

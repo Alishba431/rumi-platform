@@ -2,6 +2,8 @@ export interface User {
   firstName: string;
   lastName: string;
   phoneNumber: string;
+  /** In the observe role family: shows the coach's "Observations" area. */
+  isCoach?: boolean;
 }
 
 export interface DashboardStats {
@@ -135,4 +137,76 @@ export interface VideoDetail extends VideoRequest {
   thumbnailUrl?: string; // Presigned URL from backend
   current_step?: number;
   error_message?: string;
+}
+
+// Coach's view ("My observations"). No scores and no coach-the-coach feedback
+// are ever sent to the portal for these.
+// awaitingTeacher / withReview: the report is on its way but the teacher does
+// not have it yet (an unopened invite, or with the review team).
+export type ObservationStage =
+  | 'form' | 'debrief' | 'report' | 'awaitingTeacher' | 'withReview' | 'inProgress' | 'completed';
+
+export interface CoachVisit {
+  id: string;
+  teacherName: string | null;
+  teacherUserId: string | null;
+  schoolName: string | null;
+  scheduledFor: string | null;
+  scheduledSlot: string | null;
+  overdue: boolean;
+}
+
+export interface CoachObservation {
+  id: string;
+  createdAt: string | null;
+  stage: ObservationStage;
+  teacherUserId: string | null;
+  teacherName: string | null;
+  schoolName: string | null;
+  reportStatus: string | null;
+  reportSentAt: string | null;
+  /** Section B — did the lesson follow its plan? null when it was never looked at. */
+  sectionB?: CoachSectionB | null;
+}
+
+export type SectionBVerdict =
+  | 'executed'
+  | 'substituted_equivalent'
+  | 'substituted_better'
+  | 'partial'
+  | 'not_done'
+  | 'not_adjudicable';
+
+export interface SectionBMove {
+  /** The move's number in the plan, as in the chat form. */
+  n: number;
+  phase: string | null;
+  phaseLabel: string;
+  text: string;
+  verdict: SectionBVerdict;
+  verdictLabel: string;
+  /** The coach changed this verdict in chat. */
+  coachChanged: boolean;
+}
+
+/** The moves and their verdicts — never a percentage, band or count. */
+export type CoachSectionB =
+  | { status: 'assessed'; mismatch: boolean; editedByCoach: boolean; moves: SectionBMove[] }
+  | { status: 'not_assessed'; reason: string; detail: string | null; message: string };
+
+export interface CoachObservationsData {
+  upcoming: CoachVisit[];
+  waiting: { form: CoachObservation[]; debrief: CoachObservation[]; report: CoachObservation[] };
+  /** Reports on their way: nothing for the coach to do, not completed either. */
+  delivering?: CoachObservation[];
+  inProgress: CoachObservation[];
+  completed: CoachObservation[];
+}
+
+export interface CoachTeacher {
+  id: string;
+  name: string;
+  schoolName: string | null;
+  observationCount: number;
+  lastObservedAt: string | null;
 }

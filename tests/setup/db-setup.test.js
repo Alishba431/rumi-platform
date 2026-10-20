@@ -103,6 +103,8 @@ describe('the one-time helper definition', () => {
     // setup used to skip creating tables.
     expect(sql).toMatch(/alter function public\.exec_sql\(text\) owner to postgres/i);
     expect(sql).toMatch(/grant execute on function public\.exec_sql\(text\) to service_role/i);
+    // It runs any SQL as postgres: nobody but service_role may call it.
+    expect(sql).toMatch(/revoke execute on function public\.exec_sql\(text\) from public, anon, authenticated/i);
     expect(sql).toMatch(/notify pgrst,\s*'reload schema'/i);
     expect(sql).toMatch(/security definer/i);
     // Must include extensions schema so uuid_generate_v4() works

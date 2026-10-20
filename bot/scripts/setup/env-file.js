@@ -60,7 +60,11 @@ function readEnvFile(envPath) {
     const key = keyOf(line);
     if (key === null) continue;
     const trimmed = line.trim();
-    result[key] = trimmed.slice(trimmed.indexOf('=') + 1).trim();
+    const raw = trimmed.slice(trimmed.indexOf('=') + 1).trim();
+    // Matching surrounding quotes are not part of the value (dotenv strips
+    // them too), so the file and the running process compare equal.
+    const quoted = raw.length >= 2 && (raw[0] === '"' || raw[0] === "'") && raw[raw.length - 1] === raw[0];
+    result[key] = quoted ? raw.slice(1, -1) : raw;
   }
   return result;
 }

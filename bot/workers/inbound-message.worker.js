@@ -5,8 +5,10 @@
  * Implements:
  * - Distributed message deduplication via SessionService.isProcessed
  * - Execution tracing via runWithCorrelation
- * - Immediate conversational feedback (reaction + typing indicator)
  * - Domain handler dispatching to text, voice, image, button, and flow workflows
+ *
+ * The reaction + typing indicator are left to handleWebhookPost, which sends
+ * them only after the inbound rate limit and model budget admit the message.
  */
 
 const { logToFile } = require('../shared/utils/logger');
@@ -157,22 +159,7 @@ class InboundMessageWorker {
         return { duplicate: true };
       }
 
-      // 2. Immediate conversational feedback for WhatsApp channel
-      if ((!envelope.channel || envelope.channel === 'whatsapp') && envelope.type !== 'status_update') {
-        try {
-          const WhatsAppService = require('../shared/services/whatsapp.service');
-          const emoji = SessionService.getReactionEmoji(envelope.from);
-          await WhatsAppService.sendReaction(envelope.from, envelope.id, emoji);
-          await WhatsAppService.showTypingIndicator(envelope.from, envelope.id);
-        } catch (feedbackErr) {
-          logToFile('⚠️ Could not send immediate reaction/typing indicator', {
-            error: feedbackErr.message,
-            from: envelope.from
-          });
-        }
-      }
-
-      // 3. Domain dispatching
+      // 2. Domain dispatching
       const syntheticReq = {
         body: envelopeToMetaWebhook(envelope),
         headers: {},

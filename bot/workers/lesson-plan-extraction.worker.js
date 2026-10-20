@@ -124,6 +124,8 @@ class LessonPlanExtractionWorker {
       }
 
       const updatePayload = {
+        // The FULL text: lesson-plan fidelity reads the plan from here (the excerpt is 500 characters).
+        lesson_plan_text: extractedText || null,
         lesson_plan_excerpt: excerpt,
         lesson_plan_structured: structuredData,
         lesson_plan_word_count: wordCount,
@@ -150,6 +152,14 @@ class LessonPlanExtractionWorker {
         excerptLength: excerpt?.length || 0,
         wordCount
       });
+
+      // A plan that finished reading after the analysis already ran: grade lesson-plan fidelity against it now
+      // (recompute only acts between the analysis and the report, and never throws).
+      const { isFidelityEnabled } = require('../shared/services/coaching/fidelity/fidelity-orchestrator');
+      if (isFidelityEnabled() && extractedText) {
+        const { recomputeFidelityForSession } = require('../shared/services/coaching/fidelity/fidelity-recompute.service');
+        await recomputeFidelityForSession(coachingSessionId);
+      }
     } catch (error) {
       const sanitizedError = (error.message || 'Unknown error')
         .replace(/\/[^\/\s]+/g, '[path]')

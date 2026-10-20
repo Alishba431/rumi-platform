@@ -1,59 +1,119 @@
 /**
- * exceljs mock for the OSS root test suite.
+ * ExcelJS mock for the root test suite.
  *
- * exceljs is a runtime dependency in bot/node_modules but not the root, and
- * CI runs the ROOT suite before `cd bot && npm ci` — so any test that
- * reaches bot/shared/services/attendance-generator.service.js (Excel
- * register generation) needs this or the suite fails in CI for reasons
- * unrelated to the test itself.
+ * exceljs lives in bot/node_modules and CI runs the root suite BEFORE `bot/ npm ci`,
+ * so a test that loads register-generating source cannot require the real library.
  *
- * Only the surface attendance-generator.service.js actually touches: a
- * Workbook whose addWorksheet() returns a worksheet with addRow()/
- * mergeCells()/getColumn(), each producing row/cell/column stand-ins that
- * tolerate arbitrary property writes (font/alignment/fill/border/numFmt —
- * cosmetic styling this suite never asserts on) and a real eachCell()
- * iteration, plus xlsx.writeBuffer().
+ * This is a RECORDING stub rather than a no-op: it keeps every row and cell written,
+ * which is what the register tests actually assert on. Parsing a real workbook would
+ * mostly test ExcelJS; reading back the rows tests the register logic, which is ours.
  */
 
-function createCell() {
-  return {}; // plain object — arbitrary property writes (font/fill/...) just land on it
+class Cell {
+  constructor(row, col, value) {
+    this.row = row;
+    this.col = col;
+    this.value = value;
+    this.font = undefined;
+    this.fill = undefined;
+    this.border = undefined;
+    this.alignment = undefined;
+  }
 }
 
-function createRow(values) {
-  const cells = (values || []).map(() => createCell());
-  return {
-    getCell: jest.fn((i) => cells[i - 1] || createCell()),
-    eachCell: jest.fn((callback) => cells.forEach((cell, i) => callback(cell, i + 1))),
-  };
+class Row {
+  constructor(number, values) {
+    this.number = number;
+    this.values = values;
+    this.height = undefined;
+    this.font = undefined;
+    this.alignment = undefined;
+    this._cells = values.map((v, i) => new Cell(number, i + 1, v));
+  }
+
+  getCell(col) {
+    return this._cells[col - 1] || new Cell(this.number, col, undefined);
+  }
+
+  eachCell(fn) {
+    this._cells.forEach((cell, i) => fn(cell, i + 1));
+  }
 }
 
-function createColumn() {
-  return {};
+class Column {
+  constructor(number) {
+    this.number = number;
+    this.width = undefined;
+  }
 }
 
-function createWorksheet() {
-  const columns = [];
-  return {
-    columns: [],
-    addRow: jest.fn((values) => createRow(values)),
-    mergeCells: jest.fn(),
-    getColumn: jest.fn((i) => {
-      columns[i - 1] = columns[i - 1] || createColumn();
-      return columns[i - 1];
-    }),
-  };
+class Worksheet {
+  constructor(name, options) {
+    this.name = name;
+    this.options = options;
+    this.rows = [];
+    this.merges = [];
+    this._columns = new Map();
+  }
+
+  get columnCount() {
+    return this.rows.reduce((max, r) => Math.max(max, r.values.length), 0);
+  }
+
+  get rowCount() {
+    return this.rows.length;
+  }
+
+  addRow(values) {
+    const row = new Row(this.rows.length + 1, [...values]);
+    this.rows.push(row);
+    return row;
+  }
+
+  getRow(n) {
+    return this.rows[n - 1];
+  }
+
+  eachRow(fn) {
+    this.rows.forEach((row, i) => fn(row, i + 1));
+  }
+
+  mergeCells(...args) {
+    this.merges.push(args);
+  }
+
+  getColumn(n) {
+    if (!this._columns.has(n)) this._columns.set(n, new Column(n));
+    return this._columns.get(n);
+  }
 }
 
 class Workbook {
   constructor() {
+    this.worksheets = [];
     this.creator = undefined;
     this.created = undefined;
-    this.xlsx = { writeBuffer: jest.fn(async () => Buffer.from('')) };
+    this.xlsx = {
+      // A deterministic, non-empty buffer: callers assert it exists and has length,
+      // and the shape assertions read `worksheets` instead.
+      writeBuffer: async () => Buffer.from(JSON.stringify(
+        this.worksheets.map((s) => ({ name: s.name, rows: s.rows.map((r) => r.values) })),
+      )),
+      load: async () => { throw new Error('exceljs mock cannot parse a workbook — assert on worksheets instead'); },
+      writeFile: async () => undefined,
+    };
   }
 
-  addWorksheet() {
-    return createWorksheet();
+  addWorksheet(name, options) {
+    const sheet = new Worksheet(name, options);
+    this.worksheets.push(sheet);
+    return sheet;
+  }
+
+  getWorksheet(nameOrIndex) {
+    if (typeof nameOrIndex === 'number') return this.worksheets[nameOrIndex - 1];
+    return this.worksheets.find((s) => s.name === nameOrIndex);
   }
 }
 
-module.exports = { Workbook };
+module.exports = { Workbook, Worksheet, Row, Cell };

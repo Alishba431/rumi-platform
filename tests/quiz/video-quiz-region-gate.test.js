@@ -1,14 +1,20 @@
 'use strict';
 /**
  * Region gate — video quizzes are enabled per-region via region_features
- * (seeded ON for region='pakistan' only, because the corpus belongs to the
- * Taleemabad Pakistani-curriculum video library).
+ * (video_quizzes_enabled), because the video library behind them is tied to
+ * one curriculum and is not offered everywhere.
+ *
+ * The gate is about the VIDEO library, so it applies to quizzes that have a
+ * video and to nothing else. A lesson quiz (written from a coaching recording,
+ * a lesson plan or a topic — quizzes.video_id is null) is shared by the same
+ * class link and must join on every deployment.
  *
  * Two entry points are gated and both are asserted here:
  *  - offerAfterVideo: a region with the flag off must see the video exactly
  *    as before (no offer, standalone survey untouched).
- *  - beginFromCode:   an old share link must stop admitting children when the
- *    flag is off — minting time does not grandfather delivery time.
+ *  - beginFromCode:   an old VIDEO share link must stop admitting children when
+ *    the flag is off — minting time does not grandfather delivery time — while
+ *    a LESSON quiz's link keeps working.
  */
 
 jest.mock('../../bot/shared/config/supabase', () => ({ from: jest.fn() }));
@@ -61,11 +67,48 @@ describe('region gate — offerAfterVideo', () => {
 });
 
 describe('region gate — beginFromCode', () => {
-  test('flag OFF: an existing share code no longer admits a child', async () => {
+  const { createMemorySupabase } = require('./helpers/memory-supabase');
+  const future = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+  const seed = () => createMemorySupabase({
+    quiz_share_codes: [
+      {
+        id: 'sc-video', code: 'VIDEO2', quiz_id: 'q-video', video_id: 'v1', teacher_user_id: 't1',
+        teacher_name: 'Teacher Example', topic: 'Adjectives', language: 'en', active: true, expires_at: future,
+      },
+      {
+        id: 'sc-lesson', code: 'LESSN2', quiz_id: 'q-lesson', video_id: null, teacher_user_id: 't1',
+        teacher_name: 'Teacher Example', topic: 'Fractions', language: 'en', active: true, expires_at: future,
+      },
+    ],
+    users: [{ id: 't1', phone_number: '15550109999', name: 'Teacher Example' }],
+    students: [],
+  });
+
+  test('flag OFF: a VIDEO quiz share code no longer admits a child', async () => {
     isVideoQuizzesEnabled.mockResolvedValue(false);
-    const handled = await share.beginFromCode('15550100001', 'K7RM2');
+    const mem = seed();
+    supabase.from.mockImplementation(mem.from);
+    const handled = await share.beginFromCode('15550100001', 'VIDEO2');
     expect(handled).toBe(false);
     expect(WhatsAppService.sendMessage).not.toHaveBeenCalled();
-    expect(supabase.from).not.toHaveBeenCalled();
+  });
+
+  test('flag OFF: a LESSON quiz share code (video_id null) still joins', async () => {
+    isVideoQuizzesEnabled.mockResolvedValue(false);
+    const mem = seed();
+    supabase.from.mockImplementation(mem.from);
+    const handled = await share.beginFromCode('15550100001', 'LESSN2');
+    expect(handled).toBe(true);
+    // A child we have never met is greeted and asked their name.
+    expect(WhatsAppService.sendMessage).toHaveBeenCalledWith('15550100001', expect.stringContaining('Fractions'));
+  });
+
+  test('flag ON: a VIDEO quiz share code joins as before', async () => {
+    isVideoQuizzesEnabled.mockResolvedValue(true);
+    const mem = seed();
+    supabase.from.mockImplementation(mem.from);
+    const handled = await share.beginFromCode('15550100001', 'VIDEO2');
+    expect(handled).toBe(true);
+    expect(WhatsAppService.sendMessage).toHaveBeenCalledWith('15550100001', expect.stringContaining('Adjectives'));
   });
 });

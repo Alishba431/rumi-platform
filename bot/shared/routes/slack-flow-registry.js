@@ -132,7 +132,7 @@ function registerAll() {
     viewToScreenData: attendanceMarkingView.viewToScreenData,
     firstInputBlockId: attendanceMarkingView.FIRST_INPUT_BLOCK_ID,
     onFinish: async (response, ctx) => {
-      const { success_message: success, selectedClass, selectedListId, records, stats, sessionDate, sessionType } = response.data || {};
+      const { success_message: success, subject, selectedClass, selectedListId, records, stats, sessionDate, sessionType } = response.data || {};
       if (success) await slackWebClient.postMessage(ctx.slackUserId, success);
 
       const AttendanceDeliveryService = require('../services/attendance-delivery.service');
@@ -142,6 +142,7 @@ function registerAll() {
 
       try {
         const deliveryResult = await AttendanceDeliveryService.processAndDeliver(ctx.userId, recipientIdentifier, {
+          subject,
           selectedClass,
           selectedListId,
           records,
@@ -149,14 +150,15 @@ function registerAll() {
           summary: {
             present: stats?.present,
             absent: stats?.absent,
+            leave: stats?.leave,
             attendancePercentage: parseFloat(stats?.attendanceRate) || 0,
           },
           sessionDate,
           sessionType,
         });
 
-        if (!deliveryResult.success && !deliveryResult.isDuplicate) {
-          await slackWebClient.postMessage(ctx.slackUserId, `Sorry, there was an error generating your attendance file: ${deliveryResult.error}`);
+        if (!deliveryResult.success) {
+          await slackWebClient.postMessage(ctx.slackUserId, deliveryResult.saved ? deliveryResult.error : `Sorry, there was an error generating your attendance file: ${deliveryResult.error}`);
         }
       } finally {
         await AttendanceConversationService.clearSessionState(ctx.userId);

@@ -28,8 +28,15 @@
  */
 
 const { DRIVERS, DEFAULT_DRIVER, driverForIdentifier } = require('./channel-registry');
-const { resolveChannelDriver, resolveActiveChannels } = require('../../config/feature-availability');
+const {
+  resolveChannelDriver, resolveActiveChannels, isChannelSwitchedOff, ADDITIVE_CHANNEL_REQUIRED_VARS,
+} = require('../../config/feature-availability');
 const { logToFile } = require('../../utils/logger');
+const ModelBudget = require('../limits/model-budget');
+
+async function mutedSend() {
+  return false;
+}
 
 const rawDriver = (process.env.CHANNEL_DRIVER || '').trim().toLowerCase();
 const whatsappDriverName = resolveChannelDriver(process.env);
@@ -48,6 +55,10 @@ const additiveDrivers = {};
 for (const name of activeChannelNames) {
   additiveDrivers[name] = require(DRIVERS[name]);
 }
+// Channels the operator switched off: not loaded, but their identifiers are
+// still recognised so a send to one fails instead of reaching WhatsApp.
+const pausedChannelNames = Object.keys(ADDITIVE_CHANNEL_REQUIRED_VARS)
+  .filter((name) => isChannelSwitchedOff(name, process.env));
 
 /**
  * The export IS the WhatsApp-family driver object itself (via a Proxy), not
@@ -72,15 +83,29 @@ for (const name of activeChannelNames) {
 module.exports = new Proxy(whatsappDriver, {
   get(target, prop, receiver) {
     const original = Reflect.get(target, prop, receiver);
-    if (typeof original !== 'function' || Object.keys(additiveDrivers).length === 0) {
+    // The model budget ran out while handling this message: its remaining
+    // sends (the handler's own apology) are dropped, and the inbound path
+    // says "busy" once instead (limits/model-budget.js). Only inside such a
+    // message; everywhere else this is one cheap check.
+    if (typeof original === 'function' && typeof prop === 'string' && prop.startsWith('send') && ModelBudget.isMuted()) {
+      return mutedSend;
+    }
+    if (typeof original !== 'function' || (Object.keys(additiveDrivers).length === 0 && pausedChannelNames.length === 0)) {
       return original;
     }
     return function routed(to, ...args) {
       const driverName = driverForIdentifier(to);
       if (!driverName) return original.apply(this === receiver ? target : this, [to, ...args]);
 
+      // A prefixed identifier never falls through to WhatsApp, even when its
+      // channel is not running: a queued report for a Matrix teacher whose
+      // channel is switched off must fail loudly, not go to a phone number
+      // "matrix:@...".
       const driver = additiveDrivers[driverName];
-      if (!driver || typeof driver[prop] !== 'function') {
+      if (!driver) {
+        throw new Error(`Channel "${driverName}" is not running (switched off or not configured) (identifier: ${to})`);
+      }
+      if (typeof driver[prop] !== 'function') {
         throw new Error(`Channel driver "${driverName}" has no method "${String(prop)}" (identifier: ${to})`);
       }
       return driver[prop](to, ...args);

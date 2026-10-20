@@ -4,6 +4,8 @@
  * aws-sdk is virtually mocked (bot-only dep, not installed at root test time).
  */
 
+const { mockBotDependency } = require('../_helpers/mock-bot-dependency');
+
 let sendMessageMock;
 const MAIN = 'https://sqs/main';
 const QUIZ = 'https://sqs/quiz';
@@ -11,12 +13,12 @@ const QUIZ = 'https://sqs/quiz';
 function load() {
   jest.resetModules();
   sendMessageMock = jest.fn(() => ({ promise: () => Promise.resolve({ MessageId: 'm1' }) }));
-  jest.doMock('aws-sdk', () => ({
+  mockBotDependency('aws-sdk', () => ({
     config: { update: jest.fn() },
     SQS: jest.fn(() => ({ sendMessage: sendMessageMock })),
-  }), { virtual: true });
+  }));
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
-  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({}), { virtual: true });
+  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({}));
   jest.doMock('../../bot/shared/utils/structured-logger', () => ({ getCurrentCorrelationId: () => 'c1', logEvent: jest.fn() }));
 
   process.env.SQS_QUEUE_URL = MAIN;
@@ -57,9 +59,9 @@ describe('queueJob routing', () => {
     delete process.env.SQS_QUIZ_QUEUE_URL; // ensure unset post-require too
     // re-require with quiz url unset
     jest.resetModules();
-    jest.doMock('aws-sdk', () => ({ config: { update: jest.fn() }, SQS: jest.fn(() => ({ sendMessage: sendMessageMock })) }), { virtual: true });
+    mockBotDependency('aws-sdk', () => ({ config: { update: jest.fn() }, SQS: jest.fn(() => ({ sendMessage: sendMessageMock })) }));
     jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
-    jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({}), { virtual: true });
+    jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({}));
     jest.doMock('../../bot/shared/utils/structured-logger', () => ({ getCurrentCorrelationId: () => 'c1', logEvent: jest.fn() }));
     process.env.SQS_QUEUE_URL = MAIN;
     const q2 = require('../../bot/shared/services/queue/sqs-queue.service');

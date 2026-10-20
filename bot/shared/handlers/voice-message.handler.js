@@ -1,6 +1,8 @@
 const path = require('path');
 const fs = require('fs');
 const WhatsAppService = require('../services/whatsapp.service');
+const DailyCaps = require('../services/limits/daily-caps');
+const LessonPlanAvailability = require('../services/lesson-plan-availability');
 const OpenAIService = require('../services/openai.service');
 const AudioService = require('../services/audio.service');
 const ContentService = require('../services/content.service');
@@ -11,6 +13,8 @@ const VideoOrchestrator = require('../services/video/video-orchestrator.service'
 const LessonPlanQueueService = require('../services/lesson-plan-queue.service');
 const AttendanceConversationService = require('../services/attendance-conversation.service');
 const { logToFile } = require('../utils/logger');
+const { redactUrl } = require('../utils/redact-url');
+const { privateTempPath, removePrivateTemp } = require('../utils/private-temp');
 const { TEMP_DIR, LOADING_STICKER_PATH, LOADING_STICKER_MEDIA_ID } = require('../utils/constants');
 const {
   getOrCreateUser,
@@ -56,6 +60,28 @@ async function handleVoiceMessage(message, from, user = null) {
         logToFile('✅ Session retrieved/created', { sessionId });
       } catch (error) {
         logToFile('⚠️ Error with session management', { error: error.message });
+      }
+    }
+
+    // ============================================================
+    // OBSERVE: a coach's recording is an observation (or a debrief), never
+    // the coach's own self-coaching — the router decides, from the observe
+    // state and the real duration. Off unless OBSERVE_ENABLED=true.
+    // ============================================================
+    if (user) {
+      const { routeLeaderAudio } = require('../services/observe/observe-audio-router');
+      const handled = await routeLeaderAudio({
+        user,
+        from,
+        audioId,
+        sessionId,
+        durationSeconds: message.audio?.duration || message.voice?.duration || null,
+        sha256: message.audio?.sha256 || message.voice?.sha256 || null,
+        mimeType: message.audio?.mime_type || message.voice?.mime_type || null,
+      });
+      if (handled) {
+        typingController.stop();
+        return;
       }
     }
 
@@ -127,25 +153,27 @@ async function handleVoiceMessage(message, from, user = null) {
           // Download the audio
           const audioBuffer = await WhatsAppService.downloadMedia(audioId);
 
-          // Save to temp file for processing
-          const tempAudioPath = path.join(TEMP_DIR, `attendance_${user.id}_${Date.now()}.ogg`);
-          fs.writeFileSync(tempAudioPath, audioBuffer);
-
-          // Convert to WAV for Soniox (16kHz mono)
-          const wavPath = path.join(TEMP_DIR, `attendance_${user.id}_${Date.now()}.wav`);
-          await AudioService.convertToWav(audioBuffer, wavPath);
-
-          logToFile('Attendance audio saved', { tempAudioPath, wavPath });
-
-          // Process voice attendance using the conversation service
-          const result = await AttendanceConversationService.handleVoiceInput(user.id, wavPath);
-
-          // Cleanup temp files
+          // Save to temp file for processing. A private directory per note: a
+          // path from the user id and the clock is shared by two notes from the
+          // same teacher in one millisecond. The WAV goes in the same directory
+          // so one removal cleans up both.
+          const temp = privateTempPath(TEMP_DIR, 'attendance.ogg', 'attendance-');
+          const tempAudioPath = temp.filePath;
+          const wavPath = path.join(temp.dir, 'attendance.wav');
+          let result;
           try {
-            if (fs.existsSync(tempAudioPath)) fs.unlinkSync(tempAudioPath);
-            if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
-          } catch (cleanupError) {
-            logToFile('⚠️ Temp file cleanup failed', { error: cleanupError.message });
+            fs.writeFileSync(tempAudioPath, audioBuffer);
+
+            // Convert to WAV for Soniox (16kHz mono)
+            await AudioService.convertToWav(audioBuffer, wavPath);
+
+            logToFile('Attendance audio saved', { tempAudioPath, wavPath });
+
+            // Process voice attendance using the conversation service
+            result = await AttendanceConversationService.handleVoiceInput(user.id, wavPath);
+          } finally {
+            // Cleanup temp files
+            removePrivateTemp(temp);
           }
 
           // Stop typing indicator
@@ -200,41 +228,50 @@ async function handleVoiceMessage(message, from, user = null) {
           // Download audio
           const audioBuffer = await WhatsAppService.downloadMedia(audioId);
 
-          // Save to temp file for transcription
-          const audioPath = path.join(TEMP_DIR, `comprehension_${Date.now()}.ogg`);
-          fs.writeFileSync(audioPath, audioBuffer);
+          // Save to temp file for transcription — in a private directory: a
+          // clock-named file is shared by two answers in the same millisecond,
+          // and one learner's answer would be scored as the other's. The try
+          // opens at once: a child's recording must not outlive an error in the
+          // lookups below.
+          const comprehensionTemp = privateTempPath(TEMP_DIR, 'comprehension.ogg', 'comprehension-');
+          const audioPath = comprehensionTemp.filePath;
+          let ComprehensionService, questions, currentQuestionIndex, questionData, assessmentId, language;
+          let answerEvaluation;
+          try {
+            fs.writeFileSync(audioPath, audioBuffer);
 
-          logToFile('Audio saved for comprehension answer', { audioPath });
+            logToFile('Audio saved for comprehension answer', { audioPath });
 
-          // Stop typing indicator
-          typingController.stop();
+            // Stop typing indicator
+            typingController.stop();
 
-          // Import ComprehensionService
-          const ComprehensionService = require('../services/reading/comprehension.service');
+            // Import ComprehensionService
+            ComprehensionService = require('../services/reading/comprehension.service');
 
-          // Get question data from Redis flow state
-          const questions = activeFlow.questions;
-          const currentQuestionIndex = activeFlow.current_question_index;
-          const questionData = questions[currentQuestionIndex];
-          const assessmentId = activeFlow.assessment_id;
+            // Get question data from Redis flow state
+            questions = activeFlow.questions;
+            currentQuestionIndex = activeFlow.current_question_index;
+            questionData = questions[currentQuestionIndex];
+            assessmentId = activeFlow.assessment_id;
 
-          // Get language from assessment record
-          const { data: assessment } = await supabase
-            .from('reading_assessments')
-            .select('language')
-            .eq('id', assessmentId)
-            .single();
-          const language = assessment?.language || 'en';
+            // Get language from assessment record
+            const { data: assessment } = await supabase
+              .from('reading_assessments')
+              .select('language')
+              .eq('id', assessmentId)
+              .single();
+            language = assessment?.language || 'en';
 
-          // Evaluate answer
-          const answerEvaluation = await ComprehensionService.evaluateAnswer(
-            questionData,
-            audioPath,
-            language
-          );
-
-          // Clean up temp file
-          fs.unlinkSync(audioPath);
+            // Evaluate answer
+            answerEvaluation = await ComprehensionService.evaluateAnswer(
+              questionData,
+              audioPath,
+              language
+            );
+          } finally {
+            // Clean up temp file
+            removePrivateTemp(comprehensionTemp);
+          }
 
           logToFile('Comprehension answer evaluated', {
             questionId: questionData.id,
@@ -444,7 +481,7 @@ async function handleVoiceMessage(message, from, user = null) {
               assessmentId: activeAssessment.id,
               userId: user.id,
               status: activeAssessment.status,
-              audio_url: activeAssessment.audio_url,
+              audio_url: redactUrl(activeAssessment.audio_url),
               student_identifier: activeAssessment.student_identifier,
               created_at: activeAssessment.created_at,
               assessmentAge: Math.round(assessmentAge / 60000) + ' minutes',
@@ -510,8 +547,12 @@ async function handleVoiceMessage(message, from, user = null) {
               mimeType: audioMetadata?.mime_type
             });
 
-            // Save to temp file for upload
-            const audioPath = path.join(TEMP_DIR, `reading_${activeAssessment.id}_${Date.now()}.ogg`);
+            // Save to temp file for upload — in a private directory: a path from
+            // the assessment id and the clock is shared by two recordings for the
+            // same assessment in one millisecond (a resend), and the upload would
+            // carry the other recording.
+            const readingTemp = privateTempPath(TEMP_DIR, `reading_${activeAssessment.id}.ogg`, 'reading-');
+            const audioPath = readingTemp.filePath;
             fs.writeFileSync(audioPath, audioBuffer);
 
             logToFile('✓ Audio saved to temp file', {
@@ -536,14 +577,17 @@ async function handleVoiceMessage(message, from, user = null) {
             // for a real deployment with workers on other hosts.
             let audioUrl;
             if (isR2Configured()) {
-              audioUrl = await uploadAudio(audioPath, user.id, audioId);
-              logToFile('✓ Audio uploaded to R2', { assessmentId: activeAssessment.id, audioUrl });
-              fs.unlinkSync(audioPath);
+              try {
+                audioUrl = await uploadAudio(audioPath, user.id, audioId);
+                logToFile('✓ Audio uploaded to R2', { assessmentId: activeAssessment.id, audioUrl: redactUrl(audioUrl) });
+              } finally {
+                removePrivateTemp(readingTemp);
+              }
               logToFile('✓ Temp file cleaned up', { assessmentId: activeAssessment.id });
             } else {
               audioUrl = `file://${audioPath}`;
               logToFile('✓ Audio kept on local disk (no object storage configured)', {
-                assessmentId: activeAssessment.id, audioUrl,
+                assessmentId: activeAssessment.id, audioUrl: redactUrl(audioUrl),
               });
               // Deliberately NOT deleted — the analysis step reads it back.
             }
@@ -559,7 +603,7 @@ async function handleVoiceMessage(message, from, user = null) {
               assessmentId: activeAssessment.id,
               userId: user.id,
               sessionId,
-              audioUrl,
+              audioUrl: redactUrl(audioUrl),
               duration: audioDuration
             });
 
@@ -670,15 +714,25 @@ async function handleVoiceMessage(message, from, user = null) {
           // Download audio as buffer (same pattern as line 181 below)
           const audioBuffer = await WhatsAppService.downloadMedia(audioId);
 
-          // Save to temp file for transcription
-          const audioPath = path.join(TEMP_DIR, `audio_${Date.now()}.ogg`);
-          fs.writeFileSync(audioPath, audioBuffer);
+          // Save to temp file for transcription — in a private directory: a
+          // clock-named file is shared by two teachers' replies in the same
+          // millisecond, and one would be transcribed with the other's words.
+          const replyTemp = privateTempPath(TEMP_DIR, 'audio.ogg', 'voice-');
+          const audioPath = replyTemp.filePath;
+          let transcriptionResult;
+          let coachingUserLanguage;
+          try {
+            fs.writeFileSync(audioPath, audioBuffer);
 
-          // Get user's language preference for ASR routing
-          const coachingUserLanguage = await getUserLanguage(user.id);
+            // Get user's language preference for ASR routing
+            coachingUserLanguage = await getUserLanguage(user.id);
 
-          // Transcribe audio with language-aware routing
-          const transcriptionResult = await AudioService.transcribeWithLanguagePreference(audioPath, coachingUserLanguage);
+            // Transcribe audio with language-aware routing
+            transcriptionResult = await AudioService.transcribeWithLanguagePreference(audioPath, coachingUserLanguage);
+          } finally {
+            // Clean up audio file
+            removePrivateTemp(replyTemp);
+          }
           const transcript = transcriptionResult.text;
           const detectedLanguage = transcriptionResult.language;
 
@@ -688,9 +742,6 @@ async function handleVoiceMessage(message, from, user = null) {
             asrEngine: transcriptionResult.engine,
             userLanguage: coachingUserLanguage
           });
-
-          // Clean up audio file
-          fs.unlinkSync(audioPath);
 
           // Stop typing indicator
           typingController.stop();
@@ -715,9 +766,14 @@ async function handleVoiceMessage(message, from, user = null) {
     }
 
     // CLASSROOM COACHING DETECTION: Check audio duration before processing
+    let prefetchedAudio = null;
     try {
       const audioMetadata = await WhatsAppService.getMediaInfo(audioId);
-      const audioDuration = audioMetadata?.audio?.duration || audioMetadata?.voice?.duration || 0;
+      // Channels that report no duration (Matrix, Slack, Discord): the audio is measured, and kept for Step 1.
+      const { resolveAudioDurationSeconds } = require('../config/coaching-audio');
+      const measured = await resolveAudioDurationSeconds(audioId, audioMetadata);
+      prefetchedAudio = measured.buffer;
+      const audioDuration = measured.seconds;
       const audioDurationRounded = Math.round(audioDuration); // Round to integer for database
       const audioFormat = message.audio ? 'audio' : 'voice'; // 'audio' = document, 'voice' = voice message
 
@@ -729,7 +785,8 @@ async function handleVoiceMessage(message, from, user = null) {
       });
 
       // Check if audio is 15+ minutes (900 seconds) = classroom audio
-      const CLASSROOM_AUDIO_THRESHOLD = 900; // 15 minutes in seconds
+      // COACHING_MIN_AUDIO_SECONDS, default 900 (15 minutes)
+      const CLASSROOM_AUDIO_THRESHOLD = require('../config/coaching-audio').classroomAudioThresholdSeconds();
 
       if (audioDurationRounded >= CLASSROOM_AUDIO_THRESHOLD) {
         logToFile('🎓 CLASSROOM AUDIO DETECTED (15+ minutes)', {
@@ -783,41 +840,50 @@ async function handleVoiceMessage(message, from, user = null) {
 
     // Step 1: Download audio from WhatsApp (normal voice message flow)
     logToFile('Step 1: Downloading audio from WhatsApp...');
-    const audioBuffer = await WhatsAppService.downloadMedia(audioId);
+    const audioBuffer = prefetchedAudio || await WhatsAppService.downloadMedia(audioId);
     logToFile('Audio downloaded', { bufferSize: audioBuffer.length });
 
     // Step 2: Upload audio to R2 storage
     logToFile('Step 2: Uploading audio to R2 storage...');
     let audioUrl = null;
-    const oggPath = path.join(TEMP_DIR, `audio_${Date.now()}.ogg`);
-    fs.writeFileSync(oggPath, audioBuffer);
+    // One private directory per voice note for the OGG and the WAV made from
+    // it. Clock-named files (`audio_${Date.now()}.ogg`) are shared by two
+    // notes that arrive in the same millisecond: the second write overwrites
+    // the first, and the first teacher is answered with the second teacher's
+    // words — or finds the file already deleted.
+    const noteTemp = privateTempPath(TEMP_DIR, 'audio.ogg', 'voice-');
+    const oggPath = noteTemp.filePath;
+    const wavPath = path.join(noteTemp.dir, 'audio.wav');
+    let transcriptionResult;
+    let userPreferredLanguage;
     try {
-      audioUrl = await uploadAudio(oggPath, from, message.id);
-      logToFile('✅ Audio uploaded to R2', { audioUrl });
-    } catch (error) {
-      logToFile('⚠️ Failed to upload audio to R2', { error: error.message });
+      fs.writeFileSync(oggPath, audioBuffer);
+      try {
+        audioUrl = await uploadAudio(oggPath, from, message.id);
+        logToFile('✅ Audio uploaded to R2', { audioUrl: redactUrl(audioUrl) });
+      } catch (error) {
+        logToFile('⚠️ Failed to upload audio to R2', { error: error.message });
+      }
+
+      // Step 3: Convert to WAV for Soniox
+      logToFile('Step 3: Converting audio to WAV...');
+      await AudioService.convertToWav(audioBuffer, wavPath);
+      logToFile('Audio converted to WAV', { wavPath });
+
+      // Step 4: Transcribe using language-aware ASR routing
+      // Routes to Soniox (7 languages) or MMS-ASR (bal-PK, sd-PK, ps-PK)
+      userPreferredLanguage = user ? await getUserLanguage(user.id) : 'en';
+
+      logToFile('Step 4: Transcribing audio with ASR routing...', {
+        userPreferredLanguage,
+        asrEngine: AudioService.getASREngine(userPreferredLanguage)
+      });
+
+      transcriptionResult = await AudioService.transcribeWithLanguagePreference(wavPath, userPreferredLanguage);
+    } finally {
+      // Clean up the OGG and WAV files
+      removePrivateTemp(noteTemp);
     }
-    // Clean up OGG file
-    if (fs.existsSync(oggPath)) {
-      fs.unlinkSync(oggPath);
-    }
-
-    // Step 3: Convert to WAV for Soniox
-    logToFile('Step 3: Converting audio to WAV...');
-    const wavPath = path.join(TEMP_DIR, `audio_${Date.now()}.wav`);
-    await AudioService.convertToWav(audioBuffer, wavPath);
-    logToFile('Audio converted to WAV', { wavPath });
-
-    // Step 4: Transcribe using language-aware ASR routing
-    // Routes to Soniox (7 languages) or MMS-ASR (bal-PK, sd-PK, ps-PK)
-    const userPreferredLanguage = user ? await getUserLanguage(user.id) : 'en';
-
-    logToFile('Step 4: Transcribing audio with ASR routing...', {
-      userPreferredLanguage,
-      asrEngine: AudioService.getASREngine(userPreferredLanguage)
-    });
-
-    const transcriptionResult = await AudioService.transcribeWithLanguagePreference(wavPath, userPreferredLanguage);
     const transcription = transcriptionResult.text;
     const sonioxLanguage = transcriptionResult.language;
 
@@ -839,9 +905,6 @@ async function handleVoiceMessage(message, from, user = null) {
       sonioxLanguage,
       confirmedLanguage: detectedLanguage
     });
-
-    // Clean up WAV file
-    fs.unlinkSync(wavPath);
 
     if (!transcription || transcription.trim() === '') {
       logToFile('⚠️ Empty transcription - sending error message to user');
@@ -1043,6 +1106,15 @@ async function handleVoiceMessage(message, from, user = null) {
       }
     }
 
+    // A lesson plan or presentation this deployment cannot make (no
+    // GAMMA_API_KEY): say so, instead of a spoken "I'm preparing it…", a
+    // loading sticker and a job that can only fail (lesson-plan-availability.js).
+    if ((intent.type === 'lesson_plan' || intent.type === 'presentation')
+      && await LessonPlanAvailability.explainIfUnavailable(from, { user, language: detectedLanguage })) {
+      typingController.stop();
+      return;
+    }
+
     // Step 6: Get AI response with format-aware prompting (voice format, detected language)
     logToFile('Step 6: Getting AI response (format-aware for voice)...');
 
@@ -1197,6 +1269,8 @@ async function handleVoiceMessage(message, from, user = null) {
  */
 async function handleVoiceLessonPlanRequest(from, transcription, user, sessionId, detectedLanguage) {
   logToFile('Queueing lesson plan from voice request...');
+  // Today's lesson-plan allowance for an unregistered account (limits/daily-caps.js).
+  if (!(await DailyCaps.allowOrExplain(user, 'lesson_plan', from))) return;
   try {
     // Extract topic
     const topic = await OpenAIService.extractTopic(transcription);
@@ -1257,6 +1331,8 @@ async function handleVoiceLessonPlanRequest(from, transcription, user, sessionId
  */
 async function handleVoicePresentationRequest(from, transcription, user, sessionId, detectedLanguage) {
   logToFile('Queueing presentation from voice request...');
+  // Today's lesson-plan allowance for an unregistered account (limits/daily-caps.js).
+  if (!(await DailyCaps.allowOrExplain(user, 'lesson_plan', from))) return;
   try {
     // Extract topic
     const topic = await OpenAIService.extractTopic(transcription);

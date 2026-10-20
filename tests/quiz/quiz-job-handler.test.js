@@ -35,11 +35,11 @@ function load() {
 
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
   jest.doMock('../../bot/shared/utils/structured-logger', () => ({ logEvent: jest.fn() }));
-  jest.doMock('../../bot/shared/config/supabase', () => makeSupabase(), { virtual: true });
+  jest.doMock('../../bot/shared/config/supabase', () => makeSupabase());
   jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => redis);
   jest.doMock('../../bot/shared/services/queue/sqs-queue.service', () => sqsQueue);
-  jest.doMock('../../bot/shared/services/quiz/quiz-report.service', () => quizReport, { virtual: true });
-  jest.doMock('../../bot/shared/services/whatsapp.service', () => whatsapp, { virtual: true });
+  jest.doMock('../../bot/shared/services/quiz/quiz-report.service', () => quizReport);
+  jest.doMock('../../bot/shared/services/whatsapp.service', () => whatsapp);
   handler = require('../../bot/workers/quiz-job-handler');
   return handler;
 }

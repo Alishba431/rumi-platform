@@ -1,0 +1,196 @@
+apply plugin: 'com.android.application'
+
+// App identity and host, from the environment first, then portal/.env.app, then
+// a neutral default. capacitor.config.ts reads the same keys in the same order
+// (src/lib/app-config.cjs), so the package id, label and App Links host here
+// cannot disagree with what Capacitor was told. Every Android CI workflow
+// writes .env.app before Gradle runs.
+def envApp = [:]
+def envAppFile = rootProject.file('../.env.app')
+if (envAppFile.exists()) {
+    envAppFile.eachLine { line ->
+        def m = (line =~ '^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.*?)\\s*$')
+        if (m.find()) {
+            // Same as Vite's dotenv and app-config.cjs: a quoted value is taken
+            // whole, an unquoted one ends at '#' (an inline comment).
+            def quoted = (m.group(2) =~ /^(['"])(.*)\1\s*(?:#.*)?$/)
+            envApp[m.group(1)] = quoted.find() ? quoted.group(2) : m.group(2).replaceAll('#.*$', '').trim()
+        }
+    }
+}
+def appSetting = { String key, String fallback ->
+    def fromEnv = System.getenv(key)?.trim()
+    if (fromEnv) return fromEnv
+    def fromFile = envApp[key]
+    return fromFile ? fromFile : fallback
+}
+
+def portalAppId = appSetting('PORTAL_APP_ID', 'org.example.rumi.portal')
+def portalAppName = appSetting('PORTAL_APP_NAME', 'Rumi Portal')
+def portalVersionCode = appSetting('PORTAL_APP_VERSION_CODE', '1') as int
+def portalVersionName = appSetting('PORTAL_APP_VERSION_NAME', "${portalVersionCode}")
+def portalApiBaseUrl = appSetting('VITE_API_BASE_URL', null)
+// A store identifies an app by package id permanently. Publishing the example
+// id would tie an adopter to a placeholder forever, so release builds refuse it.
+def isPlaceholderAppId = portalAppId.startsWith('org.example.')
+
+// Release signing, from the environment or a gitignored keystore.properties —
+// NEVER committed. See keystore.properties.template.
+//
+// If you publish through Google Play with Play App Signing, this is the UPLOAD
+// key: Play re-signs the app with the app-signing key it holds. Anything that
+// pins a certificate (App Links assetlinks.json) must then list the
+// APP-SIGNING fingerprint too, not only this one.
+def keystoreProps = new Properties()
+def keystorePropsFile = rootProject.file('keystore.properties')
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+def signingSetting = { String key -> System.getenv(key) ?: keystoreProps.getProperty(key) }
+def portalKeystore = signingSetting('PORTAL_KEYSTORE_PATH')
+def portalStorePass = signingSetting('PORTAL_KEYSTORE_PASSWORD')
+def portalKeyAlias = signingSetting('PORTAL_KEY_ALIAS')
+def portalKeyPass = signingSetting('PORTAL_KEY_PASSWORD')
+def hasPortalSigning = portalKeystore && portalStorePass && portalKeyAlias && portalKeyPass
+
+// Android App Links: the host the manifest's VIEW intent filter claims.
+//
+// Derived from VITE_API_BASE_URL — the one configured host the app bundle, OTA
+// and allowNavigation already use — so a staging build claims the staging
+// portal, a release build claims production, and the claim cannot drift from
+// the host the app actually talks to.
+def deepLinkHost = null
+try {
+    def apiUri = portalApiBaseUrl ? new URI(portalApiBaseUrl) : null
+    if (apiUri?.scheme == 'https' && apiUri.host) {
+        deepLinkHost = apiUri.host
+    }
+} catch (URISyntaxException ignored) {
+    // Left null; preBuild below fails the build with the reason.
+}
+
+android {
+    // The Java package of MainActivity. Independent of applicationId, so an
+    // adopter changes PORTAL_APP_ID without moving any source.
+    namespace = "org.example.rumi.portal"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId portalAppId
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode portalVersionCode
+        versionName portalVersionName
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        resValue "string", "app_name", portalAppName
+        // deepLinkHost is shared by every build type (they merge with this map);
+        // the placeholder value is never shipped, preBuild refuses to build it.
+        manifestPlaceholders = [appLabel: portalAppName, deepLinkHost: deepLinkHost ?: "unset.invalid"]
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    signingConfigs {
+        if (hasPortalSigning) {
+            release {
+                storeFile file(portalKeystore)
+                storePassword portalStorePass
+                keyAlias portalKeyAlias
+                keyPassword portalKeyPass
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            // Debug builds install as `<id>.debug` so they sit alongside the
+            // released app instead of colliding with it. Without this,
+            // installing a debug build over a release one fails with
+            // INSTALL_FAILED_UPDATE_INCOMPATIBLE (different signing key), and
+            // the only way through is uninstalling the real app.
+            applicationIdSuffix ".debug"
+            // Distinct launcher label so the two apps are told apart on the
+            // home screen.
+            manifestPlaceholders = [appLabel: "${portalAppName} Debug"]
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // NO applicationIdSuffix here — release is exactly PORTAL_APP_ID,
+            // the id a store uses to identify the app.
+            if (hasPortalSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+}
+
+// Name the artifacts after the app and version, so two builds are
+// distinguishable the moment they leave the build directory:
+// `portal-app-v<versionCode>-release.apk` / `.aab`.
+base {
+    archivesName = "portal-app-v${android.defaultConfig.versionCode}"
+}
+
+// No https VITE_API_BASE_URL means the App Links filter would claim a host that
+// does not exist, and the bundle would white-screen. Refuse to build rather than
+// ship that silently — the same rule the app bundle build applies
+// (src/lib/app-build-guard.cjs). Checked at build time, not configuration time,
+// so an IDE sync without .env.app works.
+tasks.named('preBuild').configure {
+    doFirst {
+        if (!deepLinkHost) {
+            throw new GradleException(
+                "No https host for Android App Links: set VITE_API_BASE_URL (environment or " +
+                "portal/.env.app) to the absolute portal API url, e.g. by building through " +
+                "`npm run android:debug`. Got: ${portalApiBaseUrl ?: '(unset)'}"
+            )
+        }
+    }
+}
+
+// Release builds must carry the adopter's own package id. Debug builds may
+// keep the placeholder, so anyone can try the app before choosing one.
+// preReleaseBuild runs before any release compile, so this fails in seconds.
+tasks.configureEach { task ->
+    if (task.name == 'preReleaseBuild') {
+        task.doFirst {
+            if (isPlaceholderAppId) {
+                throw new GradleException(
+                    "PORTAL_APP_ID is still the placeholder '${portalAppId}'. Choose your own package id " +
+                    "(e.g. org.yourschool.portal) in portal/.env.app before building a Release: a store " +
+                    "identifies the app by it permanently."
+                )
+            }
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

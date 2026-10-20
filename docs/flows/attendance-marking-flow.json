@@ -1,17 +1,17 @@
 {
-  "_comment": "WhatsApp Flow for Attendance Marking - Tap to Mark Absent Students",
+  "_comment": "WhatsApp Flow for Attendance Marking - Tap to Mark Absent and On-Leave",
   "_instructions": [
     "1. Copy this JSON to Meta Business Manager > WhatsApp Manager > Flows",
     "2. Flow ID (staging): [TO BE ASSIGNED]",
     "3. Flow ID (production): [TO BE ASSIGNED]",
     "4. IMPORTANT: Update the flow in Meta Business Manager - this file is just reference",
-    "5. Screen 1 (MARK_ABSENT): CheckboxGroup to select absent students",
+    "5. Screen 1 (MARK_ABSENT): CheckboxGroups to select absent and on-leave people",
     "6. The student list is populated dynamically by the data_api_version endpoint"
   ],
   "_notes": [
     "WhatsApp CheckboxGroup can display 40+ items",
-    "Students marked as absent - unmarked students are present",
-    "Uses init_data for dynamic student list from bot"
+    "People marked absent or on leave - unmarked people are present; someone in both is on leave",
+    "Uses init_data for dynamic roster from bot: a class's students, or a head teacher's staff"
   ],
   "version": "6.2",
   "data_api_version": "3.0",
@@ -29,7 +29,7 @@
         },
         "date_display": {
           "type": "string",
-          "__example__": "Friday, 24 January 2026"
+          "__example__": "Friday 24 January 2026"
         },
         "session_type": {
           "type": "string",
@@ -85,16 +85,29 @@
               },
               {
                 "type": "TextSubheading",
-                "text": "Select ABSENT students:"
+                "text": "Who is ABSENT?"
               },
               {
                 "type": "TextBody",
-                "text": "Students not selected will be marked PRESENT"
+                "text": "Anyone not selected below will be marked PRESENT"
               },
               {
                 "type": "CheckboxGroup",
                 "name": "absent_students",
-                "label": "Absent Students",
+                "label": "Absent",
+                "required": false,
+                "data-source": "${data.students}",
+                "min-selected-items": 0,
+                "max-selected-items": 50
+              },
+              {
+                "type": "TextSubheading",
+                "text": "Who is on approved LEAVE?"
+              },
+              {
+                "type": "CheckboxGroup",
+                "name": "leave_students",
+                "label": "On leave",
                 "required": false,
                 "data-source": "${data.students}",
                 "min-selected-items": 0,
@@ -107,6 +120,7 @@
                   "name": "complete",
                   "payload": {
                     "absent_students": "${form.absent_students}",
+                    "leave_students": "${form.leave_students}",
                     "class_name": "${data.class_name}",
                     "date_display": "${data.date_display}",
                     "session_type": "${data.session_type}"

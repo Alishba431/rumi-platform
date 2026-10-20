@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { auth, portal } from '../services/api';
 import type { User } from '../types/portal';
 
+const SESSION_NOT_KEPT =
+  "Your password was accepted, but the sign-in didn't stick on this device. Please try again, or ask your administrator to allow sign-in from the app.";
+
 export const useAuth = () => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -12,13 +15,16 @@ export const useAuth = () => {
     checkAuth();
   }, []);
 
+  // Resolves true when a session exists.
   const checkAuth = async () => {
     try {
       // Try to get dashboard data - if successful, user is authenticated
       const data = await portal.getDashboard();
       setUser(data.user);
+      return true;
     } catch (error) {
       setUser(null);
+      return false;
     } finally {
       setLoading(false);
     }
@@ -28,7 +34,9 @@ export const useAuth = () => {
     try {
       const response = await auth.login(phoneNumber, password);
       if (response.success) {
-        await checkAuth(); // Refresh user data
+        // The password can be right while the session cookie is not kept (an
+        // app on a server without PORTAL_APP_ENABLED, or a blocked cookie).
+        if (!(await checkAuth())) return { success: false, error: SESSION_NOT_KEPT };
         return { success: true };
       }
       return { success: false, error: response.error || 'Login failed' };
@@ -54,7 +62,9 @@ export const useAuth = () => {
     try {
       const response = await auth.setup(token, password);
       if (response.success) {
-        await checkAuth(); // Refresh user data
+        // The password can be right while the session cookie is not kept (an
+        // app on a server without PORTAL_APP_ENABLED, or a blocked cookie).
+        if (!(await checkAuth())) return { success: false, error: SESSION_NOT_KEPT };
         return { success: true };
       }
       return { success: false, error: response.error || 'Setup failed' };

@@ -361,3 +361,19 @@ describe('attendance-mark: the fields are the ones the real handler actually rea
     }
   });
 });
+
+describe('class-setup: the roster example a teacher copies', () => {
+  // The example is what teachers imitate, so it shows both number forms the
+  // parser accepts (international and local, leading 0), parsed for real.
+  // Both stay in the fictional 555 range.
+  it('shows an international and a local-format parent number, and both parse', () => {
+    const { textFlow } = load();
+    const step = textFlow.getDefinition('class-setup').steps.find((s) => s.id === 'student_list');
+    const example = step.prompt().body.split('For example:\n')[1];
+    const StudentListService = require('../../bot/shared/services/student-list.service');
+    const phones = StudentListService.parseStudentText(example).map((s) => s.parentPhone).filter(Boolean);
+    expect(phones).toHaveLength(2);
+    expect(phones.some((p) => p.startsWith('+1555'))).toBe(true);
+    expect(phones.some((p) => p.startsWith('0555'))).toBe(true);
+  });
+});

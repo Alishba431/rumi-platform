@@ -22,6 +22,12 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const SERVER_PATH = path.resolve(REPO_ROOT, 'bot/gateway/server.js');
 const memoryQueue = require('../../bot/shared/services/queue/memory-queue.service');
 
+// Booting the standalone server in a child process needs the bot's own
+// node_modules (pino, the queue drivers). CI runs the root suite BEFORE
+// `cd bot && npm ci`, so these skip on that first pass (same as worker-boot).
+const BOT_NODE_MODULES_PRESENT = fs.existsSync(path.resolve(__dirname, '../../bot/node_modules'));
+const itWithBotDeps = BOT_NODE_MODULES_PRESENT ? it : it.skip;
+
 const TEST_VERIFY_TOKEN = 'adversarial_verify_token_777';
 const TEST_SLACK_SECRET = 'adversarial_slack_secret_888';
 
@@ -93,7 +99,7 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
   // 1. Subprocess Boot Independence & Stripped Environment
   // =========================================================================
   describe('1. Subprocess Boot Independence (Stripped Minimal Env)', () => {
-    it('boots standalone server in child process with zero Supabase/monolith env vars', async () => {
+    itWithBotDeps('boots standalone server in child process with zero Supabase/monolith env vars', async () => {
       const testPort = 4911;
       const strippedEnv = {
         PATH: process.env.PATH,
@@ -138,7 +144,7 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
       expect(stderrOutput).not.toContain('process.exit(78)');
     }, 8000);
 
-    it('respects PORT when GATEWAY_PORT is not specified', async () => {
+    itWithBotDeps('respects PORT when GATEWAY_PORT is not specified', async () => {
       const testPort = 4912;
       const strippedEnv = {
         PATH: process.env.PATH,
@@ -173,7 +179,7 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
       expect(responded).toBe(true);
     }, 8000);
 
-    it('gives GATEWAY_PORT precedence over PORT when both are specified', async () => {
+    itWithBotDeps('gives GATEWAY_PORT precedence over PORT when both are specified', async () => {
       const gatewayPort = 4913;
       const plainPort = 4914;
       const env = {
@@ -376,10 +382,8 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
       expect(res.status).toBe(200);
       expect(res.body).toBe('EVENT_RECEIVED');
 
-      // Envelope should have fallen back safely
-      expect(memoryQueue.size('main')).toBe(1);
-      const jobs = await memoryQueue.receiveJobs();
-      expect(jobs[0].body.payload.type).toBe('unknown');
+      // Not a valid message: the gateway drops it before queueing
+      expect(memoryQueue.size('main')).toBe(0);
     });
 
     it('handles invalid raw JSON syntax with HTTP 400 Bad Request without process crash', async () => {
@@ -405,13 +409,14 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
       const locationPayload = {
         object: 'whatsapp_business_account',
         entry: [{
+          id: '1234567890',
           changes: [{
             value: {
               messaging_product: 'whatsapp',
               messages: [{
                 from: '923009998877',
                 id: 'wamid.location.001',
-                timestamp: '1720000000',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'location',
                 location: { latitude: 24.8607, longitude: 67.0011 }
               }]
@@ -437,13 +442,14 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
       const flowPayload = {
         object: 'whatsapp_business_account',
         entry: [{
+          id: '1234567890',
           changes: [{
             value: {
               messaging_product: 'whatsapp',
               messages: [{
                 from: '923009998877',
                 id: 'wamid.flow.001',
-                timestamp: '1720000000',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'interactive',
                 interactive: {
                   type: 'nfm_reply',
@@ -509,6 +515,29 @@ describe('Empirical Adversarial Challenges: Standalone Gateway & Normalization E
   // 5. Malformed Payload Handling: Slack HMAC Security & Endpoints
   // =========================================================================
   describe('5. Malformed Payload Handling: Slack HMAC Security & Endpoints', () => {
+    // Slack stays on the bot (not the standalone server), so these run against
+    // the Slack gateway router the bot mounts at /api/slack.
+    let slackServer;
+    let standaloneUrl;
+
+    beforeAll((done) => {
+      const express = require('express');
+      const { createSlackRouter } = require('../../bot/gateway/adapters/slack');
+      const slackApp = express();
+      slackApp.use('/api/slack', createSlackRouter({ dispatch: jest.fn() }));
+      slackServer = http.createServer(slackApp);
+      slackServer.listen(0, '127.0.0.1', () => {
+        standaloneUrl = serverUrl;
+        serverUrl = `http://127.0.0.1:${slackServer.address().port}`;
+        done();
+      });
+    });
+
+    afterAll((done) => {
+      serverUrl = standaloneUrl;
+      slackServer.close(done);
+    });
+
     it('returns 401 when x-slack-signature header is missing', async () => {
       const timestamp = Math.floor(Date.now() / 1000).toString();
       const res = await request('/api/slack/events', {

@@ -32,6 +32,8 @@ ALTER TABLE students ENABLE ROW LEVEL SECURITY;
 ALTER TABLE student_videos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE attendance_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE attendance_records ENABLE ROW LEVEL SECURITY;
+ALTER TABLE schools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE teacher_attendance_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE exam_check_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE exam_templates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE exam_submissions ENABLE ROW LEVEL SECURITY;
@@ -140,6 +142,10 @@ DROP POLICY IF EXISTS "service_role_attendance_sessions" ON attendance_sessions;
 CREATE POLICY "service_role_attendance_sessions" ON attendance_sessions FOR ALL USING (auth.role() = 'service_role');
 DROP POLICY IF EXISTS "service_role_attendance_records" ON attendance_records;
 CREATE POLICY "service_role_attendance_records" ON attendance_records FOR ALL USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS "service_role_schools" ON schools;
+CREATE POLICY "service_role_schools" ON schools FOR ALL USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS "service_role_teacher_attendance_records" ON teacher_attendance_records;
+CREATE POLICY "service_role_teacher_attendance_records" ON teacher_attendance_records FOR ALL USING (auth.role() = 'service_role');
 
 -- Exam Checker
 DROP POLICY IF EXISTS "service_role_exam_sessions" ON exam_check_sessions;
@@ -230,3 +236,57 @@ DROP POLICY IF EXISTS "service_role_quiz_share_codes" ON quiz_share_codes;
 CREATE POLICY "service_role_quiz_share_codes" ON quiz_share_codes FOR ALL USING (auth.role() = 'service_role');
 DROP POLICY IF EXISTS "service_role_video_quiz_deliveries" ON video_quiz_deliveries;
 CREATE POLICY "service_role_video_quiz_deliveries" ON video_quiz_deliveries FOR ALL USING (auth.role() = 'service_role');
+
+-- Test papers
+ALTER TABLE test_paper_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE test_papers ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service_role_test_paper_requests" ON test_paper_requests;
+CREATE POLICY "service_role_test_paper_requests" ON test_paper_requests FOR ALL USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS "service_role_test_papers" ON test_papers;
+CREATE POLICY "service_role_test_papers" ON test_papers FOR ALL USING (auth.role() = 'service_role');
+-- Teacher nudges (bot-only)
+ALTER TABLE teacher_nudges ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service_role_teacher_nudges" ON teacher_nudges;
+CREATE POLICY "service_role_teacher_nudges" ON teacher_nudges FOR ALL USING (auth.role() = 'service_role');
+
+-- Observe: coach roster and visit schedules — service role only (schools: above).
+ALTER TABLE leader_schools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE observation_schedules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE coach_directory ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "service_role_leader_schools" ON leader_schools;
+CREATE POLICY "service_role_leader_schools" ON leader_schools FOR ALL USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS "service_role_observation_schedules" ON observation_schedules;
+CREATE POLICY "service_role_observation_schedules" ON observation_schedules FOR ALL USING (auth.role() = 'service_role');
+DROP POLICY IF EXISTS "service_role_coach_directory" ON coach_directory;
+CREATE POLICY "service_role_coach_directory" ON coach_directory FOR ALL USING (auth.role() = 'service_role');
+
+-- =============================================================================
+-- The admin dashboard's role (portal_app_user, created in 00_complete-schema.sql)
+-- The dashboard reads and writes as portal_app_user once a dashboard user has
+-- signed in. It is not a bypass-RLS role, so on a table with RLS on and only
+-- the service_role policy it would see zero rows. One policy per RLS table lets
+-- it in, but only while the dashboard user set on the connection
+-- (set_portal_user_context) is active and has an unscoped role: super_admin,
+-- admin or viewer (portal_user_is_unscoped(), in 00). Partner roles get no
+-- rows at all, teacher data included, until policies that apply a partner's
+-- access_scopes row exist; "signed in" alone would hand a school-scoped partner
+-- every teacher and conversation. The check is wrapped in a SELECT so it runs
+-- once per query, not once per row. Runs over every RLS table so none is
+-- missed; a table that turns RLS on later needs this run again (V2.11.0 does
+-- the same). Dropping by name replaces the earlier, open policy. Safe to re-run.
+-- =============================================================================
+DO $$
+DECLARE
+  t record;
+BEGIN
+  FOR t IN
+    SELECT c.relname
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relrowsecurity
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS portal_app_user_access ON public.%I', t.relname);
+    EXECUTE format($p$CREATE POLICY portal_app_user_access ON public.%I FOR ALL TO portal_app_user
+      USING ((SELECT public.portal_user_is_unscoped()))
+      WITH CHECK ((SELECT public.portal_user_is_unscoped()))$p$, t.relname);
+  END LOOP;
+END $$;

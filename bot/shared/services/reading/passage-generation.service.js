@@ -23,11 +23,13 @@ const { getClient } = require('../llm-client');
 const supabase = require('../../config/supabase');
 const WhatsAppService = require('../whatsapp.service');
 const { logToFile } = require('../../utils/logger');
+const { redactUrl } = require('../../utils/redact-url');
 const { OPENAI_API_KEY, TEMP_DIR } = require('../../utils/constants');
 const { generateAlphabetGrid } = require('../../utils/alphabet-grid-generator');
 const { generateRandomWords, generateWordGrid } = require('../../utils/word-grid-generator');
 const https = require('https');
 const { getPresignedUrl } = require('../../storage/r2');
+const { privateTempPath, removePrivateTemp } = require('../../utils/private-temp');
 
 const openai = getClient();
 
@@ -237,7 +239,7 @@ class PassageGenerationService {
       // taking the whole passage down with it — a decorative background must
       // never be able to do that.
       if (!/^https?:\/\//i.test(String(presignedUrl || ''))) {
-        logToFile('⚠️ Skipping passage background — not an absolute URL', { url, presignedUrl });
+        logToFile('⚠️ Skipping passage background — not an absolute URL', { url: redactUrl(url), presignedUrl: redactUrl(presignedUrl) });
         return null;
       }
 
@@ -257,7 +259,7 @@ class PassageGenerationService {
                   const image = await getLoadImage()(buffer);
                   resolve(image);
                 } catch (error) {
-                  logToFile('⚠️ Failed to load background image after redirect', { url, error: error.message });
+                  logToFile('⚠️ Failed to load background image after redirect', { url: redactUrl(url), error: error.message });
                   resolve(null);
                 }
               });
@@ -274,7 +276,7 @@ class PassageGenerationService {
               const image = await getLoadImage()(buffer);
               resolve(image);
             } catch (error) {
-              logToFile('⚠️ Failed to load background image', { url, error: error.message });
+              logToFile('⚠️ Failed to load background image', { url: redactUrl(url), error: error.message });
               resolve(null);
             }
           });
@@ -282,7 +284,7 @@ class PassageGenerationService {
         }).on('error', () => resolve(null));
       });
     } catch (error) {
-      logToFile('⚠️ Failed to get presigned URL for background', { url, error: error.message });
+      logToFile('⚠️ Failed to get presigned URL for background', { url: redactUrl(url), error: error.message });
       return null;
     }
   }
@@ -305,6 +307,7 @@ class PassageGenerationService {
     passageConfig,
     userLanguage = 'en'
   ) {
+    let tempImage = null;
     try {
       logToFile('📝 Starting passage generation', {
         assessmentId,
@@ -395,8 +398,12 @@ class PassageGenerationService {
         );
       }
 
-      // Step 3b: Save image to temp file (needed for WhatsApp upload)
-      const tempImagePath = path.join(TEMP_DIR, `passage_${assessmentId}.png`);
+      // Step 3b: Save image to temp file (needed for WhatsApp upload), in a
+      // directory of this call's own: two generations for one assessment (a
+      // repeated request) shared `passage_<id>.png`, so one could be sent the
+      // other's image or lose its file to the other's cleanup.
+      tempImage = privateTempPath(TEMP_DIR, `passage_${assessmentId}.png`, 'passage-');
+      const tempImagePath = tempImage.filePath;
       fs.writeFileSync(tempImagePath, imageBuffer);
       logToFile('📁 Passage image saved to temp file', { tempImagePath });
 
@@ -433,7 +440,7 @@ class PassageGenerationService {
 
       logToFile('✅ Passage saved to database', {
         assessmentId,
-        imageUrl,
+        imageUrl: redactUrl(imageUrl),
         hasTitle: passageTitle !== null,
         title: passageTitle
       });
@@ -442,15 +449,8 @@ class PassageGenerationService {
       await WhatsAppService.sendImage(phoneNumber, tempImagePath);
 
       // Step 6b: Clean up temp file
-      try {
-        fs.unlinkSync(tempImagePath);
-        logToFile('🗑️ Temp passage image deleted', { tempImagePath });
-      } catch (cleanupError) {
-        logToFile('⚠️ Could not delete temp file', {
-          path: tempImagePath,
-          error: cleanupError.message
-        });
-      }
+      removePrivateTemp(tempImage);
+      logToFile('🗑️ Temp passage image deleted', { tempImagePath });
 
       // Step 7: Send instructions in user's language
       // Add language-specific reading direction for letters type
@@ -543,6 +543,10 @@ class PassageGenerationService {
       );
 
       throw error;
+    } finally {
+      // A database or send error after the write must not leave the image
+      // behind (Step 6b removes it early on success; this is a no-op then).
+      removePrivateTemp(tempImage);
     }
   }
 
@@ -965,7 +969,7 @@ IMPORTANT: Return ONLY valid JSON in this exact format (no markdown, no code blo
             ctx.fillRect(0, 0, CANVAS_WIDTH, canvasHeight);
 
             usedBackground = true;
-            logToFile('✅ Applied background image with overlay', { type, url: backgroundUrl });
+            logToFile('✅ Applied background image with overlay', { type, url: redactUrl(backgroundUrl) });
           }
         }
       }
@@ -1192,7 +1196,7 @@ IMPORTANT: Return ONLY valid JSON in this exact format (no markdown, no code blo
 
       const publicUrl = `${process.env.R2_ENDPOINT}/${BUCKET_NAME}/${key}`;
 
-      logToFile('✅ Passage image uploaded to R2', { key, url: publicUrl });
+      logToFile('✅ Passage image uploaded to R2', { key, url: redactUrl(publicUrl) });
 
       return publicUrl;
 

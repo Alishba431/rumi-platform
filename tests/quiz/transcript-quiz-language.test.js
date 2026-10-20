@@ -1,0 +1,201 @@
+'use strict';
+/**
+ * The quiz language is decided by the SUBJECT in code, never by the prompt:
+ * subjects a deployment fixes are quizzed in their language, a language lesson
+ * in that language, and everything else follows the lesson. The table below is
+ * a two-language deployment (QUIZ_LANGUAGES=ur,en) that fixes three subjects to
+ * Urdu (QUIZ_SUBJECT_LANGUAGE).
+ */
+const L = require('../../bot/shared/services/quiz/transcript-quiz-language');
+
+describe('quizLanguageFor(subject, transcriptLanguage)', () => {
+  const saved = {};
+  beforeAll(() => {
+    for (const k of ['QUIZ_LANGUAGES', 'QUIZ_SUBJECT_LANGUAGE']) saved[k] = process.env[k];
+    process.env.QUIZ_LANGUAGES = 'ur,en';
+    process.env.QUIZ_SUBJECT_LANGUAGE = 'islamiat:ur,sst:ur,genk:ur';
+  });
+  afterAll(() => {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  });
+  test.each([
+    ['islamiat', 'en', 'ur'],
+    ['Islamiyat', 'en', 'ur'],
+    ['urdu', 'en', 'ur'],
+    ['اردو', 'en', 'ur'],
+    ['sst', 'en', 'ur'],
+    ['Social Studies', 'en', 'ur'],
+    ['genk', 'en', 'ur'],
+    ['General Knowledge', 'en', 'ur'],
+    ['english', 'ur', 'en'],
+    ['English', 'urdu', 'en'],
+    ['maths', 'ur', 'ur'],
+    ['Mathematics', 'urdu', 'ur'],
+    ['science', 'en', 'en'],
+    ['science', 'english', 'en'],
+    ['maths', 'mixed', 'ur'],
+    ['other', null, 'ur'],
+  ])('%s + %s → %s', (subject, tl, want) => {
+    expect(L.quizLanguageFor(subject, tl)).toBe(want);
+  });
+});
+
+describe('canonicalSubject', () => {
+  test.each([
+    ['Islamiyat', 'islamiat'], ['islamic studies', 'islamiat'], ['اسلامیات', 'islamiat'],
+    ['Math', 'maths'], ['ریاضی', 'maths'], ['General Science', 'science'], ['سائنس', 'science'],
+    ['Social Study', 'sst'], ['معاشرتی علوم', 'sst'], ['GK', 'genk'], ['English Language', 'english'],
+    ['Urdu', 'urdu'], ['Art', 'other'], [null, 'other'],
+  ])('%s → %s', (s, want) => expect(L.canonicalSubject(s)).toBe(want));
+});
+
+describe('teacherLanguageFor — teacher-facing copy', () => {
+  test('the stored preference wins', () => {
+    expect(L.teacherLanguageFor({ preferredLanguage: 'en', transcriptLanguage: 'ur' })).toBe('en');
+    expect(L.teacherLanguageFor({ preferredLanguage: 'ur', transcriptLanguage: 'en' })).toBe('ur');
+  });
+
+  test('nothing detected or transcribed may answer for them', () => {
+    // The clamp's floor is the ONE answer to "nothing is known" across this
+    // deployment. Falling back to the transcript meant the same teacher was
+    // addressed differently depending on the lesson they had just recorded.
+    expect(L.teacherLanguageFor({ preferredLanguage: null, transcriptLanguage: 'ur' })).toBe('en');
+    expect(L.teacherLanguageFor({ preferredLanguage: null, transcriptLanguage: 'mixed' })).toBe('en');
+    expect(L.teacherLanguageFor({})).toBe('en');
+  });
+
+  test('an off-offer preference (pa-PK) is clamped, not stored-through', () => {
+    expect(L.teacherLanguageFor({ preferredLanguage: 'pa-PK', transcriptLanguage: 'ur' })).toBe('en');
+  });
+});
+
+describe('lessonLabel — the subject and the topic as it was taught', () => {
+  const URDU_GRAMMAR = { topic: 'singular and plural', topic_as_taught: 'واحد اور جمع', subject: 'urdu' };
+
+  test('an English-reading teacher gets the subject in English, the topic as taught, and an English gloss', () => {
+    const s = L.lessonLabel({ digest: URDU_GRAMMAR, quizLanguage: 'ur', teacherLanguage: 'en' });
+    expect(s).toMatch(/Urdu lesson/);
+    expect(s).toMatch(/واحد اور جمع/);
+    expect(s).toMatch(/\(.*singular and plural.*\)/);
+  });
+
+  test('an Urdu-reading teacher whose quiz is Urdu too gets no gloss', () => {
+    const s = L.lessonLabel({ digest: URDU_GRAMMAR, quizLanguage: 'ur', teacherLanguage: 'ur' });
+    expect(s).toMatch(/اردو/);
+    expect(s).toMatch(/واحد اور جمع/);
+    expect(s).not.toMatch(/singular and plural/);
+  });
+
+  test('Islamiyat has a label of its own in both languages — never a raw key', () => {
+    const d = { topic: 'The five pillars', topic_as_taught: 'ارکانِ اسلام', subject: 'islamiat' };
+    expect(L.lessonLabel({ digest: d, quizLanguage: 'ur', teacherLanguage: 'en' })).toMatch(/Islamiyat/);
+    expect(L.lessonLabel({ digest: d, quizLanguage: 'ur', teacherLanguage: 'ur' })).toMatch(/اسلامیات/);
+  });
+
+  test('the digest keys sst and genk map to their catalog labels', () => {
+    expect(L.lessonLabel({ digest: { topic: 'Provinces', topic_as_taught: 'صوبے', subject: 'sst' }, quizLanguage: 'ur', teacherLanguage: 'en' })).toMatch(/Social Studies/);
+    expect(L.lessonLabel({ digest: { topic: 'Our flag', topic_as_taught: 'ہمارا پرچم', subject: 'genk' }, quizLanguage: 'ur', teacherLanguage: 'en' })).toMatch(/General Knowledge/);
+  });
+
+  test('an unmapped subject falls back to the catalog word for a lesson, never "other"', () => {
+    const s = L.lessonLabel({ digest: { topic: 'Shapes we drew', subject: 'art' }, quizLanguage: 'en', teacherLanguage: 'en' });
+    expect(s).toMatch(/^lesson on /);
+    expect(s).not.toMatch(/other/i);
+    const ur = L.lessonLabel({ digest: { topic: 'Shapes', topic_as_taught: 'شکلیں', subject: 'art' }, quizLanguage: 'ur', teacherLanguage: 'ur' });
+    expect(ur).toMatch(/سبق/);
+    expect(ur).not.toMatch(/other/i);
+  });
+
+  test('the topic is isolated so a script switch cannot reorder the sentence around it', () => {
+    const s = L.lessonLabel({ digest: URDU_GRAMMAR, quizLanguage: 'ur', teacherLanguage: 'en' });
+    expect(s).toMatch(/⁨/);
+    expect(s).toMatch(/⁩/);
+  });
+});
+
+// Seen in testing: an English teacher's caption read "Mathematics lesson on Comparing &
+// ordering unlike fractions (Comparing and ordering unlike fractions)" — the digest's two topic
+// labels differed only by "&"/"and", so the bracket repeated the topic as its own gloss.
+describe('lessonLabel — the gloss appears only when it adds information', () => {
+  const MATHS = (topic, taught) => ({ topic, topic_as_taught: taught, subject: 'maths' });
+
+  test('"&" versus "and" is not a gloss', () => {
+    const s = L.lessonLabel({
+      digest: MATHS('Comparing and ordering unlike fractions', 'Comparing & ordering unlike fractions'),
+      quizLanguage: 'ur', teacherLanguage: 'en',
+    });
+    expect(s).toMatch(/Comparing & ordering unlike fractions/);
+    expect(s).not.toMatch(/Comparing and ordering/);
+    expect(s).not.toMatch(/\(/);
+  });
+
+  test('neither is a difference of case, punctuation or spacing', () => {
+    const s = L.lessonLabel({
+      digest: MATHS('comparing and ordering unlike fractions', 'Comparing and Ordering:  Unlike Fractions.'),
+      quizLanguage: 'ur', teacherLanguage: 'en',
+    });
+    expect(s).not.toMatch(/\(/);
+  });
+
+  test('a gloss that really says something else is kept', () => {
+    const s = L.lessonLabel({
+      digest: MATHS('Comparing unlike fractions', 'Unlike fractions on a number line'),
+      quizLanguage: 'ur', teacherLanguage: 'en',
+    });
+    expect(s).toMatch(/Unlike fractions on a number line/);
+    expect(s).toMatch(/\(.*Comparing unlike fractions.*\)/);
+  });
+
+  test('a gloss in the other script is always kept — it is the translation', () => {
+    const s = L.lessonLabel({
+      digest: { topic: 'singular and plural', topic_as_taught: 'واحد اور جمع', subject: 'urdu' },
+      quizLanguage: 'ur', teacherLanguage: 'en',
+    });
+    expect(s).toMatch(/\(.*singular and plural.*\)/);
+  });
+});
+
+// Also seen: "Mathematics lesson on Proper Fraction (Proper Fractions)" — the
+// two labels differed only in a trailing plural.
+describe('lessonLabel — a singular/plural pair is not a gloss either', () => {
+  const MATHS = (topic, taught) => ({ topic, topic_as_taught: taught, subject: 'maths' });
+  const label = (topic, taught) => L.lessonLabel({ digest: MATHS(topic, taught), quizLanguage: 'ur', teacherLanguage: 'en' });
+
+  test('the real pair: "Proper Fraction" / "Proper Fractions"', () => {
+    const s = label('Proper Fractions', 'Proper Fraction');
+    expect(s).toMatch(/Proper Fraction/);
+    expect(s).not.toMatch(/\(/);
+  });
+
+  test.each([
+    ['-es', 'Adding boxes', 'Adding box'],
+    ['-ies', 'Properties of shapes', 'Property of shape'],
+    ['an irregular plural', 'Children and their families', 'Child and their family'],
+  ])('%s is the same word', (_, topic, taught) => {
+    expect(label(topic, taught)).not.toMatch(/\(/);
+  });
+
+  test('a word that only ends in s is not taken for a plural: "Class" / "Clas" still differ', () => {
+    expect(label('Class work', 'Clas work')).toMatch(/\(/);
+  });
+
+  test('a genuinely different name keeps its bracket', () => {
+    expect(label('Fractions of a whole', 'Proper Fraction')).toMatch(/\(.*Fractions of a whole.*\)/);
+  });
+
+  test('a translation keeps its bracket', () => {
+    const s = L.lessonLabel({
+      digest: { topic: 'singular and plural', topic_as_taught: 'واحد اور جمع', subject: 'urdu' },
+      quizLanguage: 'ur', teacherLanguage: 'en',
+    });
+    expect(s).toMatch(/\(.*singular and plural.*\)/);
+  });
+});
+
+describe('transliterations seen on real cards', () => {
+  test('ہول / پارٹس / ٹیسٹ / سرکل are written in English letters', () => {
+    const out = L.fixTransliterations('یہ ایک ہول (whole) کے پارٹس کو دکھاتا ہے، ٹیسٹ میں سرکل کی شکل');
+    expect(out).not.toMatch(/ہول|پارٹس|ٹیسٹ|سرکل/);
+    expect(out).toMatch(/whole/); expect(out).toMatch(/parts/); expect(out).toMatch(/test/); expect(out).toMatch(/circle/);
+  });
+});

@@ -100,6 +100,38 @@ async function getBrowser() {
 }
 
 /**
+ * A browser context for one render.
+ *
+ * `untrusted: true` is for pages built from text a model or a user wrote (the
+ * lesson-quiz figures, cards, teacher PDF and class report). Such a page needs
+ * neither script nor network, its fonts and images being data: URIs, so the
+ * context runs no page JavaScript and aborts every request that is not data:
+ * or about:. Markup that slipped past escaping can then neither run nor make
+ * the server's browser fetch an internal URL. Without the option the context
+ * is exactly what it always was.
+ *
+ * The route alone is not enough: it sees what the page's renderer asks for,
+ * but Chromium's prefetch and preconnect, and the frames an iframe or object
+ * opens, go out from the browser's own network service. `offline` and a proxy
+ * that nothing listens on (port 9, discard) close that path as well.
+ */
+const LOCAL_URL = /^(data|about):/i;
+const DEAD_PROXY = { server: 'http://127.0.0.1:9' };
+async function newRenderContext(browser, contextOptions, untrusted) {
+  if (!untrusted) return contextOptions ? browser.newContext(contextOptions) : browser.newContext();
+  const ctx = await browser.newContext({
+    ...(contextOptions || {}), javaScriptEnabled: false, offline: true, proxy: DEAD_PROXY,
+  });
+  try {
+    await ctx.route('**/*', (route) => (LOCAL_URL.test(route.request().url()) ? route.continue() : route.abort()));
+  } catch (error) {
+    await ctx.close().catch(() => {});
+    throw error;
+  }
+  return ctx;
+}
+
+/**
  * Convert an HTML string to a PDF buffer.
  *
  * Waits for `document.fonts.ready` before PDF capture so embedded
@@ -111,11 +143,13 @@ async function getBrowser() {
  * @param {number} [options.timeout=30000] - Max ms to wait for setContent.
  * @param {Object} [options.pdfOptions] - Passed directly to page.pdf().
  *   Defaults: format A4, printBackground=true, 50px margins.
+ * @param {boolean} [options.untrusted=false] - No page JavaScript, no
+ *   requests other than data:/about: (see newRenderContext).
  * @returns {Promise<Buffer>} The generated PDF as a Buffer.
  */
 async function htmlToPdf(html, options = {}) {
   const browser = await getBrowser();
-  const ctx = await browser.newContext();
+  const ctx = await newRenderContext(browser, null, options.untrusted);
   const page = await ctx.newPage();
   try {
     await page.setContent(html, {
@@ -155,6 +189,8 @@ async function htmlToPdf(html, options = {}) {
  * @param {number} [options.deviceScaleFactor=2] - Retina scale (2 = crisp on phones).
  * @param {string} [options.selector='.card'] - Element to crop to. Falsy → full page.
  * @param {number} [options.timeout=30000] - Max ms to wait for setContent.
+ * @param {boolean} [options.untrusted=false] - No page JavaScript, no
+ *   requests other than data:/about: (see newRenderContext).
  * @returns {Promise<Buffer>} PNG image as a Buffer.
  */
 async function htmlToImage(html, options = {}) {
@@ -163,13 +199,14 @@ async function htmlToImage(html, options = {}) {
     deviceScaleFactor = 2,
     selector = '.card',
     timeout = 30000,
+    untrusted = false,
   } = options;
 
   const browser = await getBrowser();
-  const ctx = await browser.newContext({
+  const ctx = await newRenderContext(browser, {
     viewport: { width, height: 100 }, // height grows to content for element shots
     deviceScaleFactor,
-  });
+  }, untrusted);
   const page = await ctx.newPage();
   try {
     await page.setContent(html, { waitUntil: 'domcontentloaded', timeout });

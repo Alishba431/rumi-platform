@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/css/main.css">
   <link rel="icon" type="image/png" href="/images/rumi-logo.png">
   <!-- Chart.js for visualizations -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/vendor/chart-4.4.0.umd.min.js"></script>
   <style>
     /* AMA-specific styles - Claude-inspired minimalism */
     :root {
@@ -631,6 +631,7 @@
       to { transform: rotate(360deg); }
     }
   </style>
+  <script src="/js/csp-actions.js"></script>
 </head>
 <body class="bg-background">
   <!-- Navigation -->
@@ -741,11 +742,12 @@
     </main>
   </div>
 
-  <script>
+  <script src="/js/escape-html.js"></script>
+  <script nonce="<%= cspNonce %>">
     // AMA Chat Application
     (function() {
       // Admin view flag (passed from server)
-      const isAdminView = <%= locals.isAdminView ? 'true' : 'false' %>;
+      const isAdminView = <%- safeJson(!!locals.isAdminView) %>;
 
       // State
       let currentConversationId = null;
@@ -1019,7 +1021,7 @@
             <div class="ama-sql-block">
               <div class="ama-sql-header">
                 <span class="ama-sql-label">SQL Query</span>
-                <button class="ama-sql-copy" onclick="copyToClipboard(this, '${escapeHtml(sql)}')">Copy</button>
+                <button class="ama-sql-copy" data-on-click="copyToClipboard" data-args="${cspArgs('$el', sql)}">Copy</button>
               </div>
               <pre class="ama-sql-code">${escapeHtml(sql)}</pre>
             </div>
@@ -1033,7 +1035,7 @@
             html += `
               <div class="ama-chart-container">
                 <div class="ama-chart-wrapper" style="padding: 16px;">
-                  <img src="${chartImageUrl}" alt="Chart visualization" style="max-width: 100%; height: auto; border-radius: 8px;" />
+                  <img src="${safeUrl(chartImageUrl)}" alt="Chart visualization" style="max-width: 100%; height: auto; border-radius: 8px;" />
                 </div>
               </div>
             `;
@@ -1331,7 +1333,7 @@
 
                 // Hide delete button in admin view (read-only)
                 const deleteBtn = isAdminView ? '' : `
-                  <button class="ama-history-delete" onclick="event.stopPropagation(); deleteConversation('${c.id}')" title="Delete chat">
+                  <button class="ama-history-delete" data-on-click="deleteConversation" data-args="${cspArgs(c.id)}" title="Delete chat">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                     </svg>
@@ -1340,8 +1342,8 @@
 
                 return `
                 <div class="ama-history-item ${c.id === currentConversationId ? 'active' : ''}"
-                     data-id="${c.id}">
-                  <span class="ama-history-item-title" onclick="loadConversation('${c.id}')">
+                     data-id="${escapeHtml(c.id)}">
+                  <span class="ama-history-item-title" data-on-click="loadConversation" data-args="${cspArgs(c.id)}">
                     ${displayTitle}
                   </span>
                   ${deleteBtn}
@@ -1456,12 +1458,7 @@
         }
       };
 
-      // Helper functions
-      function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-      }
+      // Helper functions (escapeHtml and safeUrl: public/js/escape-html.js)
 
       // Simple markdown renderer for assistant messages
       function renderMarkdown(text) {
@@ -1513,6 +1510,14 @@
         });
       };
     })();
+  </script>
+  <script nonce="<%= cspNonce %>">
+    // The handlers the data-on-* attributes in this page name (see /js/csp-actions.js).
+    window.cspActions.register({
+      copyToClipboard: window.copyToClipboard,
+      deleteConversation: window.deleteConversation,
+      loadConversation: window.loadConversation,
+    });
   </script>
 </body>
 </html>

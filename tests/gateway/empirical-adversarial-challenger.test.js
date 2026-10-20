@@ -292,7 +292,7 @@ describe('Empirical Adversarial Challenger Suite (Phase 2)', () => {
       }
 
       expect(mockDomainHandler).toHaveBeenCalledTimes(1);
-      expect(WhatsAppService.sendReaction).toHaveBeenCalledTimes(1);
+      expect(WhatsAppService.sendReaction).not.toHaveBeenCalled(); // reaction is handleWebhookPost's, after the limits
     });
 
     it('EMPIRICAL RACE CONDITION PROBE: demonstrates TOCTOU race condition in SessionService check-and-mark', async () => {
@@ -449,45 +449,6 @@ describe('Empirical Adversarial Challenger Suite (Phase 2)', () => {
   });
 
   describe('4. Standalone Server Microservice & Channel Routing Flaws', () => {
-    it('verifies Slack events are properly enqueued in standalone server.js without dropping', async () => {
-      // In bot/gateway/server.js:
-      // dispatcher = new IngressDispatcher();
-      // dispatcher.setQueueProducer(...)
-      // app.use(createWebhookRoutes(dispatcher));
-      // Slack routes are now mounted per router instance and bound to dispatcher.
-
-      const timestamp = Math.floor(Date.now() / 1000);
-      const slackBody = JSON.stringify({
-        type: 'event_callback',
-        event_id: `slack_emp_${Date.now()}`,
-        event: {
-          type: 'message',
-          user: 'U_TESTER_001',
-          text: 'Challenger test Slack message',
-          ts: `${timestamp}.000100`
-        }
-      });
-      const signature = computeSlackSignature(timestamp, slackBody, TEST_SLACK_SECRET);
-
-      const res = await fetch(`${serverUrl}/api/slack/events`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-slack-request-timestamp': String(timestamp),
-          'x-slack-signature': signature
-        },
-        body: slackBody
-      });
-
-      expect(res.status).toBe(200);
-
-      // Remediation: The Slack event is enqueued in server.js queue
-      const queueDepth = memoryQueue.size('main');
-      console.log(`[Standalone Slack Ingress Probe] POST /api/slack/events -> status=${res.status}, queueDepth=${queueDepth}`);
-      
-      expect(queueDepth).toBe(1);
-    });
-
     it('verifies Slack envelopes in InboundMessageWorker pass PHONE_NUMBER_ID validation', async () => {
       process.env.PHONE_NUMBER_ID = 'PRODUCTION_PHONE_NUMBER_ID_999';
       

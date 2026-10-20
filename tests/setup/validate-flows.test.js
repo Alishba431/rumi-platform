@@ -96,6 +96,10 @@ function buildCompleteState(overrides = {}) {
         flowId: 'flow_sj_14', status: 'PUBLISHED', envVar: 'STUDENT_JOIN_FLOW_ID',
         type: 'navigate', registeredAt: now,
       },
+      'Observe Form': {
+        flowId: 'flow_of_15', status: 'PUBLISHED', envVar: 'OBSERVE_FORM_FLOW_ID',
+        type: 'endpoint', endpointPath: '/api/flows/observe-form', registeredAt: now,
+      },
     },
     templates: {
       welcome_message: { templateId: 'tpl_1', status: 'APPROVED', registeredAt: now },

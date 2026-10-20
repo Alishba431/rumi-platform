@@ -1,0 +1,130 @@
+# Portal Android app — debug APK for every PR that touches portal/**.
+#
+# Builds the app the way an adopter would (`npm run android:sync`, then
+# Gradle), checks the bundle really is app-mode, and uploads the APK so a
+# reviewer can install it. Release signing lives elsewhere (portal/ANDROID.md);
+# no secrets are used here, deliberately — a debug build can run on any
+# branch, including forks, and a release keystore must never be reachable
+# from one.
+#
+# The APK points at PORTAL_APP_API_BASE_URL (a repository variable) when set,
+# otherwise at the placeholder https://portal.example.org/api/portal: enough to
+# prove the build, not to log in.
+
+name: Portal Android debug build
+
+on:
+  pull_request:
+    paths:
+      - 'portal/**'
+      - 'tests/portal/**'
+      - '.github/workflows/portal-android-debug.yml'
+  workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: 'Absolute https portal API URL to build against (blank = repo variable or placeholder)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portal-android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'      # Capacitor 8 requires Java 21
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22      # the Capacitor 8 CLI requires Node 22+
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+
+      # ubuntu-latest ships an Android SDK at $ANDROID_HOME; install only what
+      # this build needs (android-actions/setup-android@v3 asks for the obsolete
+      # `tools` package, which current cmdline-tools refuse).
+      - name: Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0" "platform-tools" > /dev/null
+
+      - name: Portal app guard tests
+        # dashboard deps: portal-app-session-runtime.test.js boots the
+        # dashboard's real express-session, cors and portal router.
+        run: |
+          npm ci
+          (cd dashboard && npm ci)
+          node tests/run.js tests/portal
+
+      - name: Install portal dependencies
+        working-directory: portal
+        run: npm ci
+
+      - name: Portal component tests
+        working-directory: portal
+        run: npm test
+
+      - name: Write app build config
+        working-directory: portal
+        env:
+          OVERRIDE: ${{ github.event.inputs.api_base_url }}
+          REPO_VAR: ${{ vars.PORTAL_APP_API_BASE_URL }}
+        run: |
+          API_BASE_URL="${OVERRIDE:-${REPO_VAR:-https://portal.example.org/api/portal}}"
+          case "$API_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::The API URL must be absolute https (got: $API_BASE_URL). A native build without one white-screens on every launch."; exit 1 ;;
+          esac
+          cp .env.app.example .env.app
+          sed -i "s|^VITE_API_BASE_URL=.*|VITE_API_BASE_URL=${API_BASE_URL}|; s|^PORTAL_APP_OTA=.*|PORTAL_APP_OTA=0|" .env.app
+          echo "API_HOST=$(printf '%s' "$API_BASE_URL" | awk -F[/:] '{print $4}')" >> "$GITHUB_ENV"
+          echo "Debug build targets ${API_BASE_URL}"
+
+      # Debug builds load their BUNDLED assets (PORTAL_APP_OTA=0): a reviewer
+      # needs to see the code in this PR, not whatever the live server serves.
+      - name: Build web assets and sync native project
+        working-directory: portal
+        run: npm run android:sync
+
+      - name: Verify the bundle is app-mode
+        working-directory: portal
+        run: |
+          if ! grep -rqF "$API_HOST" dist/assets/*.js; then
+            echo "::error::Built bundle does not reference ${API_HOST} — this is a WEB-mode build and would white-screen."
+            exit 1
+          fi
+          echo "Bundle references ${API_HOST} — app-mode confirmed."
+
+      - name: Assemble debug APK
+        working-directory: portal/android
+        run: ./gradlew assembleDebug --no-daemon
+
+      # Downloadable from this run's Summary page: adb install -r <file>.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portal-app-debug-apk
+          path: portal/android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Summary
+        run: |
+          {
+            echo "### Portal app debug APK"
+            echo ""
+            echo "- Branch: \`${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}\` (\`${GITHUB_SHA:0:7}\`)"
+            echo "- Package: \`org.example.rumi.portal.debug\` (placeholder id; installs beside a release build)"
+            echo "- API: \`${API_HOST}\`"
+            echo "- Build type: debug, debug-signed, bundled assets (OTA off)"
+          } >> "$GITHUB_STEP_SUMMARY"

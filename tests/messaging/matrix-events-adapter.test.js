@@ -1,0 +1,1191 @@
+/**
+ * matrix-events.adapter.js -- mapping matrix-bot-sdk sync events (room.message,
+ * room.failed_decryption) into the Meta-webhook-shaped payload whatsapp-bot.js's
+ * handleWebhookPost already dispatches on. Mirrors discord-events.adapter.js's
+ * own test coverage style (a persistent-listener attach(), not an HTTP route
+ * handler) -- synthetic matrix-bot-sdk-shaped event objects are fed directly to
+ * the mapping functions and to attach()'s registered listeners, never a real
+ * MatrixClient/sync connection.
+ */
+
+jest.mock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+jest.mock('../../bot/shared/services/messaging/matrix-channel.service', () => ({
+  _cacheIncomingMedia: jest.fn(),
+}));
+
+const OWN_USER_ID = '@rumi:example.org';
+const STARTED_AT = 1_700_000_000_000;
+
+function pendingOptionsMock(overrides = {}) {
+  return {
+    get: jest.fn().mockResolvedValue(null),
+    resolveSelection: jest.fn(() => null),
+    clear: jest.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
+
+let adapter;
+let pendingOptions;
+
+function loadAdapter(pendingOverrides) {
+  jest.resetModules();
+  jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+  jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => ({
+    _cacheIncomingMedia: jest.fn(),
+  }));
+  pendingOptions = pendingOptionsMock(pendingOverrides);
+  jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptions);
+  // eslint-disable-next-line global-require
+  adapter = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+  return adapter;
+}
+
+beforeEach(() => {
+  loadAdapter();
+});
+
+afterEach(() => {
+  adapter._resetSeenIdsForTests();
+  jest.clearAllMocks();
+});
+
+describe('toPrefixedIdentity', () => {
+  it('prefixes a Matrix user id with "matrix:" -- the user id itself keeps its own colon', () => {
+    expect(adapter.toPrefixedIdentity('@teacher:example.org')).toBe('matrix:@teacher:example.org');
+  });
+});
+
+// An identity is a teacher (users row, sessions, classes). The short form is
+// only for the bot's own homeserver, and the "+" and "t" usernames are two
+// different accounts, so neither may borrow the other's identity.
+describe('the sender identity names exactly one Matrix account', () => {
+  const textFrom = (sender) => ({
+    sender, event_id: `$${sender}`, origin_server_ts: STARTED_AT + 5000, content: { msgtype: 'm.text', body: '/status' },
+  });
+
+  it('a sender on another homeserver does not get the local teacher\'s `from`', async () => {
+    const { resolveChannelIdentity } = require('../../bot/shared/services/messaging/channel-registry');
+    const local = await adapter.mapMessageToMetaShape('!dm1:x', textFrom('@+15550100001:example.org'), OWN_USER_ID, STARTED_AT);
+    const foreign = await adapter.mapMessageToMetaShape('!dm2:x', textFrom('@+15550100001:other.example.org'), OWN_USER_ID, STARTED_AT);
+    expect(local.from).toBe('mtx:15550100001');
+    expect(foreign.from).toBe('matrix:@+15550100001:other.example.org');
+    expect(resolveChannelIdentity(foreign.from)).not.toEqual(resolveChannelIdentity(local.from));
+  });
+
+  it('the "t" and "+" accounts for one number are two Rumi users', async () => {
+    const plus = await adapter.mapMessageToMetaShape('!dm1:x', textFrom('@+15550100001:example.org'), OWN_USER_ID, STARTED_AT);
+    const t = await adapter.mapMessageToMetaShape('!dm2:x', textFrom('@t15550100001:example.org'), OWN_USER_ID, STARTED_AT);
+    expect(t.from).toBe('mtx:t15550100001');
+    expect(t.from).not.toBe(plus.from);
+  });
+});
+
+describe('toPrefixedMediaId', () => {
+  it('prefixes an mxc:// URI with "matrix:" -- required so the messaging router (channel-registry.js#driverForIdentifier) sends getMediaInfo/downloadMedia to the Matrix driver, not the WhatsApp one', () => {
+    expect(adapter.toPrefixedMediaId('mxc://example.org/abc123')).toBe('matrix:mxc://example.org/abc123');
+  });
+});
+
+describe('mapMessageToMetaShape', () => {
+  it('maps a plain text message to the Meta text shape, with the prefixed identity', async () => {
+    const event = {
+      sender: '@teacher:example.org',
+      event_id: '$169999',
+      origin_server_ts: STARTED_AT + 5000,
+      content: { msgtype: 'm.text', body: 'Hello Rumi' },
+    };
+    const mapped = await adapter.mapMessageToMetaShape('!room:example.org', event, OWN_USER_ID, STARTED_AT);
+    expect(mapped).toEqual({
+      from: 'matrix:@teacher:example.org',
+      id: '$169999',
+      timestamp: Math.floor((STARTED_AT + 5000) / 1000),
+      type: 'text',
+      text: { body: 'Hello Rumi' },
+    });
+  });
+
+  it('skips the bot\'s own message (echo)', async () => {
+    const event = {
+      sender: OWN_USER_ID, event_id: '$1', origin_server_ts: STARTED_AT + 1000,
+      content: { msgtype: 'm.text', body: 'echo' },
+    };
+    expect(await adapter.mapMessageToMetaShape('!room:x', event, OWN_USER_ID, STARTED_AT)).toBeNull();
+  });
+
+  it('skips an event older than the adapter\'s own attach() time (pre-startup backlog)', async () => {
+    const event = {
+      sender: '@teacher:example.org', event_id: '$1', origin_server_ts: STARTED_AT - 5000,
+      content: { msgtype: 'm.text', body: 'old' },
+    };
+    expect(await adapter.mapMessageToMetaShape('!room:x', event, OWN_USER_ID, STARTED_AT)).toBeNull();
+  });
+
+  it('skips a non-text, non-media msgtype (e.g. m.notice)', async () => {
+    const event = {
+      sender: '@teacher:example.org', event_id: '$1', origin_server_ts: STARTED_AT + 1000,
+      content: { msgtype: 'm.notice', body: 'a bot notice' },
+    };
+    expect(await adapter.mapMessageToMetaShape('!room:x', event, OWN_USER_ID, STARTED_AT)).toBeNull();
+  });
+
+  it('skips a text message with no body', async () => {
+    const event = {
+      sender: '@teacher:example.org', event_id: '$1', origin_server_ts: STARTED_AT + 1000,
+      content: { msgtype: 'm.text' },
+    };
+    expect(await adapter.mapMessageToMetaShape('!room:x', event, OWN_USER_ID, STARTED_AT)).toBeNull();
+  });
+
+  it('returns null for a nullish/incomplete event', async () => {
+    expect(await adapter.mapMessageToMetaShape('!room:x', null, OWN_USER_ID, STARTED_AT)).toBeNull();
+    expect(await adapter.mapMessageToMetaShape('!room:x', {}, OWN_USER_ID, STARTED_AT)).toBeNull();
+  });
+
+  it('delegates to attachment mapping when the message carries a media msgtype', async () => {
+    const event = {
+      sender: '@teacher:example.org', event_id: '$1', origin_server_ts: STARTED_AT + 1000,
+      content: {
+        msgtype: 'm.audio', body: 'voice.ogg', url: 'mxc://example.org/F1', info: { mimetype: 'audio/ogg', size: 42 },
+        'org.matrix.msc3245.voice': {},
+      },
+    };
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', event, OWN_USER_ID, STARTED_AT);
+    expect(mapped.type).toBe('audio');
+    expect(mapped.audio.id).toBe('matrix:mxc://example.org/F1');
+  });
+
+  it('resolves a numbered reply to a pending menu into an interactive shape BEFORE falling through to plain text', async () => {
+    loadAdapter({
+      get: jest.fn().mockResolvedValue({ replyType: 'list_reply', options: [{ id: 'lang_ur', title: 'Urdu' }] }),
+      resolveSelection: jest.fn(() => ({ id: 'lang_ur', title: 'Urdu' })),
+    });
+    const event = {
+      sender: '@teacher:example.org', event_id: '$1', origin_server_ts: STARTED_AT + 1000,
+      content: { msgtype: 'm.text', body: '1' },
+    };
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', event, OWN_USER_ID, STARTED_AT);
+    expect(mapped).toEqual({
+      from: 'matrix:@teacher:example.org',
+      id: '$1',
+      timestamp: Math.floor((STARTED_AT + 1000) / 1000),
+      type: 'interactive',
+      interactive: { type: 'list_reply', list_reply: { id: 'lang_ur', title: 'Urdu' } },
+    });
+    expect(pendingOptions.clear).toHaveBeenCalledWith('matrix:@teacher:example.org');
+  });
+});
+
+describe('mapAttachmentToMetaShape', () => {
+  it('maps an m.image message to the Meta image shape, carrying the body as the caption, and caches media metadata (NOT a downloaded buffer)', async () => {
+    const matrixChannel = require('../../bot/shared/services/messaging/matrix-channel.service');
+    const mapped = adapter.mapAttachmentToMetaShape('matrix:@teacher:example.org', '$1', 169100, {
+      msgtype: 'm.image', body: 'look at this', url: 'mxc://example.org/F2', info: { mimetype: 'image/png', size: 100 },
+    });
+    expect(mapped).toEqual({
+      from: 'matrix:@teacher:example.org',
+      id: '$1',
+      timestamp: 169100,
+      type: 'image',
+      image: { id: 'matrix:mxc://example.org/F2', mime_type: 'image/png', caption: 'look at this' },
+    });
+    expect(matrixChannel._cacheIncomingMedia).toHaveBeenCalledWith('matrix:mxc://example.org/F2', {
+      url: 'mxc://example.org/F2', mime_type: 'image/png', file_size: 100,
+    });
+  });
+
+  it('maps an m.video message to the Meta video shape', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('matrix:@teacher:example.org', '$1', 169100, {
+      msgtype: 'm.video', body: 'clip', url: 'mxc://example.org/F3', info: { mimetype: 'video/mp4', size: 500 },
+    });
+    expect(mapped.type).toBe('video');
+    expect(mapped.video.id).toBe('matrix:mxc://example.org/F3');
+  });
+
+  it('maps an m.file message (or anything else with a url) to the Meta document shape', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('matrix:@teacher:example.org', '$1', 169100, {
+      msgtype: 'm.file', body: 'lesson-plan.pdf', url: 'mxc://example.org/F4', info: { mimetype: 'application/pdf', size: 200 },
+    });
+    expect(mapped).toEqual({
+      from: 'matrix:@teacher:example.org',
+      id: '$1',
+      timestamp: 169100,
+      type: 'document',
+      document: { id: 'matrix:mxc://example.org/F4', mime_type: 'application/pdf', filename: 'lesson-plan.pdf' },
+    });
+  });
+
+  it('maps an ENCRYPTED voice note (E2EE room: content.file, no content.url) to the Meta audio shape and caches the EncryptedFile for decryption', () => {
+    const matrixChannel = require('../../bot/shared/services/messaging/matrix-channel.service');
+    const file = {
+      url: 'mxc://example.org/ENC1', key: { kty: 'oct', k: 'abc', alg: 'A256CTR', ext: true, key_ops: ['encrypt', 'decrypt'] },
+      iv: 'iv==', hashes: { sha256: 'hash' }, v: 'v2',
+    };
+    const mapped = adapter.mapAttachmentToMetaShape('mtx:15550100101', '$v1', 169100, {
+      msgtype: 'm.audio', body: 'Voice message', file,
+      info: { mimetype: 'audio/ogg', size: 5120, duration: 3000 },
+      'org.matrix.msc3245.voice': {},
+    });
+    expect(mapped).toEqual({
+      from: 'mtx:15550100101', id: '$v1', timestamp: 169100,
+      type: 'audio', audio: { id: 'matrix:mxc://example.org/ENC1', mime_type: 'audio/ogg' },
+    });
+    expect(matrixChannel._cacheIncomingMedia).toHaveBeenCalledWith('matrix:mxc://example.org/ENC1', {
+      url: 'mxc://example.org/ENC1', mime_type: 'audio/ogg', file_size: 5120, file,
+      audio: { duration: 3 }, // info.duration is ms; the voice handler reads seconds, as on Meta
+    });
+  });
+
+  // An audio FILE (a lesson recording picked from the phone) arrives as
+  // m.audio too, but without the voice-message flag. Mapped as audio, it took
+  // the voice-note path, which never reaches classroom coaching (that needs a
+  // 15-minute recording, detected on the document path by ffprobe). WhatsApp
+  // delivers a shared audio file as a document; so does this adapter now.
+  it('maps an audio FILE (m.audio without the voice-message flag) to a document, so a lesson recording reaches coaching', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('mtx:15550100101', '$a1', 169100, {
+      msgtype: 'm.audio', body: 'lesson-recording.mp3', file: { url: 'mxc://example.org/ENC9' },
+      info: { mimetype: 'audio/mpeg', size: 9000000, duration: 960000 },
+    });
+    expect(mapped).toEqual({
+      from: 'mtx:15550100101', id: '$a1', timestamp: 169100,
+      type: 'document',
+      document: { id: 'matrix:mxc://example.org/ENC9', mime_type: 'audio/mpeg', filename: 'lesson-recording.mp3' },
+    });
+  });
+
+  it('keeps a voice message (MSC3245 flag) on the voice-note path', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('mtx:15550100101', '$a2', 169100, {
+      msgtype: 'm.audio', body: 'Voice message', url: 'mxc://example.org/V2',
+      info: { mimetype: 'audio/ogg' }, 'org.matrix.msc3245.voice': {},
+    });
+    expect(mapped.type).toBe('audio');
+  });
+
+  it('maps an encrypted image the same way as a plaintext one (the E2EE shape was previously dropped as "no url")', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('mtx:15550100101', '$i1', 169100, {
+      msgtype: 'm.image', body: 'IMG_2031.jpg', file: { url: 'mxc://example.org/ENC2' }, info: { mimetype: 'image/jpeg' },
+    });
+    expect(mapped.type).toBe('image');
+    expect(mapped.image.id).toBe('matrix:mxc://example.org/ENC2');
+  });
+
+  it('a bare filename in body is NOT passed through as the caption (Matrix puts the filename there when there is no caption)', () => {
+    const noCaption = adapter.mapAttachmentToMetaShape('matrix:@t:x', '$1', 1, {
+      msgtype: 'm.image', body: 'IMG_2031.jpg', url: 'mxc://x/1', info: { mimetype: 'image/jpeg' },
+    });
+    expect(noCaption.image.caption).toBe('');
+    const sameAsFilename = adapter.mapAttachmentToMetaShape('matrix:@t:x', '$2', 1, {
+      msgtype: 'm.image', body: 'photo.png', filename: 'photo.png', url: 'mxc://x/2',
+    });
+    expect(sameAsFilename.image.caption).toBe('');
+  });
+
+  it('a real caption (MSC2530: filename present and different from body) IS passed through', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('matrix:@t:x', '$1', 1, {
+      msgtype: 'm.image', body: 'grade 3 worksheet, check it', filename: 'IMG_2031.jpg', url: 'mxc://x/1',
+    });
+    expect(mapped.image.caption).toBe('grade 3 worksheet, check it');
+  });
+
+  it('a document keeps its real filename when MSC2530 separates it from the caption', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('matrix:@t:x', '$1', 1, {
+      msgtype: 'm.file', body: 'my lesson plan', filename: 'lp.pdf', url: 'mxc://x/1', info: { mimetype: 'application/pdf' },
+    });
+    expect(mapped.document.filename).toBe('lp.pdf');
+  });
+
+  it('returns null when the media content has no url (e.g. an undecryptable media event)', () => {
+    const mapped = adapter.mapAttachmentToMetaShape('matrix:@teacher:example.org', '$1', 169100, { msgtype: 'm.image', body: 'x' });
+    expect(mapped).toBeNull();
+  });
+});
+
+describe('toInteractiveSelection', () => {
+  it('returns null when there is no pending menu', async () => {
+    expect(await adapter.toInteractiveSelection('matrix:@teacher:example.org', 'hello')).toBeNull();
+  });
+
+  it('resolves a button_reply selection and clears the menu', async () => {
+    loadAdapter({
+      get: jest.fn().mockResolvedValue({ replyType: 'button_reply', options: [{ id: 'menu_video', title: 'Video' }] }),
+      resolveSelection: jest.fn(() => ({ id: 'menu_video', title: 'Video' })),
+    });
+    const result = await adapter.toInteractiveSelection('matrix:@teacher:example.org', '1');
+    expect(result).toEqual({ type: 'interactive', interactive: { type: 'button_reply', button_reply: { id: 'menu_video', title: 'Video' } } });
+    expect(pendingOptions.clear).toHaveBeenCalledWith('matrix:@teacher:example.org');
+  });
+});
+
+describe('isDuplicateDelivery', () => {
+  it('returns false for an unseen id and true for the same id seen again', () => {
+    expect(adapter.isDuplicateDelivery('$msg-1')).toBe(false);
+    expect(adapter.isDuplicateDelivery('$msg-1')).toBe(true);
+  });
+
+  it('treats an absent id as never a duplicate (never records it)', () => {
+    expect(adapter.isDuplicateDelivery(undefined)).toBe(false);
+    expect(adapter.isDuplicateDelivery(undefined)).toBe(false);
+  });
+});
+
+describe('attach', () => {
+  function mockConnection({ getUserIdImpl } = {}) {
+    const handlers = {};
+    const client = {
+      on: jest.fn((event, handler) => { handlers[event] = handler; }),
+      getUserId: jest.fn(getUserIdImpl || (async () => OWN_USER_ID)),
+      // A 1:1 room: an unreadable one is treated as a group (and stays quiet).
+      getAllRoomMembers: jest.fn(async () => [{ effectiveMembership: 'join' }, { effectiveMembership: 'join' }]),
+      dms: { isDm: jest.fn(() => true) },
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-connection', () => ({
+      getClient: jest.fn().mockResolvedValue(client),
+      getCachedUserId: jest.fn(() => OWN_USER_ID),
+    }));
+    // tests/setup.js sets a REDIS_URL; never let attach() dial a real Redis here.
+    const relay = { startOwner: jest.fn(() => true) };
+    jest.doMock('../../bot/shared/services/messaging/matrix-outbound-relay', () => relay);
+    return { client, handlers, relay };
+  }
+
+  beforeEach(() => jest.resetModules());
+
+  it('starts serving relayed worker sends, handing the relay the driver\'s LOCAL implementations', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const localImplementations = { sendMessage: jest.fn() };
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => ({
+      _cacheIncomingMedia: jest.fn(), _localImplementations: localImplementations,
+    }));
+    const { relay } = mockConnection();
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    await freshAttach(jest.fn());
+    expect(relay.startOwner).toHaveBeenCalledWith(localImplementations);
+  });
+
+  it('registers a room.message and a room.failed_decryption listener on the shared client', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const { handlers } = mockConnection();
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    await freshAttach(jest.fn());
+
+    expect(typeof handlers['room.message']).toBe('function');
+    expect(typeof handlers['room.failed_decryption']).toBe('function');
+  });
+
+  it('dispatches a mapped text message on room.message', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const { handlers } = mockConnection();
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    const dispatch = jest.fn().mockResolvedValue(undefined);
+    await freshAttach(dispatch);
+
+    await handlers['room.message']('!room:x', {
+      sender: '@teacher:example.org', event_id: '$1', origin_server_ts: Date.now() + 1000,
+      content: { msgtype: 'm.text', body: 'hi' },
+    });
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    const [dispatchReq] = dispatch.mock.calls[0];
+    expect(dispatchReq.body.entry[0].changes[0].value.messages[0]).toEqual(
+      expect.objectContaining({ from: 'matrix:@teacher:example.org', type: 'text', text: { body: 'hi' } })
+    );
+  });
+
+  it('does not dispatch twice for a redelivered event id', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const { handlers } = mockConnection();
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    const dispatch = jest.fn().mockResolvedValue(undefined);
+    await freshAttach(dispatch);
+    const event = {
+      sender: '@teacher:example.org', event_id: '$dup-1', origin_server_ts: Date.now() + 1000,
+      content: { msgtype: 'm.text', body: 'hi' },
+    };
+    await handlers['room.message']('!room:x', event);
+    await handlers['room.message']('!room:x', event);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs one line (no message body) and does not throw on room.failed_decryption', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const { handlers } = mockConnection();
+    const logger = require('../../bot/shared/utils/logger');
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    await freshAttach(jest.fn());
+    expect(() => handlers['room.failed_decryption']('!room:x', { event_id: '$1' }, new Error('bad session'))).not.toThrow();
+    expect(logger.logToFile).toHaveBeenCalledWith(
+      expect.stringContaining('failed to decrypt'),
+      expect.objectContaining({ roomId: '!room:x', eventId: '$1' })
+    );
+    // No message body/content ever logged -- teacher privacy.
+    const loggedPayload = logger.logToFile.mock.calls.find(([msg]) => msg.includes('failed to decrypt'))[1];
+    expect(loggedPayload).not.toHaveProperty('content');
+    expect(loggedPayload).not.toHaveProperty('body');
+  });
+
+  it('does not dispatch its own echoed message', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const { handlers } = mockConnection();
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    const dispatch = jest.fn().mockResolvedValue(undefined);
+    await freshAttach(dispatch);
+
+    await handlers['room.message']('!room:x', {
+      sender: OWN_USER_ID, event_id: '$echo', origin_server_ts: Date.now() + 1000,
+      content: { msgtype: 'm.text', body: 'my own reply' },
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+// A teacher who writes while the bot is restarting (a deploy, a crash) used to
+// get no answer: attach() dropped every event older than its own start time.
+// Now the adapter persists a marker of the last event it processed, in the
+// client's own storage (bot.json in MATRIX_STORAGE_DIR, next to the sync
+// token), and answers the backlog after it -- once.
+describe('messages sent while the bot was down', () => {
+  const DAY_MS = 24 * 3600 * 1000;
+  function sharedStorage() {
+    const values = new Map();
+    return {
+      values,
+      provider: {
+        readValue: jest.fn(async (key) => (values.has(key) ? values.get(key) : null)),
+        storeValue: jest.fn(async (key, value) => { values.set(key, value); }),
+      },
+    };
+  }
+
+  // One "process": a fresh adapter module attached to a client that shares
+  // `storage` with every other process in the test, like a restart would.
+  async function startBot(storage) {
+    jest.resetModules();
+    const logToFile = jest.fn();
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => ({ _cacheIncomingMedia: jest.fn() }));
+    const handlers = {};
+    const client = {
+      on: jest.fn((event, handler) => { handlers[event] = handler; }),
+      getUserId: jest.fn(async () => OWN_USER_ID),
+      storageProvider: storage.provider,
+      // A 1:1 room: an unreadable one is treated as a group (and stays quiet).
+      getAllRoomMembers: jest.fn(async () => [{ effectiveMembership: 'join' }, { effectiveMembership: 'join' }]),
+      dms: { isDm: jest.fn(() => true) },
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-connection', () => ({
+      getClient: jest.fn().mockResolvedValue(client),
+      getCachedUserId: jest.fn(() => OWN_USER_ID),
+    }));
+    jest.doMock('../../bot/shared/services/messaging/matrix-outbound-relay', () => ({ startOwner: jest.fn(() => true) }));
+    const dispatch = jest.fn().mockResolvedValue(undefined);
+    const fresh = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    await fresh.attach(dispatch);
+    return { handlers, dispatch, adapter: fresh, logToFile };
+  }
+
+  const text = (id, ts, body = 'hi') => ({
+    sender: '@+15550100001:example.org', event_id: id, origin_server_ts: ts, content: { msgtype: 'm.text', body },
+  });
+
+  it('answers a message that arrived while the bot was down, after the last one it processed', async () => {
+    const storage = sharedStorage();
+    const first = await startBot(storage);
+    await first.handlers['room.message']('!dm:x', text('$before', Date.now() - 60_000));
+    // That one predates this first-ever start, so it is history, not backlog.
+    expect(first.dispatch).not.toHaveBeenCalled();
+    await first.handlers['room.message']('!dm:x', text('$live', Date.now() + 10));
+    expect(first.dispatch).toHaveBeenCalledTimes(1);
+
+    const sentWhileDown = Date.now() + 20;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const second = await startBot(storage); // restart: started AFTER the teacher wrote
+    await second.handlers['room.message']('!dm:x', text('$while-down', sentWhileDown, 'are you there?'));
+    expect(second.dispatch).toHaveBeenCalledTimes(1);
+    expect(second.dispatch.mock.calls[0][0].body.entry[0].changes[0].value.messages[0])
+      .toEqual(expect.objectContaining({ id: '$while-down', text: { body: 'are you there?' } }));
+  });
+
+  it('never answers twice: an event processed before the restart and replayed after it is skipped', async () => {
+    const storage = sharedStorage();
+    const first = await startBot(storage);
+    const live = text('$answered', Date.now() + 10);
+    await first.handlers['room.message']('!dm:x', live);
+    expect(first.dispatch).toHaveBeenCalledTimes(1);
+
+    const second = await startBot(storage);
+    await second.handlers['room.message']('!dm:x', live); // the sync token lagged; the event comes again
+    expect(second.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('on a first-ever start (no marker yet), history from before the start is not answered', async () => {
+    const storage = sharedStorage();
+    const bot = await startBot(storage);
+    await bot.handlers['room.message']('!dm:x', text('$old', Date.now() - 3_600_000));
+    expect(bot.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('persists the marker in the client storage, and ignores its own echoes for it', async () => {
+    const storage = sharedStorage();
+    const bot = await startBot(storage);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const ts = Date.now() - 5; // after the start, and not in the future
+    await bot.handlers['room.message']('!dm:x', text('$m1', ts));
+    await bot.handlers['room.message']('!dm:x', { ...text('$echo', ts + 5), sender: OWN_USER_ID });
+    const marker = JSON.parse(storage.values.get(bot.adapter.INBOUND_MARKER_KEY));
+    expect(marker.lastTs).toBe(ts);
+    expect(marker.recentIds).toEqual(['$m1']);
+  });
+  // A clock jump on the homeserver, a federated or bridged event, or an
+  // appservice ?ts= can stamp an event weeks ahead. Trusted as the marker, that
+  // date became the cutoff after the next restart, and every real message
+  // until then was dropped without a log line.
+  it('one future-stamped event does not make the bot ignore every real message after a restart', async () => {
+    const storage = sharedStorage();
+    const first = await startBot(storage);
+    await first.handlers['room.message']('!dm:x', text('$future', Date.now() + 30 * DAY_MS));
+    expect(JSON.parse(storage.values.get(first.adapter.INBOUND_MARKER_KEY)).lastTs).toBeLessThanOrEqual(Date.now());
+
+    const second = await startBot(storage); // a restart / deploy
+    await second.handlers['room.message']('!dm:x', text('$real', Date.now() + 1000));
+    expect(second.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('a marker already stored in the future is ignored, with one warning', async () => {
+    const storage = sharedStorage();
+    const KEY = 'org.rumi.inbound.marker';
+    storage.values.set(KEY, JSON.stringify({ lastTs: Date.now() + 30 * DAY_MS, recentIds: [] }));
+
+    const bot = await startBot(storage);
+    await bot.handlers['room.message']('!dm:x', text('$real-1', Date.now() + 1000));
+    await bot.handlers['room.message']('!dm:x', text('$real-2', Date.now() + 2000));
+    expect(bot.dispatch).toHaveBeenCalledTimes(2);
+    const warnings = bot.logToFile.mock.calls.filter(([msg]) => /in the future/.test(msg));
+    expect(warnings).toHaveLength(1);
+    expect(JSON.parse(storage.values.get(KEY)).lastTs).toBeLessThanOrEqual(Date.now());
+  });
+});
+
+describe('defaultWelcomeRoomAlias', () => {
+  it('derives "#rumi-announcements:<server>" from the bot\'s own user id', () => {
+    expect(adapter.defaultWelcomeRoomAlias('@rumi:example.org')).toBe('#rumi-announcements:example.org');
+  });
+
+  it('returns null when there is no server part to derive from', () => {
+    expect(adapter.defaultWelcomeRoomAlias('')).toBeNull();
+    expect(adapter.defaultWelcomeRoomAlias(undefined)).toBeNull();
+  });
+});
+
+describe('handleWelcomeRoomJoin', () => {
+  /**
+   * @param {boolean} localGreeted whether the LOCAL storage provider (this
+   *   process's own MATRIX_STORAGE_DIR) already has the marker.
+   * @param {object|null} serverGreetedMap the homeserver account-data map,
+   *   or null to simulate a real M_NOT_FOUND (nothing ever written there) --
+   *   the "fresh storage dir, but the SERVER remembers" scenario this fix
+   *   exists for is `{ localGreeted: false, serverGreetedMap: {...} }`.
+   */
+  function fakeClient({ localGreeted = false, serverGreetedMap = null, dmJoined = true } = {}) {
+    const notFound = async () => {
+      const error = new Error('Event not found.');
+      error.body = { errcode: 'M_NOT_FOUND' };
+      throw error;
+    };
+    return {
+      storageProvider: {
+        readValue: jest.fn().mockResolvedValue(localGreeted ? '1' : null),
+        storeValue: jest.fn().mockResolvedValue(undefined),
+      },
+      getAccountData: jest.fn(serverGreetedMap ? async () => serverGreetedMap : notFound),
+      setAccountData: jest.fn().mockResolvedValue(undefined),
+      // The user's own membership in the DM room: joined (greet now) or not yet (defer).
+      getRoomStateEvent: jest.fn(dmJoined ? async () => ({ membership: 'join' }) : notFound),
+    };
+  }
+
+  function mockMatrixChannel(overrides = {}) {
+    const mod = {
+      _cacheIncomingMedia: jest.fn(),
+      sendMessage: jest.fn().mockResolvedValue(true),
+      _resolveDmRoomId: jest.fn().mockResolvedValue('!dm:example.org'),
+      ...overrides,
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => mod);
+    return mod;
+  }
+
+  beforeEach(() => jest.resetModules());
+
+  it('opens a DM (via the driver\'s own sendMessage) and sends the welcome message on a genuine first join when the user is already in the DM (nothing local, nothing on the server)', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient();
+
+    const event = { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+
+    expect(matrixChannel.sendMessage).toHaveBeenCalledWith(
+      'matrix:@teacher:example.org',
+      expect.stringContaining("we're glad you're here")
+    );
+    // Write-through: BOTH the local cache (speed) AND the homeserver account
+    // data (source of truth) get the marker.
+    expect(client.storageProvider.storeValue).toHaveBeenCalledWith('rumi:matrix:welcomed:@teacher:example.org', '1');
+    expect(client.setAccountData).toHaveBeenCalledWith('org.rumi.messenger.greeted', { '@teacher:example.org': true });
+  });
+
+  it('never re-greets a user the LOCAL cache already has a marker for (same-process fast path)', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient({ localGreeted: true });
+
+    const event = { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+    // The fast path never even needed to ask the server.
+    expect(client.getAccountData).not.toHaveBeenCalled();
+  });
+
+  it('REGRESSION: a fresh process (empty local storage) with a marker already on the homeserver does NOT re-greet', async () => {
+    // The exact bug this fix closes: a new bot process (new MATRIX_STORAGE_DIR,
+    // same @rumi account) has no local cache at all, but the homeserver
+    // account data already remembers this user from a PREVIOUS process.
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient({ localGreeted: false, serverGreetedMap: { '@teacher:example.org': true } });
+
+    const event = { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+    // The server answer is backfilled into this (fresh) process's local
+    // cache, so a second join in the SAME process skips the network too.
+    expect(client.storageProvider.storeValue).toHaveBeenCalledWith('rumi:matrix:welcomed:@teacher:example.org', '1');
+  });
+
+  it('REGRESSION: a fresh process with NOTHING on the server (a real first-ever join) greets and writes the account-data marker', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient({ localGreeted: false, serverGreetedMap: null });
+
+    const event = { type: 'm.room.member', state_key: '@newteacher:example.org', content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+
+    expect(matrixChannel.sendMessage).toHaveBeenCalledWith('matrix:@newteacher:example.org', expect.any(String));
+    expect(client.setAccountData).toHaveBeenCalledWith('org.rumi.messenger.greeted', { '@newteacher:example.org': true });
+  });
+
+  it('merges into an EXISTING server-side map rather than overwriting other users\' entries', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient({ serverGreetedMap: { '@already:example.org': true } });
+
+    const event = { type: 'm.room.member', state_key: '@new:example.org', content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+
+    expect(client.setAccountData).toHaveBeenCalledWith('org.rumi.messenger.greeted', {
+      '@already:example.org': true,
+      '@new:example.org': true,
+    });
+  });
+
+  it('ignores the bot\'s own join to the welcome room', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient();
+
+    const event = { type: 'm.room.member', state_key: OWN_USER_ID, content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('ignores an event in a different room, and any non-join member event', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient();
+
+    await freshHandle(
+      client, '!welcome:example.org', '!other:example.org',
+      { type: 'm.room.member', state_key: '@x:example.org', content: { membership: 'join' } },
+      OWN_USER_ID
+    );
+    await freshHandle(
+      client, '!welcome:example.org', '!welcome:example.org',
+      { type: 'm.room.message', content: {} },
+      OWN_USER_ID
+    );
+    await freshHandle(
+      client, '!welcome:example.org', '!welcome:example.org',
+      { type: 'm.room.member', state_key: '@x:example.org', content: { membership: 'leave' } },
+      OWN_USER_ID
+    );
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('REGRESSION: a user with no devices yet (teacher.sh onboarding) only gets the DM opened -- the greeting waits for their DM join', async () => {
+    // Sending here encrypted the greeting to nobody: the phone later showed
+    // it forever as "Waiting for this message" (reproduced live 2026-09-23).
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const adapterMod = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient({ dmJoined: false });
+
+    const join = { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } };
+    await adapterMod.handleWelcomeRoomJoin(client, '!welcome:example.org', '!welcome:example.org', join, OWN_USER_ID);
+    expect(matrixChannel._resolveDmRoomId).toHaveBeenCalledWith('@teacher:example.org'); // DM created + invited
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+    expect(client.setAccountData).not.toHaveBeenCalled();
+    expect(client.storageProvider.storeValue).toHaveBeenCalledWith('rumi:matrix:welcome-pending:!dm:example.org', '@teacher:example.org');
+
+    // The teacher's phone signs in and accepts the invite: NOW the greeting goes out, once.
+    await adapterMod.handleDmRoomJoin(client, '!dm:example.org', join, OWN_USER_ID);
+    expect(matrixChannel.sendMessage).toHaveBeenCalledWith('matrix:@teacher:example.org', expect.stringContaining("we're glad you're here"));
+    expect(client.setAccountData).toHaveBeenCalledWith('org.rumi.messenger.greeted', { '@teacher:example.org': true });
+    expect(client.storageProvider.storeValue).toHaveBeenCalledWith('rumi:matrix:welcome-pending:!dm:example.org', '');
+
+    await adapterMod.handleDmRoomJoin(client, '!dm:example.org', join, OWN_USER_ID);
+    expect(matrixChannel.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('the deferred greeting survives a restart: a pending marker only in storage still greets on the DM join', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleDmRoomJoin } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient();
+    client.storageProvider.readValue = jest.fn(async (key) => (
+      key === 'rumi:matrix:welcome-pending:!dm:example.org' ? '@teacher:example.org' : null
+    ));
+
+    await handleDmRoomJoin(client, '!dm:example.org',
+      { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } }, OWN_USER_ID);
+    expect(matrixChannel.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('a join in a DM with no pending welcome (an invite accepted long ago, a group room, the bot itself) sends nothing', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleDmRoomJoin } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient();
+
+    await handleDmRoomJoin(client, '!old-dm:example.org',
+      { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } }, OWN_USER_ID);
+    await handleDmRoomJoin(client, '!old-dm:example.org',
+      { type: 'm.room.member', state_key: OWN_USER_ID, content: { membership: 'join' } }, OWN_USER_ID);
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('a pending DM join for someone already greeted (e.g. by another process) clears the marker without re-greeting', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const matrixChannel = mockMatrixChannel();
+    const { handleDmRoomJoin } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient({ serverGreetedMap: { '@teacher:example.org': true } });
+    client.storageProvider.readValue = jest.fn(async (key) => (
+      key.startsWith('rumi:matrix:welcome-pending:') ? '@teacher:example.org' : null
+    ));
+
+    await handleDmRoomJoin(client, '!dm:example.org',
+      { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } }, OWN_USER_ID);
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+    expect(client.storageProvider.storeValue).toHaveBeenCalledWith('rumi:matrix:welcome-pending:!dm:example.org', '');
+  });
+
+  it('does not mark the user greeted when the welcome send fails -- a retry can still happen later', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    mockMatrixChannel({ sendMessage: jest.fn().mockResolvedValue(false) });
+    const { handleWelcomeRoomJoin: freshHandle } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const client = fakeClient();
+
+    const event = { type: 'm.room.member', state_key: '@teacher:example.org', content: { membership: 'join' } };
+    await freshHandle(client, '!welcome:example.org', '!welcome:example.org', event, OWN_USER_ID);
+    expect(client.storageProvider.storeValue).not.toHaveBeenCalled();
+  });
+});
+
+describe('attach -- welcome-room join wiring', () => {
+  function mockConnectionWithWelcome({ joinRoomImpl, resolveRoomImpl } = {}) {
+    const handlers = {};
+    const client = {
+      on: jest.fn((event, handler) => { handlers[event] = handler; }),
+      getUserId: jest.fn().mockResolvedValue(OWN_USER_ID),
+      joinRoom: jest.fn(joinRoomImpl || (async () => '!welcome:example.org')),
+      resolveRoom: jest.fn(resolveRoomImpl || (async () => '!welcome:example.org')),
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-connection', () => ({
+      getClient: jest.fn().mockResolvedValue(client),
+      getCachedUserId: jest.fn(() => OWN_USER_ID),
+    }));
+    // tests/setup.js sets a REDIS_URL; never let attach() dial a real Redis here.
+    jest.doMock('../../bot/shared/services/messaging/matrix-outbound-relay', () => ({ startOwner: jest.fn(() => true) }));
+    return { client, handlers };
+  }
+
+  beforeEach(() => jest.resetModules());
+
+  it('registers a room.event listener when the welcome room alias resolves', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => ({ _cacheIncomingMedia: jest.fn() }));
+    const { handlers } = mockConnectionWithWelcome();
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    await freshAttach(jest.fn());
+    expect(typeof handlers['room.event']).toBe('function');
+  });
+
+  it('does not register a room.event listener when the welcome alias cannot be resolved -- messaging still works either way', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => ({ _cacheIncomingMedia: jest.fn() }));
+    const { handlers } = mockConnectionWithWelcome({ resolveRoomImpl: async () => { throw new Error('not found'); } });
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    await freshAttach(jest.fn());
+    expect(handlers['room.event']).toBeUndefined();
+    expect(typeof handlers['room.message']).toBe('function'); // unaffected
+  });
+
+  it('a room.event join in the welcome room opens the DM; the user\'s later join of that DM sends the welcome, exactly once', async () => {
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    const matrixChannel = {
+      _cacheIncomingMedia: jest.fn(),
+      sendMessage: jest.fn().mockResolvedValue(true),
+      _resolveDmRoomId: jest.fn().mockResolvedValue('!dm:x'),
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => matrixChannel);
+    const { client, handlers } = mockConnectionWithWelcome();
+    const stored = {};
+    client.storageProvider = {
+      readValue: jest.fn(async (key) => stored[key] || null),
+      storeValue: jest.fn(async (key, value) => { stored[key] = value; }),
+    };
+    client.getAccountData = jest.fn().mockResolvedValue({});
+    client.setAccountData = jest.fn().mockResolvedValue(undefined);
+    client.getRoomStateEvent = jest.fn(async () => { throw new Error('M_NOT_FOUND'); }); // only invited so far
+    const { attach: freshAttach } = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+
+    await freshAttach(jest.fn());
+    const join = { type: 'm.room.member', state_key: '@newteacher:example.org', content: { membership: 'join' } };
+    await handlers['room.event']('!welcome:example.org', join);
+    expect(matrixChannel._resolveDmRoomId).toHaveBeenCalledWith('@newteacher:example.org');
+    expect(matrixChannel.sendMessage).not.toHaveBeenCalled();
+
+    await handlers['room.event']('!dm:x', join);
+    expect(matrixChannel.sendMessage).toHaveBeenCalledWith('matrix:@newteacher:example.org', expect.any(String));
+
+    // Further joins (welcome room or DM) for the same user do nothing more.
+    await handlers['room.event']('!welcome:example.org', join);
+    await handlers['room.event']('!dm:x', join);
+    expect(matrixChannel.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('text flows (a WhatsApp Flow degraded to one question per message)', () => {
+  function loadWithTextFlow(textFlowOverrides = {}, detector = {}) {
+    jest.resetModules();
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    const channel = {
+      _cacheIncomingMedia: jest.fn(),
+      sendMessage: jest.fn().mockResolvedValue(true),
+      _sendTextFlowStep: jest.fn().mockResolvedValue(true),
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => channel);
+    pendingOptions = pendingOptionsMock();
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptions);
+    const textFlow = {
+      advance: jest.fn().mockResolvedValue(null),
+      isActive: jest.fn().mockResolvedValue(false),
+      clear: jest.fn().mockResolvedValue(undefined),
+      getState: jest.fn().mockResolvedValue(null),
+      getDefinition: jest.fn(() => null),
+      renderStep: jest.fn(),
+      ...textFlowOverrides,
+    };
+    jest.doMock('../../bot/shared/services/messaging/text-flow', () => textFlow);
+    jest.doMock('../../bot/shared/services/messaging/text-flow-definitions', () => ({ ensureRegistered: jest.fn() }));
+    jest.doMock('../../bot/shared/services/attendance-detector.service', () => ({
+      detectAddClassIntent: jest.fn(() => ({ detected: false })),
+      detectAttendanceIntent: jest.fn(() => ({ detected: false })),
+      ...detector,
+    }));
+    // eslint-disable-next-line global-require
+    adapter = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    return { channel, textFlow };
+  }
+
+  const FROM_USER = '@teacher:example.org';
+  const textEvent = (body) => ({
+    sender: FROM_USER, event_id: `$${body}`, origin_server_ts: STARTED_AT + 1000, content: { msgtype: 'm.text', body },
+  });
+
+  it('a reply mid-flow is consumed by the flow, which renders the next step -- nothing reaches the dispatcher', async () => {
+    const render = { kind: 'menu', prompt: { body: 'Which language?' }, options: [] };
+    const { channel, textFlow } = loadWithTextFlow({ advance: jest.fn().mockResolvedValue({ status: 'step', render }) });
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', textEvent('Ayesha Khan'), OWN_USER_ID, STARTED_AT);
+    expect(mapped).toBeNull();
+    expect(textFlow.advance).toHaveBeenCalledWith('matrix:@teacher:example.org', 'Ayesha Khan');
+    expect(channel._sendTextFlowStep).toHaveBeenCalledWith('matrix:@teacher:example.org', render);
+  });
+
+  it('a completed flow hands its synthesised nfm_reply to the normal dispatch (flow-response.handler.js runs as on Meta)', async () => {
+    const nfm = { type: 'interactive', interactive: { type: 'nfm_reply', nfm_reply: { name: 'reading_assessment', response_json: '{}' } } };
+    loadWithTextFlow({
+      advance: jest.fn().mockResolvedValue({
+        status: 'complete', answers: {}, context: {}, definition: { onComplete: jest.fn().mockResolvedValue({ metaMessage: nfm }) },
+      }),
+    });
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', textEvent('2'), OWN_USER_ID, STARTED_AT);
+    expect(mapped).toEqual({ from: 'matrix:@teacher:example.org', id: '$2', timestamp: Math.floor((STARTED_AT + 1000) / 1000), ...nfm });
+  });
+
+  it('"cancel" mid-flow confirms the cancellation and stops there', async () => {
+    const { channel } = loadWithTextFlow({ advance: jest.fn().mockResolvedValue({ status: 'cancelled' }) });
+    expect(await adapter.mapMessageToMetaShape('!room:x', textEvent('cancel'), OWN_USER_ID, STARTED_AT)).toBeNull();
+    expect(channel.sendMessage).toHaveBeenCalledWith('matrix:@teacher:example.org', expect.stringContaining('cancelled'));
+  });
+
+  it('a slash command always wins over an active flow: the flow is cleared and the command dispatches as text', async () => {
+    const { textFlow } = loadWithTextFlow({ isActive: jest.fn().mockResolvedValue(true) });
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', textEvent('/menu'), OWN_USER_ID, STARTED_AT);
+    expect(textFlow.advance).not.toHaveBeenCalled();
+    expect(textFlow.clear).toHaveBeenCalledWith('matrix:@teacher:example.org');
+    expect(mapped.type).toBe('text');
+    expect(mapped.text.body).toBe('/menu');
+  });
+
+  // Element eats "/menu" as one of its own client commands, so on Matrix the
+  // bare word is how a teacher types a command: it must win over a flow too.
+  it('a bare command word ("menu") wins over an active flow exactly as "/menu" does', async () => {
+    const { textFlow } = loadWithTextFlow({ isActive: jest.fn().mockResolvedValue(true) });
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', textEvent('menu'), OWN_USER_ID, STARTED_AT);
+    expect(textFlow.advance).not.toHaveBeenCalled();
+    expect(textFlow.clear).toHaveBeenCalledWith('matrix:@teacher:example.org');
+    expect(mapped.type).toBe('text');
+    expect(mapped.text.body).toBe('menu');
+  });
+
+  it('"quiz fractions" (the Matrix form of "/quiz fractions") also wins over an active flow', async () => {
+    const { textFlow } = loadWithTextFlow({ isActive: jest.fn().mockResolvedValue(true) });
+    await adapter.mapMessageToMetaShape('!room:x', textEvent('quiz fractions'), OWN_USER_ID, STARTED_AT);
+    expect(textFlow.advance).not.toHaveBeenCalled();
+    expect(textFlow.clear).toHaveBeenCalledWith('matrix:@teacher:example.org');
+  });
+
+  it('an ordinary answer that merely contains a command word is still the flow\'s', async () => {
+    const { textFlow } = loadWithTextFlow({ isActive: jest.fn().mockResolvedValue(true) });
+    await adapter.mapMessageToMetaShape('!room:x', textEvent('menu items for lunch'), OWN_USER_ID, STARTED_AT);
+    expect(textFlow.advance).toHaveBeenCalledWith('matrix:@teacher:example.org', 'menu items for lunch');
+    expect(textFlow.clear).not.toHaveBeenCalled();
+  });
+
+  it('a second unmatched reply gives the flow up and lets the message through to normal handling', async () => {
+    const { textFlow } = loadWithTextFlow({ advance: jest.fn().mockResolvedValue({ status: 'unmatched', strikes: 2 }) });
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', textEvent('what is photosynthesis'), OWN_USER_ID, STARTED_AT);
+    expect(textFlow.clear).toHaveBeenCalled();
+    expect(mapped.type).toBe('text');
+  });
+
+  it('with no active flow, text continues to the menu-selection / plain-text path unchanged', async () => {
+    loadWithTextFlow();
+    const mapped = await adapter.mapMessageToMetaShape('!room:x', textEvent('hello'), OWN_USER_ID, STARTED_AT);
+    expect(mapped).toEqual(expect.objectContaining({ type: 'text', text: { body: 'hello' } }));
+  });
+});
+
+describe('group rooms -- Rumi answers only when addressed (gateGroupMessage)', () => {
+  const GROUP = '!group:example.org';
+  const DM = '!dm:example.org';
+  const T1 = '@teacher:example.org';
+  const T2 = '@teacher2:example.org';
+  const NAMES = ['Rumi', 'rumi'];
+
+  function member(userId, membership = 'join') {
+    return { membershipFor: userId, effectiveMembership: membership };
+  }
+
+  function fakeClient({ members, isDm = false, roomName = 'Grade 3 Teachers', repliedToSender = T2 } = {}) {
+    return {
+      getAllRoomMembers: jest.fn(async () => members || [member(OWN_USER_ID), member(T1), member(T2)]),
+      dms: { isDm: jest.fn(() => isDm) },
+      getRoomStateEvent: jest.fn(async () => {
+        if (!roomName) throw new Error('M_NOT_FOUND');
+        return { name: roomName };
+      }),
+      doRequest: jest.fn(async () => ({ sender: repliedToSender })),
+    };
+  }
+
+  function textEvent(body, extra = {}) {
+    return {
+      sender: T1, event_id: `$${Math.random()}`, origin_server_ts: Date.now(),
+      content: { msgtype: 'm.text', body, ...extra },
+    };
+  }
+
+  afterEach(() => adapter._resetGroupGateForTests());
+
+  it('ignores unrelated teacher-to-teacher chatter in a group', async () => {
+    const client = fakeClient();
+    for (const body of ['Is the staff room free after lunch?', 'السلام علیکم، کل صبح دس بجے میٹنگ ہے', 'Forwarded: school closes at 1pm Friday']) {
+      const gate = await adapter.gateGroupMessage(client, GROUP, textEvent(body), OWN_USER_ID, NAMES);
+      expect(gate).toEqual({ process: false, reason: 'group_not_addressed' });
+    }
+  });
+
+  it('ignores a group image with no mention', async () => {
+    const event = { sender: T1, event_id: '$img', content: { msgtype: 'm.image', body: 'IMG_1.jpg', url: 'mxc://x/y' } };
+    const gate = await adapter.gateGroupMessage(fakeClient(), GROUP, event, OWN_USER_ID, NAMES);
+    expect(gate.process).toBe(false);
+  });
+
+  it('processes an Element X pill mention (m.mentions + Markdown-link body) and strips the mention from the body', async () => {
+    const event = textEvent(`[@rumi:example.org](https://matrix.to/#/${OWN_USER_ID}) one quick fractions idea for grade 3 please`, {
+      'm.mentions': { user_ids: [OWN_USER_ID] },
+    });
+    const gate = await adapter.gateGroupMessage(fakeClient(), GROUP, event, OWN_USER_ID, NAMES);
+    expect(gate.process).toBe(true);
+    expect(gate.reason).toBe('mention');
+    expect(gate.event.content.body).toBe('one quick fractions idea for grade 3 please');
+    expect(gate.event.event_id).toBe(event.event_id);
+  });
+
+  it('processes a mention by display name typed as plain text ("Rumi, ..." / "@rumi ...") and strips it', async () => {
+    const client = fakeClient();
+    const a = await adapter.gateGroupMessage(client, GROUP, textEvent('Rumi, one quick fractions idea'), OWN_USER_ID, NAMES);
+    expect(a.process).toBe(true);
+    expect(a.event.content.body).toBe('one quick fractions idea');
+    const b = await adapter.gateGroupMessage(client, GROUP, textEvent('@rumi what is a good warm-up?'), OWN_USER_ID, NAMES);
+    expect(b.event.content.body).toBe('what is a good warm-up?');
+  });
+
+  it('a bare mention becomes "hi"; a word that merely contains the name is not a mention', async () => {
+    const client = fakeClient();
+    const bare = await adapter.gateGroupMessage(client, GROUP, textEvent('@Rumi'), OWN_USER_ID, NAMES);
+    expect(bare.event.content.body).toBe('hi');
+    const notMention = await adapter.gateGroupMessage(client, GROUP, textEvent('Rumina is late today'), OWN_USER_ID, NAMES);
+    expect(notMention.process).toBe(false);
+  });
+
+  it('processes a reply to one of Rumi\'s own messages and drops the quoted reply fallback', async () => {
+    adapter.recordOwnEvent('$rumi-said');
+    const event = textEvent('> <@rumi:example.org> Try a pizza fractions game\n\nhow long should it take?', {
+      'm.relates_to': { 'm.in_reply_to': { event_id: '$rumi-said' } },
+    });
+    const client = fakeClient();
+    const gate = await adapter.gateGroupMessage(client, GROUP, event, OWN_USER_ID, NAMES);
+    expect(gate).toEqual(expect.objectContaining({ process: true, reason: 'reply_to_rumi' }));
+    expect(gate.event.content.body).toBe('how long should it take?');
+    expect(client.doRequest).not.toHaveBeenCalled(); // known own event: no fetch
+  });
+
+  it('after a restart (own-event memory empty) a reply is checked against the replied-to event\'s sender', async () => {
+    const reply = (id) => textEvent('ok', { 'm.relates_to': { 'm.in_reply_to': { event_id: id } } });
+    const toRumi = await adapter.gateGroupMessage(fakeClient({ repliedToSender: OWN_USER_ID }), GROUP, reply('$old'), OWN_USER_ID, NAMES);
+    expect(toRumi.process).toBe(true);
+    const toTeacher = await adapter.gateGroupMessage(fakeClient({ repliedToSender: T2 }), GROUP, reply('$t2'), OWN_USER_ID, NAMES);
+    expect(toTeacher.process).toBe(false);
+  });
+
+  it('processes a numbered reply to the menu Rumi last posted to this sender in THIS room -- body untouched', async () => {
+    loadAdapter({
+      get: jest.fn().mockResolvedValue({ replyType: 'list_reply', options: [{ id: 'a', title: 'A' }, { id: 'b', title: 'B' }] }),
+      resolveSelection: jest.fn((menu, text) => (text === '2' ? { id: 'b', title: 'B' } : null)),
+    });
+    adapter.recordPromptRoom(T1, GROUP);
+    const gate = await adapter.gateGroupMessage(fakeClient(), GROUP, textEvent('2'), OWN_USER_ID, NAMES);
+    expect(gate).toEqual(expect.objectContaining({ process: true, reason: 'menu_reply' }));
+    expect(gate.event.content.body).toBe('2');
+  });
+
+  it('ignores the same "2" when Rumi\'s menu went to a different room (e.g. the teacher\'s DM)', async () => {
+    loadAdapter({
+      get: jest.fn().mockResolvedValue({ replyType: 'list_reply', options: [{ id: 'b', title: 'B' }] }),
+      resolveSelection: jest.fn(() => ({ id: 'b', title: 'B' })),
+    });
+    adapter.recordPromptRoom(T1, DM);
+    const gate = await adapter.gateGroupMessage(fakeClient(), GROUP, textEvent('2'), OWN_USER_ID, NAMES);
+    expect(gate.process).toBe(false);
+  });
+
+  it('leaves a DM completely unchanged -- no mention needed, body not rewritten', async () => {
+    const client = fakeClient({ members: [member(OWN_USER_ID), member(T1)], isDm: true });
+    const event = textEvent('Rumi, one quick fractions idea');
+    const gate = await adapter.gateGroupMessage(client, DM, event, OWN_USER_ID, NAMES);
+    expect(gate).toEqual({ process: true, reason: 'dm', event });
+  });
+
+  it('classifies rooms: >2 members = group; 2 members in m.direct = DM; unnamed 2-member = DM; named 2-member outside m.direct = group', async () => {
+    const two = [member(OWN_USER_ID), member(T1)];
+    expect(await adapter.isGroupRoom(fakeClient(), '!a:x')).toBe(true);
+    expect(await adapter.isGroupRoom(fakeClient({ members: [member(OWN_USER_ID), member(T1), member(T2, 'invite')] }), '!b:x')).toBe(true);
+    expect(await adapter.isGroupRoom(fakeClient({ members: two, isDm: true }), '!c:x')).toBe(false);
+    expect(await adapter.isGroupRoom(fakeClient({ members: two, roomName: null }), '!d:x')).toBe(false);
+    expect(await adapter.isGroupRoom(fakeClient({ members: two, roomName: 'Class 5 planning' }), '!e:x')).toBe(true);
+    // Departed members don't count.
+    expect(await adapter.isGroupRoom(fakeClient({ members: [...two, member(T2, 'leave')], isDm: true }), '!f:x')).toBe(false);
+  });
+
+  it('treats a room it cannot classify as a group: answered only when addressed', async () => {
+    const client = { getAllRoomMembers: jest.fn(async () => { throw new Error('boom'); }) };
+    const gate = await adapter.gateGroupMessage(client, '!x:x', textEvent('hello'), OWN_USER_ID, NAMES);
+    expect(gate).toEqual({ process: false, reason: 'group_not_addressed' });
+    const addressed = await adapter.gateGroupMessage(client, '!x:x', textEvent('Rumi, one idea'), OWN_USER_ID, NAMES);
+    expect(addressed).toEqual(expect.objectContaining({ process: true, reason: 'mention' }));
+  });
+
+  it('attach(): group chatter is never dispatched (no reply/reaction/typing); a mention is dispatched with the mention stripped', async () => {
+    jest.resetModules();
+    jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => pendingOptionsMock());
+    jest.doMock('../../bot/shared/services/messaging/matrix-channel.service', () => ({ _cacheIncomingMedia: jest.fn() }));
+    const handlers = {};
+    const client = {
+      ...fakeClient(),
+      on: jest.fn((event, handler) => { handlers[event] = handler; }),
+      getUserId: jest.fn(async () => OWN_USER_ID),
+      getUserProfile: jest.fn(async () => ({ displayname: 'Rumi' })),
+    };
+    jest.doMock('../../bot/shared/services/messaging/matrix-connection', () => ({
+      getClient: jest.fn().mockResolvedValue(client),
+      getCachedUserId: jest.fn(() => OWN_USER_ID),
+    }));
+    jest.doMock('../../bot/shared/services/messaging/matrix-outbound-relay', () => ({ startOwner: jest.fn(() => true) }));
+    const fresh = require('../../bot/shared/services/messaging/inbound/matrix-events.adapter');
+    const dispatch = jest.fn().mockResolvedValue(undefined);
+    await fresh.attach(dispatch);
+
+    await handlers['room.message'](GROUP, { ...textEvent('Is the staff room free after lunch?'), origin_server_ts: Date.now() + 1000 });
+    expect(dispatch).not.toHaveBeenCalled();
+    // Chatter must not redirect the sender's replies into the group.
+    expect(fresh.getLastInboundRoom(T1)).toBeNull();
+
+    await handlers['room.message'](GROUP, {
+      ...textEvent('Rumi: one quick fractions idea'), origin_server_ts: Date.now() + 1000,
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    const msg = dispatch.mock.calls[0][0].body.entry[0].changes[0].value.messages[0];
+    expect(msg).toEqual(expect.objectContaining({ type: 'text', text: { body: 'one quick fractions idea' } }));
+    // Nor does a mention: the group is never recorded as the sender's DM room.
+    expect(fresh.getLastInboundRoom(T1)).toBeNull();
+  });
+});

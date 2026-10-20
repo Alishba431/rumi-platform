@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { EXEC_SQL_SQL } = require('./exec-sql-helper');
 
 /**
  * MigrationRunner - Applies SQL migrations from files to a Supabase database.
@@ -11,10 +12,8 @@ const { createClient } = require('@supabase/supabase-js');
  * in version order.
  *
  * SQL execution uses a direct fetch to the Supabase `exec_sql` RPC endpoint.
- * The `exec_sql` function must exist in the database:
- *
- *   CREATE OR REPLACE FUNCTION exec_sql(query TEXT)
- *   RETURNS VOID AS $$ BEGIN EXECUTE query; END; $$ LANGUAGE plpgsql;
+ * The `exec_sql` function must exist in the database; its one-time
+ * definition (service_role only) is in exec-sql-helper.js.
  *
  * Usage as CLI:
  *   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... node infrastructure/scripts/migrate.js
@@ -118,7 +117,7 @@ class MigrationRunner {
    * Applies a single migration file:
    * 1. Reads the SQL content
    * 2. Executes it via the exec_sql RPC endpoint
-   * 3. Records the version and SHA-256 checksum in schema_versions
+   * 3. Records the version, filename and SHA-256 checksum in schema_versions
    *
    * @param {string} filePath - Absolute path to the .sql migration file
    * @throws {Error} If SQL execution or recording fails
@@ -153,17 +152,22 @@ class MigrationRunner {
       );
     }
 
-    // Record the applied migration
+    // Record the applied migration. Only version, description and applied_at exist in every
+    // schema_versions (00_complete-schema.sql has no filename or checksum column, and the REST
+    // API rejects an unknown column), so the filename and checksum go in the description.
+    // Some migrations record their own version (ON CONFLICT DO NOTHING); recording it again is not a failure.
     const { error: insertError } = await this.supabase
       .from('schema_versions')
-      .insert([
-        {
-          version,
-          filename,
-          checksum,
-          applied_at: new Date().toISOString(),
-        },
-      ]);
+      .upsert(
+        [
+          {
+            version,
+            description: `${filename} (sha256 ${checksum})`,
+            applied_at: new Date().toISOString(),
+          },
+        ],
+        { onConflict: 'version', ignoreDuplicates: true }
+      );
 
     if (insertError) {
       throw new Error(
@@ -282,12 +286,9 @@ if (require.main === module) {
   console.log(
     '[migrate] If it does not exist, create it with:'
   );
-  console.log(
-    '  CREATE OR REPLACE FUNCTION exec_sql(query TEXT)'
-  );
-  console.log(
-    "  RETURNS VOID AS $$ BEGIN EXECUTE query; END; $$ LANGUAGE plpgsql;"
-  );
+  // The same definition bootstrap and setup print, REVOKE included: an
+  // older copy here left the helper callable by anon.
+  console.log(EXEC_SQL_SQL.replace(/^/gm, '  '));
   console.log('');
 
   const runner = new MigrationRunner({

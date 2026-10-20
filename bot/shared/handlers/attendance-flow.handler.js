@@ -10,31 +10,25 @@ const supabase = require('../config/supabase');
 const StudentListService = require('../services/student-list.service');
 const AttendanceGeneratorService = require('../services/attendance-generator.service');
 const { logToFile } = require('../utils/logger');
+const AttendanceDates = require('../services/attendance-dates');
 
 /**
- * Get current academic year based on Pakistan school calendar
- * Academic year runs April to March:
- * - January-March 2026 → 2025-2026
- * - April-December 2026 → 2026-2027
+ * The current academic year ("YYYY-YYYY"); the start month is configurable
+ * (ATTENDANCE_ACADEMIC_YEAR_START_MONTH, default April) — see attendance-dates.
  *
  * @returns {string} Academic year in format "YYYY-YYYY"
  */
 function getCurrentAcademicYear() {
-  const now = new Date();
-  const month = now.getMonth() + 1; // 1-12
-  const year = now.getFullYear();
-
-  // If we're in Jan-March, we're in the second half of previous academic year
-  if (month >= 1 && month <= 3) {
-    return `${year - 1}-${year}`;
-  }
-  // April onwards = new academic year
-  return `${year}-${year + 1}`;
+  return AttendanceDates.academicYear();
 }
 
 // Flow IDs - configurable via env for staging vs production
 const ATTENDANCE_SETUP_FLOW_ID = process.env.ATTENDANCE_SETUP_FLOW_ID || '';
 const ATTENDANCE_MARKING_FLOW_ID = process.env.ATTENDANCE_MARKING_FLOW_ID || '';
+
+// The marking token's second segment is a class's list id, or this word for a head
+// teacher's staff attendance (userId:staff:date:sessionType:encodedSchoolName).
+const STAFF_TARGET = 'staff';
 
 class AttendanceFlowHandler {
   /**
@@ -90,16 +84,19 @@ class AttendanceFlowHandler {
 
     try {
       const absentStudentIds = responseJson.absent_students || [];
+      // Optional: older Flow versions and surfaces without a leave field send none.
+      const leaveStudentIds = responseJson.leave_students || [];
       const className = responseJson.class_name;
       const dateDisplay = responseJson.date_display;
       const sessionType = responseJson.session_type || 'Full Day';
 
       return {
         absentStudentIds,
+        leaveStudentIds,
         className,
         dateDisplay,
         sessionType,
-        everyonePresent: absentStudentIds.length === 0
+        everyonePresent: absentStudentIds.length === 0 && leaveStudentIds.length === 0
       };
     } catch (error) {
       logToFile('Error parsing marking flow response', { error: error.message });
@@ -138,21 +135,25 @@ class AttendanceFlowHandler {
   }
 
   /**
-   * Build attendance records from student list and absent IDs
+   * Build attendance records by exception: the absent and the on-leave are named,
+   * everyone else is present. Someone in both lists is on leave — the more specific
+   * statement, and counting them twice would corrupt the tallies.
    *
-   * @param {Array} allStudents - All students in the class
-   * @param {Array} absentIds - IDs of absent students
+   * @param {Array} allStudents - Everyone on the roster (students, or staff)
+   * @param {Array} absentIds - IDs of absent people
+   * @param {Array} [leaveIds] - IDs of people on approved leave
    * @returns {Array} Attendance records with status
    */
-  static buildAttendanceRecords(allStudents, absentIds) {
-    const absentSet = new Set(absentIds);
+  static buildAttendanceRecords(allStudents, absentIds, leaveIds = []) {
+    const leaveSet = new Set(leaveIds || []);
+    const absentSet = new Set((absentIds || []).filter(id => !leaveSet.has(id)));
 
     return allStudents.map(student => ({
       studentId: student.id,
       studentName: student.student_name,
       fatherName: student.father_name,
       rollNumber: student.roll_number,
-      status: absentSet.has(student.id) ? 'absent' : 'present',
+      status: leaveSet.has(student.id) ? 'leave' : absentSet.has(student.id) ? 'absent' : 'present',
       confidence: 1.0 // Manual marking = 100% confidence
     }));
   }
@@ -164,15 +165,25 @@ class AttendanceFlowHandler {
    * @param {Object} stats - Attendance statistics
    * @returns {string} Formatted message
    */
-  static generateConfirmationMessage(className, stats) {
+  static generateConfirmationMessage(className, stats, { subject = 'class' } = {}) {
+    // The day's rate follows the register's rule: for staff, approved leave is
+    // excused (present ÷ present + absent); for a class it is present ÷ everyone.
+    let rate = stats.attendanceRate;
+    if (subject === 'staff') {
+      const worked = (stats.present || 0) + (stats.absent || 0);
+      const pct = worked ? (stats.present / worked) * 100 : 0;
+      rate = pct === 100 || pct === 0 ? `${pct}%` : `${pct.toFixed(2)}%`;
+    }
+
     const lines = [
       `*Attendance Recorded*`,
       ``,
-      `Class: ${className}`,
-      `Total Students: ${stats.total}`,
+      subject === 'staff' ? `School: ${className}` : `Class: ${className}`,
+      `Total: ${stats.total}`,
       `Present: ${stats.present}`,
       `Absent: ${stats.absent}`,
-      `Attendance Rate: ${stats.attendanceRate}`,
+      `On leave: ${stats.leave || 0}`,
+      `Attendance Rate: ${rate}`,
       ``,
       `Your Excel file is being generated...`
     ];
@@ -285,14 +296,26 @@ class AttendanceFlowHandler {
         return { success: false, error: 'Invalid flow response' };
       }
 
-      // Get all students in the list
-      const { data: allStudents, error: studentsError } = await StudentListService.getStudentsByList(listId);
-      if (studentsError || !allStudents) {
-        return { success: false, error: 'Failed to fetch students' };
+      // Get everyone on the roster: the school's staff, or the class's students
+      let allStudents;
+      if (listId === STAFF_TARGET) {
+        const StaffAttendanceService = require('../services/staff-attendance.service');
+        const marker = await StaffAttendanceService.loadUser(userId);
+        if (!StaffAttendanceService.isHeadTeacher(marker) || !marker.school_id) {
+          return { success: false, error: 'Staff attendance is marked by a head teacher linked to a school.' };
+        }
+        const staff = await StaffAttendanceService.loadStaffRoster(marker.school_id, userId);
+        allStudents = staff.map(s => ({ id: s.id, student_name: StaffAttendanceService.personName(s) }));
+      } else {
+        const { data: students, error: studentsError } = await StudentListService.getStudentsByList(listId);
+        if (studentsError || !students) {
+          return { success: false, error: 'Failed to fetch students' };
+        }
+        allStudents = students;
       }
 
       // Build attendance records
-      const records = this.buildAttendanceRecords(allStudents, data.absentStudentIds);
+      const records = this.buildAttendanceRecords(allStudents, data.absentStudentIds, data.leaveStudentIds);
 
       // Calculate stats
       const stats = AttendanceGeneratorService.calculateSummaryStats(records);
@@ -302,7 +325,8 @@ class AttendanceFlowHandler {
         listId,
         total: stats.total,
         present: stats.present,
-        absent: stats.absent
+        absent: stats.absent,
+        leave: stats.leave
       });
 
       return {
@@ -333,5 +357,7 @@ class AttendanceFlowHandler {
     return null;
   }
 }
+
+AttendanceFlowHandler.STAFF_TARGET = STAFF_TARGET;
 
 module.exports = AttendanceFlowHandler;

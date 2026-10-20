@@ -162,6 +162,22 @@ describe('SELECT_TOPIC → SUCCESS (deliver)', () => {
     expect(caption).not.toMatch(/—.*—/); // no fragmented em-dashes
   });
 
+  test('a teacher on Matrix (no users.phone_number) gets the ack and the video in the chat the picker was opened from', async () => {
+    mockQueue = [
+      { data: { id: 'uuid-1', grade: '3', subject: 'Maths', clean_chapter: 'Numbers',
+                clean_title: 'Identifying Even and Odd Numbers', r2_url: 'https://r2/sample.mp4',
+                migration_status: 'done' }, error: null },
+    ];
+    // The opener puts the recipient at the end of the token: userId:student-videos:<ts>:<recipient>.
+    const res = await handleStudentVideosDataExchange('u9:student-videos:1790000000000:mtx:15550100001', 'SELECT_TOPIC', {
+      grade: '3', subject: 'Maths', video: 'uuid-1',
+    });
+    expect(res.screen).toBe('SUCCESS');
+    expect(WhatsAppService.sendMessage.mock.calls[0][0]).toBe('mtx:15550100001');
+    await flush();
+    expect(WhatsAppService.sendVideoFromUrl.mock.calls[0][0]).toBe('mtx:15550100001');
+  });
+
   test('unknown video id → error, no delivery', async () => {
     mockQueue = [{ data: null, error: { message: 'not found' } }];
     const res = await handleStudentVideosDataExchange('u:tok', 'SELECT_TOPIC', {
@@ -184,5 +200,57 @@ describe('SELECT_TOPIC → SUCCESS (deliver)', () => {
   test('unknown screen → graceful error', async () => {
     const res = await handleStudentVideosDataExchange('u:tok', 'WAT', {});
     expect(res.data.error).toBeDefined();
+  });
+});
+
+// A child's "watch more videos" picker (video-quiz-binge) carries a
+// `childpick:<phone>:<shareCodeId>:<studentId>:<language>:<ts>` token: there is
+// no users row for a child, so the video goes to the phone on the token.
+describe('a child\'s picker (childpick: token)', () => {
+  const { logToFile } = require('../../bot/shared/utils/logger');
+  const { logEvent } = require('../../bot/shared/utils/structured-logger');
+  const supabase = require('../../bot/shared/config/supabase');
+  const ChildFlowToken = require('../../bot/shared/services/quiz/child-flow-token');
+  const CHILD = '15550100077';
+  const childToken = () => ChildFlowToken.build({ phone: CHILD, shareCodeId: 'sc1', studentId: 'st1', language: 'en' });
+  const VIDEO_ROW = { data: { id: 'uuid-1', grade: '3', subject: 'Maths', clean_chapter: 'Numbers',
+    clean_title: 'Identifying Even and Odd Numbers', r2_url: 'https://r2/sample.mp4', migration_status: 'done' }, error: null };
+  const logged = () => JSON.stringify([...logToFile.mock.calls, ...logEvent.mock.calls]);
+
+  test('the ack and the video reach the child, with no teacher lookup', async () => {
+    mockQueue = [VIDEO_ROW];
+    const res = await handleStudentVideosDataExchange(childToken(), 'SELECT_TOPIC', {
+      grade: '3', subject: 'Maths', video: 'uuid-1',
+    });
+    expect(res.screen).toBe('SUCCESS');
+    expect(WhatsAppService.sendMessage.mock.calls[0][0]).toBe(CHILD);
+    await flush(); await flush();
+    expect(WhatsAppService.sendVideoFromUrl.mock.calls[0][0]).toBe(CHILD);
+    // Only the video row is read: no users row is looked up, and no teacher
+    // delivery row / class-share offer is made for a child.
+    expect(supabase.from.mock.calls.map((c) => c[0])).toEqual(['student_videos']);
+    expect(logEvent).toHaveBeenCalledWith('student_videos.delivered',
+      expect.objectContaining({ shareCodeId: 'sc1', studentId: 'st1', userId: null }));
+  });
+
+  test('the child\'s phone never reaches a log line (INIT, data_exchange, delivery)', async () => {
+    mockQueue = [{ data: [{ grade: '1' }], error: null }];
+    await handleStudentVideosInit(childToken());
+    mockQueue = [{ data: [{ subject: 'Maths' }], error: null }];
+    await handleStudentVideosDataExchange(childToken(), 'SELECT_GRADE', { grade: '1' });
+    mockQueue = [VIDEO_ROW];
+    await handleStudentVideosDataExchange(childToken(), 'SELECT_TOPIC', { grade: '3', subject: 'Maths', video: 'uuid-1' });
+    await flush(); await flush();
+    expect(logToFile).toHaveBeenCalled();
+    expect(logged()).not.toContain(CHILD);
+  });
+
+  test('a teacher token with the recipient on its end does not log that recipient (R-N1)', async () => {
+    mockQueue = [{ data: [{ grade: '1' }], error: null }];
+    await handleStudentVideosInit('u9:student-videos:1790000000000:15550100001');
+    mockQueue = [{ data: [{ subject: 'Maths' }], error: null }];
+    await handleStudentVideosDataExchange('u9:student-videos:1790000000000:mtx:15550100001', 'SELECT_GRADE', { grade: '1' });
+    expect(logToFile).toHaveBeenCalled();
+    expect(logged()).not.toContain('15550100001');
   });
 });

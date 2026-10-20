@@ -24,6 +24,17 @@ describe('readEnvFile', () => {
   });
 });
 
+// The console compared the raw text of a quoted value ('"#rumi-announcements:x"')
+// with the process value dotenv had unquoted, and showed a false "saved change
+// not applied yet". Read values the way dotenv does.
+describe('readEnvFile — quoted values', () => {
+  it('unquotes a value wrapped in matching double or single quotes, as dotenv does', () => {
+    const p = tempEnvPath();
+    fs.writeFileSync(p, 'A="#rumi-announcements:example.org"\nB=\'two words\'\nC="unbalanced\nD=plain\n');
+    expect(readEnvFile(p)).toEqual({ A: '#rumi-announcements:example.org', B: 'two words', C: '"unbalanced', D: 'plain' });
+  });
+});
+
 describe('writeEnvVars', () => {
   it('creates the file from a template when it does not exist yet', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rumi-env-test-'));

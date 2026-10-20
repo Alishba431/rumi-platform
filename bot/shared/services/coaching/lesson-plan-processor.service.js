@@ -79,9 +79,10 @@ class LessonPlanProcessorService {
         // Queue analysis job immediately; LP extraction happens in background
         await CoachingJobQueueService.queueAnalysis(coachingSessionId, { from, lpUploaded: true });
       } else {
-        // User said yes but no document yet - ask them to send it
+        // User said yes but no document yet - ask them to send it (or, with lesson-plan fidelity on, paste it)
         const lang = await _resolveSessionLanguage(coachingSessionId);
-        await WhatsAppService.sendMessage(from, getCoachingMessage('lessonPlan_request', lang));
+        const { isFidelityEnabled } = require('./fidelity/fidelity-orchestrator');
+        await WhatsAppService.sendMessage(from, getCoachingMessage(isFidelityEnabled() ? 'lessonPlan_request_or_paste' : 'lessonPlan_request', lang));
 
         // Set timeout for 24 hours with reminders
         // TODO: Implement reminder system (can be done in Phase 4)

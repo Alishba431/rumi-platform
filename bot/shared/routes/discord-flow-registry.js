@@ -113,7 +113,7 @@ function registerAll() {
     screenToSteps: attendanceMarkingView.screenToSteps,
     mergeScreenData: attendanceMarkingView.mergeScreenData,
     onFinish: async (response, ctx) => {
-      const { success_message: success, selectedClass, selectedListId, records, stats, sessionDate, sessionType } = response.data || {};
+      const { success_message: success, subject, selectedClass, selectedListId, records, stats, sessionDate, sessionType } = response.data || {};
       const recipientIdentifier = `discord:${ctx.discordUserId}`;
       if (success) await discordChannel.sendMessage(recipientIdentifier, success);
 
@@ -122,6 +122,7 @@ function registerAll() {
 
       try {
         const deliveryResult = await AttendanceDeliveryService.processAndDeliver(ctx.userId, recipientIdentifier, {
+          subject,
           selectedClass,
           selectedListId,
           records,
@@ -129,14 +130,15 @@ function registerAll() {
           summary: {
             present: stats?.present,
             absent: stats?.absent,
+            leave: stats?.leave,
             attendancePercentage: parseFloat(stats?.attendanceRate) || 0,
           },
           sessionDate,
           sessionType,
         });
 
-        if (!deliveryResult.success && !deliveryResult.isDuplicate) {
-          await discordChannel.sendMessage(recipientIdentifier, `Sorry, there was an error generating your attendance file: ${deliveryResult.error}`);
+        if (!deliveryResult.success) {
+          await discordChannel.sendMessage(recipientIdentifier, deliveryResult.saved ? deliveryResult.error : `Sorry, there was an error generating your attendance file: ${deliveryResult.error}`);
         }
       } finally {
         await AttendanceConversationService.clearSessionState(ctx.userId);

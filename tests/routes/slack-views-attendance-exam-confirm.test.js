@@ -267,11 +267,11 @@ describe('attendance-marking.view — viewToScreenData', () => {
     const stateValues = {
       absent_students_block: { absent_students: { selected_options: [{ value: 's1' }] } },
     };
-    expect(attendanceMarkingView.viewToScreenData('MARK_ABSENT', stateValues)).toEqual({ absent_student_ids: ['s1'] });
+    expect(attendanceMarkingView.viewToScreenData('MARK_ABSENT', stateValues)).toEqual({ absent_student_ids: ['s1'], leave_student_ids: [] });
   });
 
   it('defaults to an empty array when nobody is checked (everyone present)', () => {
-    expect(attendanceMarkingView.viewToScreenData('MARK_ABSENT', {})).toEqual({ absent_student_ids: [] });
+    expect(attendanceMarkingView.viewToScreenData('MARK_ABSENT', {})).toEqual({ absent_student_ids: [], leave_student_ids: [] });
   });
 
   it('returns {} for an unrecognized screen', () => {

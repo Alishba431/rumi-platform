@@ -79,10 +79,10 @@ interface InboundMessageEnvelope {
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Phase 1: In-Process Channel-Agnostic Gateway (Current Scope)           │
-│ - bot/gateway/webhook.routes.js & bot/gateway/adapters/                │
+│ - bot/gateway/adapters/ (whatsapp.js, slack.js)                        │
 │ - Canonical Inbound Envelope normalization                            │
 │ - Synchronous in-process delegation to domain handlers                 │
-│ - Zero wire regression: passes tests/characterization/legacy-baseline  │
+│ - Zero wire regression: passes tests/gateway/differential.test.js      │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
                                     ▼
@@ -113,15 +113,16 @@ interface InboundMessageEnvelope {
 bot/
 ├── gateway/
 │   ├── index.js                     # Gateway exports & initialization
-│   ├── webhook.routes.js            # Express router mounting /webhook & /api/slack
-│   ├── envelope.js                  # Inbound message envelope factory & schema
-│   ├── ingress-dispatcher.js        # Dispatches normalized envelopes (sync in Phase 1)
+│   ├── webhook.routes.js            # Queue mode: /webhook -> envelope -> queue (Phase 2/3)
+│   ├── envelope.js                  # Inbound message envelope factory + WhatsApp normalizer
+│   ├── ingress-dispatcher.js        # Dispatches envelopes (sync handler or queue producer)
+│   ├── server.js                    # Standalone gateway (Phase 3, WhatsApp only)
 │   └── adapters/
-│       ├── whatsapp.adapter.js      # Meta GET challenge & POST validation + normalization
-│       └── slack.adapter.js         # Slack HMAC signature verification + normalization
+│       ├── whatsapp.js              # Meta GET handshake, HMAC, envelope validation
+│       └── slack.js                 # Slack HMAC verification, events/interactivity/commands
 ```
 
 ### Safety & Backward Compatibility Guarantees
-1. **Wire Compatibility:** All URLs, headers, status codes, and response bodies are verified against [`tests/characterization/legacy-baseline.test.js`](file:///Users/mashhoodr/dev/playground/googlebuildwithvideo/rumi-platform/tests/characterization/legacy-baseline.test.js).
+1. **Wire Compatibility:** All URLs, headers, status codes, and response bodies are verified against [`tests/gateway/characterization.test.js`](../../tests/gateway/characterization.test.js) and [`tests/gateway/differential.test.js`](../../tests/gateway/differential.test.js).
 2. **Zero Domain Regressions:** In Phase 1, `ingress-dispatcher.js` calls the existing domain handler functions synchronously, preserving exact execution order and error boundaries.
-3. **Additive Refactoring:** `bot/whatsapp-bot.js` delegates its route mounts to `bot/gateway/webhook.routes.js`, shrinking the monolith entry point without modifying any business logic behavior.
+3. **Additive Refactoring:** `bot/whatsapp-bot.js` delegates its route mounts to the `bot/gateway/adapters/` routers, shrinking the monolith entry point without modifying any business logic behavior.

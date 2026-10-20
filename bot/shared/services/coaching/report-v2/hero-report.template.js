@@ -161,24 +161,24 @@ function buildHeroReportHtml(vm) {
         <div class="hrow"><div class="eyebrow">${T(C.celebrate)}</div>${logo(A.logoWhite, 'logo')}</div>
         <div class="headline">
           <h1>${T(n.affirmation || '')}</h1>
-          <div class="hscore"><div class="p">${score.overall}%</div>${marksLine ? `<div class="s">${marksLine}</div>` : ''}</div>
+          ${vm.scoreless ? '' : `<div class="hscore"><div class="p">${score.overall}%</div>${marksLine ? `<div class="s">${marksLine}</div>` : ''}</div>`}
         </div>
         <div class="who"><b>${esc(vm.teacherName || '')}</b>${vm.topic ? ` &nbsp;·&nbsp; ${T(vm.topic)}` : ''}${vm.date ? ` &nbsp;·&nbsp; ${esc(vm.date)}` : ''}</div>
       </div>
     </div>
     ${n.identity ? `<div class="pad" style="padding-bottom:0"><div class="identity">${T(n.identity)}</div></div>` : ''}
     <div class="cols">
-      <div class="col-l">
+      ${vm.scoreless ? '' : `<div class="col-l">
         <div class="label">${T(C.scores)} &nbsp; <span class="ov">${score.overall}%</span></div>
         ${scorecard}
-      </div>
+      </div>`}
       <div class="col-r">
         ${moment ? `<div class="label">${T(C.moments)}</div><div class="moment"><div class="m-q">“${T(moment.quote)}”</div><div class="m-w">${T(moment.why)}</div></div>` : ''}
         <div class="sh"><span class="pill">${T(C.strength)}</span><h3>${T(n.strength_name || '')}</h3><div class="nt">${T(n.strength_note || '')}</div></div>
         <div class="sh h"><span class="pill">${T(C.horizon)}</span><h3>${T(n.horizon_title || '')}</h3><div class="nt">${T(n.horizon_note || '')}</div></div>
       </div>
     </div>
-    ${(vm.trend && vm.trend.length >= 2) ? `<div class="journey"><div class="label">${T(C.journey(vm.trend.length))}</div>${ltrTrend(vm.trend, peak)}<div class="j-cap">${T(n.journey_note || '')}</div></div>` : ''}
+    ${(!vm.scoreless && vm.trend && vm.trend.length >= 2) ? `<div class="journey"><div class="label">${T(C.journey(vm.trend.length))}</div>${ltrTrend(vm.trend, peak)}<div class="j-cap">${T(n.journey_note || '')}</div></div>` : ''}
     ${vm.tryNext ? `<div class="try"><div class="label">${T(C.trynext)}</div><div class="try-text">${T(vm.tryNext)}</div></div>` : ''}
     <div class="foot"><div class="brand">${logo(A.logoNavy, '')}Rumi</div><div>${T(C.made(vm.teacherName || ''))}</div></div>
   </div>

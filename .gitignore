@@ -37,6 +37,11 @@ credentials*
 service-account*.json
 .railway-token
 
+# Matrix channel local state (sync token store + E2EE crypto store), see
+# MATRIX_STORAGE_DIR in .env.template. Same "treat like a credential"
+# reasoning as .channel-state/ above: the crypto store holds Megolm/Olm keys.
+.matrix-storage/
+
 # Setup state (generated during /setup)
 .setup-state.json
 
@@ -103,3 +108,11 @@ dashboard/supabase/.temp/
 # Python bytecode (the brief/ and curriculum/ packages)
 __pycache__/
 *.pyc
+
+# Local stack state (infrastructure/local/up.sh): Postgres data, logs, the
+# local JWT secret. See docs/local-stack.md.
+.local-stack/
+
+# A matrix-channel-service test writes a bare-named file in the cwd and removes it;
+# an interrupted run can leave one behind.
+matrix-test-bare-*.png

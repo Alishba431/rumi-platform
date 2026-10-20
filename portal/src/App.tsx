@@ -5,9 +5,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { isPortalTarget } from "@/lib/runtime";
 import Index from "./pages/Index";
 import HowItWorks from "./pages/HowItWorks";
 import NotFound from "./pages/NotFound";
+import PortalRoot from "./portal/pages/PortalRoot";
 import PortalSetup from "./portal/pages/PortalSetup";
 import PortalLogin from "./portal/pages/PortalLogin";
 import PortalPasswordReset from "./portal/pages/PortalPasswordReset";
@@ -21,12 +23,17 @@ import PortalReadingAssessments from "./portal/pages/PortalReadingAssessments";
 import PortalReadingAssessmentDetail from "./portal/pages/PortalReadingAssessmentDetail";
 import PortalVideos from "./portal/pages/PortalVideos";
 import PortalVideoDetail from "./portal/pages/PortalVideoDetail";
+import AppLinkListener from "./portal/components/AppLinkListener";
+import BackButtonHandler from "./portal/components/BackButtonHandler";
+import CoachObservations from "./portal/pages/CoachObservations";
+import CoachTeacherDetail from "./portal/pages/CoachTeacherDetail";
 
 const queryClient = new QueryClient();
 
 const App = () => {
   const { i18n } = useTranslation();
-  const isPortalSubdomain = window.location.hostname.startsWith('portal.');
+  // A `portal.` subdomain or the native app (src/lib/runtime.ts).
+  const isPortalSubdomain = isPortalTarget();
 
   useEffect(() => {
     // Update the lang attribute on the HTML element
@@ -54,8 +61,13 @@ const App = () => {
         <Toaster />
         <Sonner />
         <BrowserRouter>
+          {/* Android app only; both are no-ops in a browser. */}
+          <AppLinkListener />
+          <BackButtonHandler />
           <Routes>
-            <Route path="/" element={isPortalSubdomain ? <PortalLogin /> : <Index />} />
+            {/* "/" is every app launch: send a signed-in teacher to their
+                session (PortalRoot), not straight to the login form. */}
+            <Route path="/" element={isPortalSubdomain ? <PortalRoot /> : <Index />} />
             <Route path="/how-it-works" element={<HowItWorks />} />
             
             {/* Portal Routes */}
@@ -72,6 +84,8 @@ const App = () => {
             <Route path="/portal/reading-assessment/:id" element={<PortalReadingAssessmentDetail />} />
             <Route path="/portal/videos" element={<PortalVideos />} />
             <Route path="/portal/video/:id" element={<PortalVideoDetail />} />
+            <Route path="/portal/observe" element={<CoachObservations />} />
+            <Route path="/portal/observe/teacher/:id" element={<CoachTeacherDetail />} />
 
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />

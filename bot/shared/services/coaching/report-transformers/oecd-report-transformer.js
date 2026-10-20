@@ -9,6 +9,7 @@
  */
 
 const { logToFile } = require('../../../utils/logger');
+const { extractFidelity } = require('./_shared');
 const {
   CLASSROOM_MARKS_BASE,
   CLASSROOM_MARKS_WITH_LP,
@@ -287,8 +288,9 @@ function transformOECDToReportData(session, teacherName, enhancedAnalysis, hasPr
 
   const hasLessonPlanData = !!(session.lesson_plan_structured || enhancedAnalysis.has_lesson_plan);
 
-  // Fidelity section
-  let fidelitySection = enhancedAnalysis.fidelity_analysis ? {
+  // Fidelity section — the measured lesson-plan fidelity when it ran (extractFidelity), else the
+  // model's whole-lesson estimate as before.
+  let fidelitySection = enhancedAnalysis.lp_fidelity ? extractFidelity(enhancedAnalysis) : enhancedAnalysis.fidelity_analysis ? {
     score: enhancedAnalysis.fidelity_analysis.score || 0,
     maxScore: enhancedAnalysis.fidelity_analysis.max_score || 100,
     note: enhancedAnalysis.fidelity_analysis.note || 'Informational only',
@@ -356,7 +358,9 @@ function transformOECDToReportData(session, teacherName, enhancedAnalysis, hasPr
     topic: session.lesson_plan_structured?.topic || enhancedAnalysis.topic || 'N/A',
     observerName: 'Rumi Digital Coach',
     frameworkDisplayName: 'OECD Framework',
-    hasLessonPlan: hasLessonPlanData,
+    // A plan linked for fidelity (picked, uploaded or pasted) is a submitted plan for the header; scoring above is
+    // unchanged.
+    hasLessonPlan: hasLessonPlanData || !!(enhancedAnalysis.lp_fidelity && enhancedAnalysis.lp_fidelity.source),
     totalScore,
     maxScore: maxPossibleMarks,
     priorFeedback,

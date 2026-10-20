@@ -11,6 +11,9 @@ const fs = require('fs');
 // Import Services
 const WhatsAppService = require('./shared/services/whatsapp.service');
 const SessionService = require('./shared/services/session.service');
+const InboundRateLimit = require('./shared/services/limits/inbound-rate-limit');
+const DailyCaps = require('./shared/services/limits/daily-caps');
+const ModelBudget = require('./shared/services/limits/model-budget');
 const OpenAIService = require('./shared/services/openai.service');
 const CoachingService = require('./shared/services/coaching-orchestrator.service');
 const PortalInviteService = require('./shared/services/portal-invite.service');
@@ -21,6 +24,7 @@ const { handleTextMessage } = require('./shared/handlers/text-message.handler');
 const { handleVoiceMessage } = require('./shared/handlers/voice-message.handler');
 const { handleImageMessage } = require('./shared/handlers/image-message.handler');
 const ExamCheckerHandler = require('./shared/handlers/exam-checker.handler');
+const { routeTestPaperSelection, routeTestPaperDocument } = require('./shared/handlers/testpaper-trigger');
 
 // Import Utils
 const { logToFile, LOGS_DIR } = require('./shared/utils/logger');
@@ -34,59 +38,28 @@ const supabase = require('./shared/config/supabase');
 
 // Import Routes (Flow encryption endpoints)
 const flowEndpointRoutes = require('./shared/routes/flow-endpoint.routes');
+const PortalInternalEndpoint = require('./shared/routes/portal-internal-endpoint');
 
-// The channel-registry map from additive-driver name -> the `channel` value
-// user_channels/getOrCreateUserByChannel expects (registry driver names are
-// per-implementation — meta/baileys both mean 'whatsapp' as an identity
-// family; slack/discord map 1:1). See driverForIdentity() below.
-const { driverForIdentifier } = require('./shared/services/messaging/channel-registry');
-const CHANNEL_FAMILY = { slack: 'slack', discord: 'discord' };
+// Import Ingress Gateway (Strangler Fig)
+const { createSlackRouter, createWhatsAppRouter } = require('./gateway');
+const { createQueueDispatch } = require('./gateway/webhook.routes');
 
-/**
- * Resolves the (channel, channelUserId) pair for a `from` identifier, or null
- * for a bare WhatsApp phone number — the one place identity resolution needs
- * to know about additive channels at all; every other line below already
- * operates on the resolved `user`/`message`/`messageType`, never re-deriving
- * identity from `from` itself.
- */
-function resolveChannelIdentity(from) {
-  const driverName = driverForIdentifier(from);
-  if (!driverName) return null;
-  const prefix = `${driverName}:`; // CHANNEL_PREFIXES value happens to equal the driver name today
-  return { channel: CHANNEL_FAMILY[driverName] || driverName, channelUserId: String(from).slice(prefix.length) };
-}
+// Maps an additive-channel identifier ("slack:U…", "mtx:1555…") to the
+// (channel, channelUserId) pair user_channels expects, or null for a bare
+// WhatsApp phone number. Lives in channel-registry so it can be unit-tested
+// without booting this file.
+const { resolveChannelIdentity, driverForIdentifier } = require('./shared/services/messaging/channel-registry');
+const { normalizeCommand } = require('./shared/services/messaging/command-words');
+const { nativeFlowIdFor } = require('./shared/services/messaging/channel-capabilities');
 
 // Create Express app
 const app = express();
 
-// Decoupled Webhook Ingestion Gateway (WhatsApp, Slack, and multi-channel ingress)
-// Handles raw body capture for HMAC verification, Meta verification handshakes,
-// and canonical envelope normalization before in-process dispatching.
-const { createWebhookRoutes } = require('./gateway/webhook.routes');
-const { defaultDispatcher } = require('./gateway/ingress-dispatcher');
-
-// Support queue mode or synchronous in-process mode (default)
-const isQueueMode = process.env.GATEWAY_QUEUE_MODE === 'true' || process.env.QUEUE_MODE === 'async';
-
-if (isQueueMode) {
-  const queueService = require('./shared/services/queue');
-  defaultDispatcher.setQueueProducer(async (envelope) => {
-    return await queueService.queueJob(
-      envelope.from || envelope.id,
-      'inbound_message',
-      envelope,
-      { deduplicationId: envelope.id }
-    );
-  });
-} else {
-  // Register synchronous in-process execution handler for Phase 1 (default)
-  defaultDispatcher.registerHandler(async (envelope, { req, res }) => {
-    return await handleWebhookPost(req, res);
-  });
-}
-
-// Mount the decoupled gateway routes (handles /api/slack raw capture and /webhook)
-app.use(createWebhookRoutes(defaultDispatcher));
+// Slack Ingestion Gateway (Strangler Fig)
+// Encapsulates raw body capture & HMAC signature verification.
+// Mounted BEFORE global express.json() to guarantee wire-byte fidelity.
+// Note: handleWebhookPost is a hoisted function declaration, safely referenced here at require-time.
+app.use('/api/slack', createSlackRouter({ dispatch: handleWebhookPost }));
 
 app.use(express.json());
 
@@ -302,7 +275,18 @@ async function trackBroadcastReply(userId) {
   }
 }
 
-// Webhook verification endpoint (GET) is mounted via bot/gateway/webhook.routes.js
+// WhatsApp Ingestion Gateway (Strangler Fig)
+// Handles GET verification handshake and POST incoming message ingestion.
+// encapsulateIngress is off: dedup, the inbound limits and the reaction/typing
+// indicator stay in handleWebhookPost, where the limits must run before the
+// reaction is sent.
+// GATEWAY_QUEUE_MODE=true: the gateway acks Meta at once and queues the message
+// instead; bot/workers/inbound-message.worker.js runs handleWebhookPost on it.
+app.use('/webhook', createWhatsAppRouter({
+  dispatch: process.env.GATEWAY_QUEUE_MODE === 'true' ? createQueueDispatch() : handleWebhookPost,
+  handleBroadcastStatus: handleBroadcastStatusWebhook,
+  encapsulateIngress: false,
+}));
 
 /**
  * Webhook endpoint to receive messages (POST).
@@ -315,13 +299,45 @@ async function trackBroadcastReply(userId) {
  * Zero behavior change from the previous inline handler; see
  * wireBaileysInboundIfSelected() below for where the Baileys path plugs in.
  */
+const sendText = (to, text) => WhatsAppService.sendMessage(to, text);
+
+/**
+ * Is this message a step toward registering, which the daily message cap lets
+ * through? "register" (slash or bare: on Matrix the slash cannot be typed),
+ * and the reply to a pending name question. On Matrix that question is also
+ * offered unasked and may be ignored while the person keeps chatting, so
+ * there only a reply that reads as the name, or turns the offer down, counts;
+ * a pending flag alone would lift the cap for good.
+ */
+async function isFinishingRegistration(user, from, messageBody) {
+  const text = String(messageBody || '').trim();
+  if (/^\/register\b/i.test(normalizeCommand(text, from))) return true;
+  if (user.registration_pending_name !== true) return false;
+  if (driverForIdentifier(from) !== 'matrix') return true;
+  // Lazy: the registration service pulls in the messaging facade, which this
+  // file wires up first.
+  const FeatureRegistrationService = require('./shared/services/feature-registration.service');
+  return FeatureRegistrationService.isDeclineReply(text)
+    || await FeatureRegistrationService.readsAsNameReply(user.id, text);
+}
+
 async function handleWebhookPost(req, res) {
+  // A branch that is done early (`return` out of the list_reply routes) must
+  // still answer Meta, or the request hangs until it times out and Meta
+  // re-delivers. `headersSent` makes this idempotent, so the existing acks
+  // can stay where they are.
+  const ack = () => { if (!res.headersSent) res.status(200).send('EVENT_RECEIVED'); };
   // Generate correlation ID for tracing this request across all logs
   const correlationId = generateCorrelationId();
 
+  // Who hears "busy" if the model budget runs out while this message is
+  // handled (limits/model-budget.js): known once the message is validated.
+  let sender = null;
+  let senderLang = null;
+
   // Wrap the entire request processing with correlation context
   // All console.log calls inside will automatically include correlationId
-  await runWithCorrelation(correlationId, async () => {
+  await runWithCorrelation(correlationId, () => ModelBudget.guard(() => sender, async () => {
     logToFile('=== INCOMING WEBHOOK ===', { correlationId });
 
     // Issue #58 FIX: Add button payload diagnostic logging
@@ -409,6 +425,25 @@ async function handleWebhookPost(req, res) {
       await SessionService.markAsProcessed(message.id);
     }
 
+    // Public-deployment limits (shared/services/limits/), before the user
+    // lookup and before anything can reach a model. A sender over the
+    // per-minute rate hears "slow down" once per window, then nothing; while
+    // the model budget is out every sender hears "busy" once, then nothing.
+    const rate = await InboundRateLimit.admit(from, { kind: InboundRateLimit.kindOf(messageType) });
+    if (!rate.allowed) {
+      logToFile('🚦 Inbound rate limit: message dropped', { from, type: messageType, count: rate.count, limit: rate.limit, notified: rate.notify });
+      if (rate.notify) await WhatsAppService.sendMessage(from, InboundRateLimit.slowDownMessage());
+      ack();
+      return;
+    }
+    if (await ModelBudget.isTripped()) {
+      logToFile('💸 Model budget exhausted: message not handled', { from });
+      await ModelBudget.tellBusy(from, null, sendText);
+      ack();
+      return;
+    }
+    sender = from;
+
     logToFile('✅ Message accepted for processing', {
       messageId: message.id,
       from,
@@ -429,12 +464,28 @@ async function handleWebhookPost(req, res) {
     try {
       const channelIdentity = resolveChannelIdentity(from);
       user = channelIdentity
-        ? await getOrCreateUserByChannel(channelIdentity.channel, channelIdentity.channelUserId)
+        ? await getOrCreateUserByChannel(channelIdentity.channel, channelIdentity.channelUserId, { replyIdentifier: from })
         : await getOrCreateUser(from);
       logToFile('User retrieved/created', { userId: user.id, phoneNumber: from });
     } catch (error) {
       logToFile('⚠️ Error with database user operation', { error: error.message });
       // Continue without database - bot will still work
+    }
+    senderLang = (user && user.preferred_language) || null;
+
+    // Today's message allowance for this account's tier (limits/daily-caps.js;
+    // no cap unless the operator set one). Told once, then quiet until the
+    // next school day. Finishing registration stays possible: register (with
+    // or without its slash) and the name reply it asks for are never capped.
+    const finishingRegistration = user && await isFinishingRegistration(user, from, messageBody);
+    if (user && !finishingRegistration) {
+      const daily = await DailyCaps.claim(user, 'message');
+      if (!daily.allowed) {
+        logToFile('🚧 Daily message cap reached: message dropped', { userId: user.id, tier: daily.tier, limit: daily.limit, notified: daily.first });
+        if (daily.first) await WhatsAppService.sendMessage(from, DailyCaps.capMessage('message', daily));
+        ack();
+        return;
+      }
     }
 
     // Track chat start for funnel analysis (for all message types)
@@ -457,7 +508,19 @@ async function handleWebhookPost(req, res) {
 
     // Route to appropriate handler based on message type
     if (messageType === 'text' && messageBody) {
-      await handleTextMessage(message, from, messageBody, user);
+      // Lesson quiz: a typed number (or name) answering the numbered language
+      // ask, the fallback when a channel refused its buttons and its list.
+      // Meta's inbound text is never matched against pending menus, so it is
+      // asked here first; with the lesson quiz off it reads nothing, and a
+      // failure never costs the message.
+      let answeredAsk = false;
+      try {
+        const TranscriptQuizOffer = require('./shared/services/quiz/transcript-quiz-offer.service');
+        answeredAsk = await TranscriptQuizOffer.handleTypedLanguageChoice(from, messageBody, user);
+      } catch (askErr) {
+        logToFile('⚠️ lesson quiz: typed language answer check failed', { error: askErr.message });
+      }
+      if (!answeredAsk) await handleTextMessage(message, from, messageBody, user);
     } else if (messageType === 'audio' || messageType === 'voice') {
       await handleVoiceMessage(message, from, user);
     } else if (messageType === 'image' && message.image) {
@@ -470,6 +533,24 @@ async function handleWebhookPost(req, res) {
       // Handle interactive button responses
       const buttonId = message.interactive.button_reply.id;
       logToFile('📱 Interactive button clicked', { buttonId, from });
+
+      // Observe taps (capture ack, cancel, debrief, report …) — one dispatcher,
+      // ahead of every other branch so no other feature can claim an observe id.
+      if (buttonId.startsWith('observe_')) {
+        const { handleObserveInteractive } = require('./shared/handlers/observe-interactive.handler');
+        if (await handleObserveInteractive(user, from, buttonId)) return;
+      }
+
+      // Classroom-photo question (photo_yes_/photo_no_/photo_more_/photo_done_):
+      // "No"/"Done" move the coaching session on to the lesson-plan step.
+      const { handleCoachingFlowButton } = require('./shared/services/coaching/coaching-flow-buttons');
+      if (await handleCoachingFlowButton(buttonId, from, user)) return;
+      // Test papers (tp_ ids): Edit / New paper / My papers after a delivery.
+      // Acknowledged before returning: Meta retries a webhook it gets no 200 for.
+      if (await routeTestPaperSelection({ user, from, id: buttonId })) {
+        res.status(200).send('EVENT_RECEIVED');
+        return;
+      }
 
       // Coaching confirmation buttons
       if (buttonId.startsWith('coaching_confirm_')) {
@@ -893,12 +974,46 @@ async function handleWebhookPost(req, res) {
         // left as an answer id, so a new offer button placed after it would be
         // swallowed as a wrong answer.
         const VideoQuizInvite = require('./shared/services/quiz/video-quiz-invite.service');
+        // The watch-more offer (vq_more_*), chained after a declined invite.
+        // Same before-handleAnswer placement, same reason.
+        const VideoQuizBinge = require('./shared/services/quiz/video-quiz-binge.service');
         const handled = await VideoQuizService.handleOfferButton(buttonId, from)
           || await VideoQuizShare.handleShareButton(buttonId, from)
           || await VideoQuizInvite.handleInviteButton(buttonId, from)
+          || await VideoQuizBinge.handleMoreButton(buttonId, from)
           || await VideoQuizService.handleAnswer(from, buttonId);
         if (!handled) {
           logToFile('⚠️ unrouted vq_ button', { buttonId, from });
+        }
+      }
+      // Lesson quiz: which language the quiz should be written in
+      // (tq_lang_<code>_<quizId>, any configured quiz language). Matched
+      // BEFORE the generic `tq_` branch, which would otherwise take it.
+      // With the lesson quiz switched off (TRANSCRIPT_QUIZ_ENABLED, or
+      // RUMI_FEATURE_LESSON_QUIZ=off in the console) an old tq_ button does
+      // nothing, like every other door into it.
+      else if (buttonId.startsWith('tq_lang_')) {
+        const TranscriptQuizOffer = require('./shared/services/quiz/transcript-quiz-offer.service');
+        if (!TranscriptQuizOffer.enabled()) {
+          logToFile('⚠️ lesson quiz is off: tq_ tap ignored', { buttonId });
+        } else if (!(await TranscriptQuizOffer.handleLanguageButton(buttonId, from, user))) {
+          logToFile('⚠️ unrouted tq_lang_ button', { buttonId, from });
+        }
+      }
+      // Lesson quiz: the post-coaching offer (tq_yes_/tq_no_) and the /quiz
+      // actions (tq_link_/tq_report_…). Its own prefix on purpose — never
+      // `quiz_` (parent quiz) or `vq_` (video quiz).
+      else if (buttonId.startsWith('tq_')) {
+        const TranscriptQuizOffer = require('./shared/services/quiz/transcript-quiz-offer.service');
+        const TranscriptQuizList = require('./shared/services/quiz/transcript-quiz-list.service');
+        if (!TranscriptQuizOffer.enabled()) {
+          logToFile('⚠️ lesson quiz is off: tq_ tap ignored', { buttonId });
+        } else {
+          const handled = await TranscriptQuizOffer.handleOfferButton(buttonId, from)
+            || await TranscriptQuizList.handleActionButton(buttonId, from);
+          if (!handled) {
+            logToFile('⚠️ unrouted tq_ button', { buttonId, from });
+          }
         }
       }
       // Edit-class multi-class picker: open the edit-class flow for the chosen class.
@@ -907,7 +1022,7 @@ async function handleWebhookPost(req, res) {
         logToFile('📋 Edit class button selected', { listId, userId: user?.id, from });
         if (!user?.id) {
           await WhatsAppService.sendMessage(from, 'Sorry, I could not identify your account. Please try "edit class" again.');
-        } else if (!constants.EDIT_CLASS_FLOW_ID) {
+        } else if (!nativeFlowIdFor(from, constants.EDIT_CLASS_FLOW_ID)) {
           await WhatsAppService.sendMessage(from, 'Sorry, class editing is not available right now. Please try again later.');
         } else {
           const { data: classRow } = await supabase
@@ -945,6 +1060,13 @@ async function handleWebhookPost(req, res) {
         from,
         userId: user?.id
       });
+
+      // Observe: a teacher tapped the report-invite template (observe_report_<id>).
+      // The tap may come from someone with no account yet, so it needs no user.
+      if (buttonPayload && buttonPayload.startsWith('observe_report_')) {
+        const { handleReportTap } = require('./shared/services/observe/observe-send.service');
+        if (await handleReportTap(from, buttonPayload)) return;
+      }
 
       // Handle style_* payloads from video style carousel
       if (buttonPayload && buttonPayload.startsWith('style_')) {
@@ -1058,6 +1180,20 @@ async function handleWebhookPost(req, res) {
         } catch (vqFlowErr) {
           logToFile('❌ video-quiz Flow reply routing failed', { error: vqFlowErr.message });
         }
+      }
+
+      // The coach's observation form (/observe). Routed on its own
+      // observe_action tag before the detector: its "<observerId>:<sessionId>"
+      // token would otherwise read as an attendance Flow.
+      if (responseJson.observe_action !== undefined) {
+        try {
+          const ObserveDraft = require('./shared/services/observe/observe-draft.service');
+          await ObserveDraft.completeFromFlow(user, from, responseJson);
+        } catch (observeFlowErr) {
+          // The edits are already saved by the endpoint; only the ack failed.
+          logToFile('❌ observe form Flow reply failed', { from, error: observeFlowErr.message });
+        }
+        return;
       }
 
       // Use centralized flow type detection (fixes registration→attendance misrouting)
@@ -1187,13 +1323,64 @@ async function handleWebhookPost(req, res) {
       const listId = listReply.id;
       logToFile('📋 Interactive list item selected', { listId, from });
 
+      if (listId.startsWith('observe_')) {
+        const { handleObserveInteractive } = require('./shared/handlers/observe-interactive.handler');
+        if (await handleObserveInteractive(user, from, listId)) return;
+      }
+
+      // Test papers (tp_ ids): source, chapter, size, language, my papers.
+      if (await routeTestPaperSelection({ user, from, id: listId })) {
+        res.status(200).send('EVENT_RECEIVED');
+        return;
+      }
+
       // Video-quiz answers arrive as list_reply whenever the question has 4
       // options or a title too long for a 20-char button. Same `vq_` ids as
       // the button path — routed here too, or a four-option question would
       // accept no answer at all.
       if (listId.startsWith('vq_')) {
         const VideoQuizService = require('./shared/services/quiz/video-quiz.service');
-        if (await VideoQuizService.handleAnswer(from, listId)) return;
+        if (await VideoQuizService.handleAnswer(from, listId)) { ack(); return; }
+      }
+
+      // Lesson quiz: the language ask sent as a list (more than three quiz
+      // languages) — the same ids as its buttons.
+      if (listId.startsWith('tq_lang_')) {
+        const TranscriptQuizOffer = require('./shared/services/quiz/transcript-quiz-offer.service');
+        if (!TranscriptQuizOffer.enabled()) {
+          logToFile('⚠️ lesson quiz is off: tq_ row ignored', { listId });
+        } else if (!(await TranscriptQuizOffer.handleLanguageButton(listId, from, user))) {
+          logToFile('⚠️ unrouted tq_lang_ list row', { listId });
+        }
+        ack();
+        return;
+      }
+
+      // Lesson quiz: a row tapped in the /quiz list (a lesson, a plan, an
+      // existing quiz, the topic / classic / video rows) or its "older" page.
+      if (listId.startsWith('tq_pick_') || listId.startsWith('tq_page_')) {
+        const TranscriptQuizOffer = require('./shared/services/quiz/transcript-quiz-offer.service');
+        const TranscriptQuizList = require('./shared/services/quiz/transcript-quiz-list.service');
+        if (!TranscriptQuizOffer.enabled()) {
+          logToFile('⚠️ lesson quiz is off: tq_ row ignored', { listId });
+        } else if (listId === TranscriptQuizList.MENU_CLASSIC && user?.id) {
+          // The classic quiz keeps its Redis state per chat session, as /quiz
+          // started it before the lesson quiz: without the session the state
+          // key was `quiz:awaiting_lp_selection:null`.
+          const { getOrCreateSession } = require('./shared/database/bot-helpers');
+          const sessionId = await getOrCreateSession(user.id);
+          await TranscriptQuizList.handleListPick(listId, from, user, { sessionId });
+        } else {
+          await TranscriptQuizList.handleListPick(listId, from, user);
+        }
+        ack();
+        return;
+      }
+
+      // The lesson-plan picker of the coaching flow (lp_select_/lp_upload_/lp_none_).
+      if (/^lp_(select|upload|none)_/.test(listId)) {
+        const { handleLpListSelection } = require('./shared/services/coaching/lp-coaching/lp-list-selection.handler');
+        if (await handleLpListSelection(listId, from)) return;
       }
 
       // /quiz's class picker. QuizOrchestrator.initiateQuizRequest builds these
@@ -1212,6 +1399,7 @@ async function handleWebhookPost(req, res) {
           logToFile('❌ quiz class selection failed', { classId, error: quizErr.message });
           await WhatsAppService.sendMessage(from, 'Sorry, something went wrong. Please try /quiz again.');
         }
+        ack();
         return;
       }
 
@@ -1503,10 +1691,10 @@ async function handleWebhookPost(req, res) {
     });
     res.status(200).send('EVENT_RECEIVED'); // Still send 200 to avoid retries
   }
-  }); // End of runWithCorrelation
+  }, { send: sendText, lang: () => senderLang })); // End of runWithCorrelation
 }
 
-// Webhook endpoint (POST) is mounted via bot/gateway/webhook.routes.js
+// Note: POST /webhook is now handled by WhatsApp Gateway router mounted above
 
 /**
  * Handle document messages (classroom audio or lesson plan uploads for coaching)
@@ -1525,6 +1713,9 @@ async function handleDocumentMessage(message, from, user) {
   }
 
   try {
+    // A chapter the teacher was asked to send for a test paper.
+    if (await routeTestPaperDocument({ user, from, message })) return;
+
     const documentId = message.document.id;
     const mimeType = message.document.mime_type || '';
 
@@ -1559,8 +1750,28 @@ async function handleDocumentMessage(message, from, user) {
           mimeType
         });
 
+        // OBSERVE: a coach's lesson recording usually arrives as a FILE. It is
+        // an observation (or a debrief), never the coach's own coaching — the
+        // observe router decides before the self-coaching threshold below.
+        const ObserveGate = require('./shared/services/observe/observe-gate');
+        if (user && ObserveGate.isObserveEnabled() && ObserveGate.isSchoolLeader(user)) {
+          const { routeLeaderAudio } = require('./shared/services/observe/observe-audio-router');
+          const { getOrCreateSession: observeSession } = require('./shared/database/bot-helpers');
+          const handled = await routeLeaderAudio({
+            user,
+            from,
+            audioId: documentId,
+            sessionId: await observeSession(user.id),
+            isLongAudio: audioDurationRounded >= require('./shared/config/coaching-audio').classroomAudioThresholdSeconds(),
+            durationSeconds: audioDurationRounded || null,
+            mimeType,
+          });
+          if (handled) return;
+        }
+
         // Check if audio is 15+ minutes (900 seconds) = classroom audio
-        const CLASSROOM_AUDIO_THRESHOLD = 900; // 15 minutes in seconds
+        // COACHING_MIN_AUDIO_SECONDS, default 900 (15 minutes)
+        const CLASSROOM_AUDIO_THRESHOLD = require('./shared/config/coaching-audio').classroomAudioThresholdSeconds();
 
         if (audioDurationRounded >= CLASSROOM_AUDIO_THRESHOLD) {
           logToFile('🎓 CLASSROOM AUDIO DETECTED (15+ minutes)', {
@@ -1678,20 +1889,17 @@ app.get('/stats', (req, res) => {
  * Health check endpoint
  */
 app.get('/health', (req, res) => {
-  const path = require('path');
-  const versionFile = path.join(__dirname, 'VERSION');
-  let version = require('./package.json').version; // single source: package.json, overridden by VERSION file below
-
-  try {
-    if (fs.existsSync(versionFile)) {
-      version = fs.readFileSync(versionFile, 'utf8').trim();
-    }
-  } catch (err) {
-    console.error('Error reading VERSION file:', err);
-  }
+  const version = require('./shared/utils/version').rumiVersion();
+  // `channels` names a persistent-connection channel's state (Matrix today);
+  // `status` is 'degraded' when Matrix is the only channel and not connected
+  // (channel-health.js). Still HTTP 200: hosting platforms restart a service
+  // whose health check fails, and a restart cannot bring a homeserver up --
+  // the bot already retries the connection itself.
+  const report = require('./shared/services/messaging/channel-health').healthReport(process.env);
 
   res.json({
-    status: 'healthy',
+    status: report.status,
+    channels: report.channels,
     service: 'Rumi WhatsApp Bot',
     version: version,
     uptime: process.uptime(),
@@ -1700,123 +1908,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-/**
- * Internal API: Send password reset code via WhatsApp
- * Called by portal backend to send reset codes through the main bot
- *
- * Security: API key authentication required
- */
-app.post('/api/internal/send-password-reset', async (req, res) => {
-  try {
-    // Verify API key (shared secret between portal and main bot)
-    const apiKey = req.headers['x-api-key'];
-    const expectedApiKey = process.env.INTERNAL_API_KEY;
-
-    if (apiKey !== expectedApiKey) {
-      logToFile('❌ Unauthorized internal API call', {
-        endpoint: '/api/internal/send-password-reset',
-        ip: req.ip
-      });
-      return res.status(401).json({
-        success: false,
-        error: 'Unauthorized'
-      });
-    }
-
-    const { phoneNumber, code, firstName, language } = req.body;
-
-    if (!phoneNumber || !code || !firstName) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: phoneNumber, code, firstName'
-      });
-    }
-
-    logToFile('📞 Internal API: Sending password reset code', {
-      phoneNumber,
-      language,
-      caller: 'portal-backend'
-    });
-
-    // Multilingual reset code messages
-    const messages = {
-      en: `Hi ${firstName}! 👋
-
-Your Rumi portal password reset code is:
-
-*${code}*
-
-This code expires in 10 minutes.
-
-If you didn't request this, please ignore this message.`,
-
-      ur: `ہیلو ${firstName}! 👋
-
-آپ کا Rumi پورٹل پاسورڈ ری سیٹ کوڈ ہے:
-
-*${code}*
-
-یہ کوڈ 10 منٹ میں ختم ہو جائے گا۔
-
-اگر آپ نے یہ درخواست نہیں کی تو براہ کرم اس پیغام کو نظر انداز کریں۔`,
-
-      ar: `مرحباً ${firstName}! 👋
-
-رمز إعادة تعيين كلمة مرور بوابة Rumi الخاص بك هو:
-
-*${code}*
-
-تنتهي صلاحية هذا الرمز خلال 10 دقائق.
-
-إذا لم تطلب ذلك، يرجى تجاهل هذه الرسالة.`,
-
-      es: `¡Hola ${firstName}! 👋
-
-Tu código de restablecimiento de contraseña del portal Rumi es:
-
-*${code}*
-
-Este código expira en 10 minutos.
-
-Si no solicitaste esto, ignora este mensaje.`
-    };
-
-    // Get localized message (fallback to English)
-    const message = messages[language] || messages.en;
-
-    // Send WhatsApp message using main bot's WhatsApp service
-    const sent = await WhatsAppService.sendMessage(phoneNumber, message);
-
-    if (sent) {
-      logToFile('✅ Password reset code sent via WhatsApp', {
-        phoneNumber,
-        language
-      });
-      res.json({
-        success: true,
-        message: 'Password reset code sent successfully'
-      });
-    } else {
-      logToFile('❌ Failed to send password reset code', {
-        phoneNumber
-      });
-      res.status(500).json({
-        success: false,
-        error: 'Failed to send WhatsApp message'
-      });
-    }
-  } catch (error) {
-    logToFile('❌ Internal API error', {
-      endpoint: '/api/internal/send-password-reset',
-      error: error.message,
-      stack: error.stack
-    });
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
-  }
-});
+// Internal API: send a portal password reset code (see the module's header).
+app.post('/api/internal/send-password-reset', PortalInternalEndpoint.sendPasswordReset);
 
 /**
  * Exit code for "the WhatsApp session is gone; a human must re-pair". Chosen as
@@ -1873,6 +1966,26 @@ const PERSISTENT_CONNECTION_DRIVERS = {
     onLogoutExit: null,
     close: () => require('./shared/services/messaging/discord-connection').close(),
   },
+  matrix: {
+    isActive: (env) => require('./shared/config/feature-availability').resolveActiveChannels(env).includes('matrix'),
+    attachInbound: async (dispatch) => {
+      // This process owns the one sync connection; every other process sends
+      // through it over the relay (matrix-outbound-relay.js), by default.
+      require('./shared/services/messaging/matrix-outbound-relay').ownConnectionInThisProcess();
+      const matrixEventsAdapter = require('./shared/services/messaging/inbound/matrix-events.adapter');
+      await matrixEventsAdapter.attach(dispatch);
+    },
+    // Same reasoning as Discord: a long-lived access token has no mid-session
+    // "you have been logged out" event -- a revoked MATRIX_ACCESS_TOKEN
+    // surfaces as a sync-start failure (at connect() time, inside
+    // attachInbound's own try/catch below), not a live-session event.
+    onLogoutExit: null,
+    // A homeserver deployed alongside the bot is often still starting when
+    // the bot boots; one failed connect must not leave Matrix down until the
+    // next restart. See wireBaileysInboundIfSelected below.
+    retryAttach: true,
+    close: () => require('./shared/services/messaging/matrix-connection').close(),
+  },
 };
 
 /**
@@ -1882,14 +1995,23 @@ const PERSISTENT_CONNECTION_DRIVERS = {
  * POST does. No-op for any driver not in PERSISTENT_CONNECTION_DRIVERS
  * (Express's own routes already handle those). Failures here are logged,
  * never thrown — a connection problem must not crash server boot.
+ *
+ * A driver with `retryAttach` (Matrix) keeps trying in the background with
+ * capped backoff (channel-health.js#attachWithRetry) instead of giving up
+ * after one failure; the others are attempted once, as before.
  */
 async function wireBaileysInboundIfSelected() {
-  for (const driver of Object.values(PERSISTENT_CONNECTION_DRIVERS)) {
+  const { attachWithRetry } = require('./shared/services/messaging/channel-health');
+  for (const [channel, driver] of Object.entries(PERSISTENT_CONNECTION_DRIVERS)) {
     if (!driver.isActive(process.env)) continue;
+    if (driver.retryAttach) {
+      attachWithRetry(channel, () => driver.attachInbound(handleWebhookPost)); // never rejects; not awaited, so it never holds up the other drivers
+      continue;
+    }
     try {
       await driver.attachInbound(handleWebhookPost);
     } catch (error) {
-      logToFile('❌ Failed to attach persistent-connection inbound listener', { error: error.message, stack: error.stack });
+      logToFile(`❌ The ${channel} channel did not start: ${error.message}`, { channel, error: error.message, stack: error.stack });
     }
   }
 }
@@ -1957,22 +2079,16 @@ function registerChannelShutdownHandlers() {
  * Express `app` without its listener) does NOT bind to a port.
  */
 function startServer() {
+  // Does coaching_sessions have observation_type yet? Teachers' own coaching
+  // reads depend on it (see own-coaching.js); a missing migration is logged.
+  require('./shared/services/coaching/own-coaching').probe();
   wireBaileysInboundIfSelected();
   registerChannelShutdownHandlers();
   exitOnChannelLogout();
   return app.listen(constants.PORT, () => {
-  // Read version from VERSION file
-  const path = require('path');
-  const versionFile = path.join(__dirname, 'VERSION');
-  let version = require('./package.json').version; // single source: package.json, overridden by VERSION file below
-
-  try {
-    if (fs.existsSync(versionFile)) {
-      version = fs.readFileSync(versionFile, 'utf8').trim();
-    }
-  } catch (err) {
-    console.error('Error reading VERSION file:', err);
-  }
+  const version = require('./shared/utils/version').rumiVersion();
+  // Only a Meta deployment has a Meta webhook to configure (see the module).
+  const { webhookInstructions } = require('./shared/utils/webhook-instructions');
 
   const startupMessage = `\n${'='.repeat(70)}
 🤖 Rumi v${version}
@@ -1987,27 +2103,7 @@ ${'='.repeat(70)}
    All webhook activity is logged to: ${LOGS_DIR}
    Log file: bot-${new Date().toISOString().split('T')[0]}.log
 
-${'='.repeat(70)}
-📋 NEXT STEP: Start ngrok in a NEW terminal window
-${'='.repeat(70)}
-
-   Run this command in a new terminal:
-
-   npx ngrok http ${constants.PORT}${process.env.NGROK_AUTHTOKEN ? ` --authtoken ${process.env.NGROK_AUTHTOKEN}` : ''}
-   ${process.env.NGROK_AUTHTOKEN ? '' : '(first time? add your own token from https://dashboard.ngrok.com → set NGROK_AUTHTOKEN in .env)'}
-
-${'='.repeat(70)}
-
-Then copy the ngrok URL and configure it in Meta:
-   1. Go to: https://developers.facebook.com/apps/
-   2. Navigate to: WhatsApp → Configuration → Webhook
-   3. Paste ngrok URL with /webhook (e.g., https://abc.ngrok-free.app/webhook)
-   4. Verify Token: ${constants.WEBHOOK_VERIFY_TOKEN}
-   5. Subscribe to: messages
-   6. Send a test message to your WhatsApp bot number
-
-${'='.repeat(70)}
-\n`;
+${webhookInstructions(process.env, { port: constants.PORT, verifyToken: constants.WEBHOOK_VERIFY_TOKEN }) || `${'='.repeat(70)}\n`}\n`;
 
   console.log(startupMessage);
   logToFile('🚀 Bot server started', { port: constants.PORT, logsDir: LOGS_DIR });

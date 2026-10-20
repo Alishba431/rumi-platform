@@ -5,6 +5,7 @@ const { getClient } = require('./llm-client');
 const { OPENAI_API_KEY } = require('../utils/constants');
 const { storeConversation } = require('../database/bot-helpers');
 const redisService = require('./cache/railway-redis.service');
+const { nativeFlowIdFor } = require('./messaging/channel-capabilities');
 // CoachingService not used in this file - removed legacy import
 // MediaLibraryService removed - Issue #28: AI Video Generation replaces Media Library
 const LessonPlanningService = require('./lesson-planning.service');
@@ -117,9 +118,12 @@ class MenuService {
             language
           );
 
-          // Send WhatsApp Flow for reading assessment setup
+          // Send WhatsApp Flow for reading assessment setup. flowKind lets a
+          // channel without Flows run the text equivalent, same as /reading test.
           const flowSent = await WhatsAppService.sendFlow(from, {
             flowId: process.env.READING_ASSESSMENT_FLOW_ID,
+            flowKind: 'reading-assessment',
+            flowToken: `${user.id}:reading-assessment:${Date.now()}`,
             header: '📚 Reading Assessment',
             body: 'Let\'s set up a reading assessment for your student. This will help measure their reading fluency and comprehension.',
             footer: 'Takes about 5-10 minutes',
@@ -130,8 +134,17 @@ class MenuService {
           if (flowSent) {
             logToFile('✅ Reading assessment flow sent from menu', { userId: user.id });
             await FeatureIntroService.markFeatureUsed(user.id, 'reading');
+          } else if (nativeFlowIdFor(from, process.env.READING_ASSESSMENT_FLOW_ID)) {
+            // A native Flow IS configured here, so false means the send itself
+            // failed (a passing Graph error): the assessment exists, try again.
+            logToFile('⚠️ Reading assessment flow send failed (menu)', { userId: user.id });
+            await WhatsAppService.sendMessage(from,
+              "I couldn't open the reading assessment right now. Please try again in a moment, or type /menu.");
           } else {
-            throw new Error('Failed to send WhatsApp Flow from menu');
+            // Not an exception: this channel simply cannot offer the assessment.
+            logToFile('⚠️ Reading assessment unavailable on this channel (menu)', { userId: user.id });
+            await WhatsAppService.sendMessage(from,
+              'The reading assessment is not set up on this deployment yet. Type /menu to see what else I can do.');
           }
           break;
 

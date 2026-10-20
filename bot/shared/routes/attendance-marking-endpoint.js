@@ -10,7 +10,11 @@
  *
  * Flow:
  * 1. INIT → MARK_ABSENT screen (roster from the existing Redis session)
- * 2. MARK_ABSENT submit → build records, SUCCESS screen
+ * 2. MARK_ABSENT submit → build records (absent + on leave; everyone else
+ *    present), SUCCESS screen
+ *
+ * Serves both registers: the session's `subject` is 'class' or 'staff', and
+ * its `students` is the roster for either.
  *
  * Created: 2026-08-25
  */
@@ -50,7 +54,7 @@ async function handleMarkingInit(userId) {
  * checked (absent) student ids, everyone else is present.
  * @param {string} userId - User ID
  * @param {string} screen - Current screen ID
- * @param {Object} screenData - { absent_student_ids: string[] }
+ * @param {Object} screenData - { absent_student_ids: string[], leave_student_ids?: string[] }
  * @returns {Object} - SUCCESS screen with records/stats for onFinish delivery
  */
 async function handleMarkingExchange(userId, screen, screenData) {
@@ -64,7 +68,8 @@ async function handleMarkingExchange(userId, screen, screenData) {
   }
 
   const absentIds = screenData.absent_student_ids || [];
-  const records = AttendanceFlowHandler.buildAttendanceRecords(sessionState.students, absentIds);
+  const leaveIds = screenData.leave_student_ids || [];
+  const records = AttendanceFlowHandler.buildAttendanceRecords(sessionState.students, absentIds, leaveIds);
   const stats = AttendanceGeneratorService.calculateSummaryStats(records);
   const classDisplay = AttendanceConversationService.formatClassDisplayName(sessionState.selectedClass);
 
@@ -73,13 +78,15 @@ async function handleMarkingExchange(userId, screen, screenData) {
     listId: sessionState.selectedListId,
     total: stats.total,
     present: stats.present,
-    absent: stats.absent
+    absent: stats.absent,
+    leave: stats.leave
   });
 
   return {
     screen: 'SUCCESS',
     data: {
-      success_message: AttendanceFlowHandler.generateConfirmationMessage(classDisplay, stats),
+      success_message: AttendanceFlowHandler.generateConfirmationMessage(classDisplay, stats, { subject: sessionState.subject === 'staff' ? 'staff' : 'class' }),
+      subject: sessionState.subject === 'staff' ? 'staff' : 'class',
       selectedClass: sessionState.selectedClass,
       selectedListId: sessionState.selectedListId,
       records,

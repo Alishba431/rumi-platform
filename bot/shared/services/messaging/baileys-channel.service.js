@@ -33,6 +33,8 @@
 const fs = require('fs');
 const path = require('path');
 const { logToFile } = require('../../utils/logger');
+const { noteUploadedBytes } = require('../../utils/upload-digest');
+const { redactUrl } = require('../../utils/redact-url');
 const { downloadFromR2, extractKeyFromUrl } = require('../../storage/r2');
 const connection = require('./baileys-connection');
 const pendingOptions = require('./pending-options');
@@ -233,14 +235,14 @@ async function resolveMediaSource(url) {
       // from another bucket, say) — so fall through when we can fetch directly.
       if (!isAbsoluteHttpUrl(url)) throw error;
       logToFile('⚠️ Baileys: R2 download failed — fetching the URL directly instead', {
-        url, error: error.message,
+        url: redactUrl(url), error: redactUrl(error.message),
       });
     }
   }
 
   if (!isAbsoluteHttpUrl(url)) {
     throw new Error(
-      `Cannot send media from "${url}": it is not an absolute URL, and R2 is not configured `
+      `Cannot send media from "${redactUrl(url)}": it is not an absolute URL, and R2 is not configured `
       + '(set R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY to read private objects).'
     );
   }
@@ -405,6 +407,7 @@ async function sendDocumentBuffer(to, buffer, filename, caption) {
 async function sendDocument(to, filePath, filename, caption) {
   try {
     const buffer = fs.readFileSync(filePath);
+    noteUploadedBytes(filePath, buffer); // what the caller's log reports as sent
     return await sendDocumentBuffer(to, buffer, filename, caption);
   } catch (error) {
     logToFile('❌ Baileys: error sending document', { error: error.message });
@@ -428,7 +431,7 @@ async function sendDocumentFromUrl(to, documentUrl, filename, caption) {
     const media = await resolveMediaSource(documentUrl);
     return await sendDocumentBuffer(to, media, filename, caption);
   } catch (error) {
-    logToFile('❌ Baileys: error sending document from URL', { error: error.message, documentUrl });
+    logToFile('❌ Baileys: error sending document from URL', { error: redactUrl(error.message), documentUrl: redactUrl(documentUrl) });
     return false;
   }
 }
@@ -438,7 +441,7 @@ async function sendAudioFromUrl(to, audioUrl) {
     const media = await resolveMediaSource(audioUrl);
     return await sendAudio(to, media);
   } catch (error) {
-    logToFile('❌ Baileys: error sending audio from URL', { error: error.message, audioUrl });
+    logToFile('❌ Baileys: error sending audio from URL', { error: redactUrl(error.message), audioUrl: redactUrl(audioUrl) });
     return false;
   }
 }
@@ -485,7 +488,7 @@ async function sendAudioFromUrlReturningId(to, audioUrl) {
     logToFile('✅ Baileys audio sent (returning id)', { to, id });
     return id;
   } catch (error) {
-    logToFile('❌ Baileys: error sending audio from URL (returning id)', { error: error.message, audioUrl });
+    logToFile('❌ Baileys: error sending audio from URL (returning id)', { error: error.message, audioUrl: redactUrl(audioUrl) });
     return null;
   }
 }
@@ -501,7 +504,7 @@ async function sendImageFromUrl(to, imageUrl, caption = '') {
     const media = await resolveMediaSource(imageUrl);
     return await sendImageBuffer(to, media, caption);
   } catch (error) {
-    logToFile('❌ Baileys: error sending image from URL', { error: error.message, imageUrl });
+    logToFile('❌ Baileys: error sending image from URL', { error: redactUrl(error.message), imageUrl: redactUrl(imageUrl) });
     return false;
   }
 }
@@ -522,7 +525,7 @@ async function sendVideoFromUrl(to, videoUrl, caption = '') {
     const media = await resolveMediaSource(videoUrl);
     return await sendVideo(to, media, null, caption);
   } catch (error) {
-    logToFile('❌ Baileys: error sending video from URL', { error: error.message, videoUrl });
+    logToFile('❌ Baileys: error sending video from URL', { error: redactUrl(error.message), videoUrl: redactUrl(videoUrl) });
     return false;
   }
 }
@@ -586,7 +589,7 @@ async function sendImageWithButtons(to, imageUrl, bodyText, buttons) {
     await rememberMenu(to, 'button_reply', buttons);
     return await sendImageBuffer(to, media, caption);
   } catch (error) {
-    logToFile('❌ Baileys: error sending image with buttons (text fallback)', { error: error.message, imageUrl });
+    logToFile('❌ Baileys: error sending image with buttons (text fallback)', { error: error.message, imageUrl: redactUrl(imageUrl) });
     return false;
   }
 }
@@ -594,15 +597,21 @@ async function sendImageWithButtons(to, imageUrl, bodyText, buttons) {
 async function sendInteractiveMessage(to, listData) {
   try {
     const { header, body, footer, action } = listData;
-    const { sections } = action || {};
-    const options = (sections || []).flatMap((s) => s.rows || []);
+    const { sections, buttons } = action || {};
+    // A Meta interactive is either a list (sections of rows) or reply buttons
+    // ({type:'reply', reply:{id,title}}); both arrive here, and a reply to
+    // buttons must come back as button_reply, as it would from Meta.
+    const isButtons = !sections && Array.isArray(buttons);
+    const options = isButtons
+      ? buttons.map((b) => (b.reply ? { id: b.reply.id, title: b.reply.title } : b))
+      : (sections || []).flatMap((s) => s.rows || []);
     const text = renderOptionsAsText({
       header: header?.text || header,
       body: body?.text || body,
       footer: footer?.text || footer,
       options,
     });
-    await rememberMenu(to, 'list_reply', options);
+    await rememberMenu(to, isButtons ? 'button_reply' : 'list_reply', options);
     return await sendMessage(to, text);
   } catch (error) {
     logToFile('❌ Baileys: error sending interactive list (text fallback)', { error: error.message });

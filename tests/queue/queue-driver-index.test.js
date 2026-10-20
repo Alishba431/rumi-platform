@@ -5,13 +5,15 @@
  * not installed at root test time); bullmq is NOT required unless selected.
  */
 
+const { mockBotDependency } = require('../_helpers/mock-bot-dependency');
+
 function mockCommon() {
-  jest.doMock('aws-sdk', () => ({
+  mockBotDependency('aws-sdk', () => ({
     config: { update: jest.fn() },
     SQS: jest.fn(() => ({})),
-  }), { virtual: true });
+  }));
   jest.doMock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
-  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: jest.fn() }), { virtual: true });
+  jest.doMock('../../bot/shared/services/cache/railway-redis.service', () => ({ set: jest.fn() }));
   jest.doMock('../../bot/shared/utils/structured-logger', () => ({ getCurrentCorrelationId: () => 'c1', logEvent: jest.fn() }));
 }
 

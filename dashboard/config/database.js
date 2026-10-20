@@ -19,7 +19,9 @@ const poolConfig = {
   user: process.env.SUPABASE_DB_USER,
   password: process.env.SUPABASE_DB_PASSWORD,
   database: process.env.SUPABASE_DB_NAME || 'postgres',
-  ssl: { rejectUnauthorized: false },
+  // Hosted Supabase needs SSL. SUPABASE_DB_SSL=off is for a plain Postgres
+  // without it, such as the laptop-local stack (infrastructure/local/).
+  ssl: String(process.env.SUPABASE_DB_SSL || '').trim().toLowerCase() === 'off' ? false : { rejectUnauthorized: false },
 
   // Pool settings
   max: parseInt(process.env.DB_POOL_SIZE || '20', 10),

@@ -125,6 +125,17 @@ describe('the readiness view', () => {
     expect(rendered).toMatch(/rumi pair/);
   });
 
+  it('shows Matrix as connected alongside Slack and Discord when it is active', () => {
+    const rendered = summary.renderReadiness(doctorResult({ activeChannels: ['slack', 'discord', 'matrix'] }), {});
+    expect(rendered).toMatch(/Slack\s+connected/);
+    expect(rendered).toMatch(/Discord\s+connected/);
+    expect(rendered).toMatch(/Matrix\s+connected/);
+  });
+
+  it('leaves Matrix out when it is not configured', () => {
+    expect(summary.renderReadiness(doctorResult({ activeChannels: [] }), {})).not.toContain('Matrix');
+  });
+
   it('reports a failing service with the reason attached', () => {
     const failing = doctorResult({
       ok: false,
@@ -151,6 +162,13 @@ describe('what to do next', () => {
     const rendered = summary.renderNextSteps({ channel: 'meta' });
     expect(rendered).not.toContain('rumi pair');
     expect(rendered).toMatch(/webhook/i);
+  });
+
+  it('says Matrix is connected too when the wizard connected it, and not otherwise', () => {
+    expect(summary.renderNextSteps({ channel: 'baileys', number: '15550101234', matrix: true }))
+      .toMatch(/Matrix is connected too/);
+    expect(summary.renderNextSteps({ channel: 'baileys', number: '15550101234' }))
+      .not.toContain('Matrix');
   });
 
   it('suggests things to try that actually exist as commands', () => {

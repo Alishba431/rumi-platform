@@ -7,7 +7,7 @@
  * parents, so a roster with no numbers gets as far as the class picker and stops.
  */
 
-jest.mock('../../bot/shared/config/supabase', () => ({ from: jest.fn() }), { virtual: true });
+jest.mock('../../bot/shared/config/supabase', () => ({ from: jest.fn() }));
 jest.mock('../../bot/shared/utils/logger', () => ({ logToFile: jest.fn() }));
 
 const StudentListService = require('../../bot/shared/services/student-list.service');

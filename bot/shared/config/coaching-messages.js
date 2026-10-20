@@ -82,6 +82,30 @@ const COACHING_MESSAGES = {
   // {{action}} is substituted at the call site (kept distinct from
   // ${} JS interpolation so this string can be translated 1:1).
   priorActionReminder: en('💡 *Quick reminder:* Last time, you committed to:\n\n_"{{action}}"_\n\nLet\'s see how it went in this session!'),
+
+  // Classroom-photo question: the teacher tapped "Yes" or "Add another"
+  photo_sendNow: en("📸 Send your classroom photo now."),
+
+  // ── Lesson-plan fidelity (LP_FIDELITY_ENABLED) ──────────────────────
+  // The lesson-plan step after a recording, when fidelity is on: a plan can
+  // also be pasted as text.
+  lessonPlan_request_or_paste: en("Great! Send your lesson plan as a document (PDF or Word), or paste its text here as one message."),
+  lessonPlan_linked: en("✅ Got it — I'll compare your lesson with that plan."),
+  lessonPlan_pasted: en("📄 Thanks — I've got your lesson plan. I'll compare your lesson with it."),
+  // One line per fidelity outcome, sent after the report and printed in it.
+  // Each state has its OWN words: the teacher should never have to guess
+  // whether the plan, the recording or our system was the problem.
+  // {{delivered}}, {{total}} and {{band}} are filled at the call site.
+  fidelity_measured: en("📋 *Did the lesson follow the plan?* {{delivered}} of {{total}} planned moves were seen in your recording — {{band}}. Your report lists each move with the moment it happened."),
+  fidelity_lesson_mismatch: en("📋 *Did the lesson follow the plan?* This recording doesn't seem to match the lesson plan you linked, so the planned moves weren't seen. If you taught a different lesson, link that lesson's plan next time."),
+  fidelity_no_timings: en("📋 Your lesson wasn't compared with your plan this time: the recording came back without speech timings, so moves couldn't be matched to moments. That's a recording problem, not a teaching one."),
+  fidelity_recording_unusable: en("📋 Your lesson wasn't compared with your plan this time: the recording was too unclear to judge the planned moves. That's a recording problem, not a teaching one."),
+  fidelity_no_plan: en("📋 No lesson plan was linked, so this lesson wasn't compared with a plan. Next time, pick or send the plan you meant to teach."),
+  fidelity_plan_unreadable: en("📋 I couldn't read your lesson plan, so this lesson wasn't compared with it. Next time, send it as a Word file or paste the text (photos and scanned pages can't be read yet)."),
+  fidelity_grader_failed: en("📋 The lesson-plan check couldn't run this time because of a problem on our side. The rest of your report is complete."),
+  fidelity_band_high: en("you followed your plan closely"),
+  fidelity_band_partial: en("you followed part of your plan"),
+  fidelity_band_low: en("most of your plan wasn't seen"),
 };
 
 /**

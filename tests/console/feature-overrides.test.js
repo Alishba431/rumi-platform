@@ -97,7 +97,7 @@ describe('ids are explicit and stable', () => {
   });
 });
 
-describe('required services and channels have no switch', () => {
+describe('required services have no switch; additive channels do', () => {
   it('exposes no override for the database, the LLM or Redis', () => {
     // A "turn off Supabase" switch would be a self-destruct button.
     const ids = new Set(fa.FEATURES.map((f) => f.id));
@@ -106,12 +106,19 @@ describe('required services and channels have no switch', () => {
     }
   });
 
-  it('leaves channel resolution untouched by overrides', () => {
-    // resolveChannelDriver and resolveActiveChannels are consulted at require
-    // time by messaging/index.js; an override there would be misleading at best.
+  it('a channel switch stops the channel: resolveActiveChannels leaves it out', () => {
+    // The console's channel switch used to change only the console's display;
+    // the bot connects and routes from resolveActiveChannels. It is read at
+    // require time, so the switch applies at the next restart.
     const env = { ...KEYED, SLACK_BOT_TOKEN: 'x'.repeat(30), SLACK_SIGNING_SECRET: 'y'.repeat(30) };
-    overrides.load({ ...env, RUMI_FEATURE_CHANNEL_SLACK: 'off' });
     expect(fa.resolveActiveChannels(env)).toContain('slack');
+    overrides.load({ ...env, RUMI_FEATURE_CHANNEL_SLACK: 'off' });
+    expect(fa.resolveActiveChannels(env)).not.toContain('slack');
+  });
+
+  it('never switches the WhatsApp-family driver', () => {
+    overrides.load({ RUMI_FEATURE_CHANNEL_META: 'off', RUMI_FEATURE_CHANNEL_BAILEYS: 'off' });
+    expect(fa.resolveChannelDriver({ CHANNEL_DRIVER: 'baileys' })).toBe('baileys');
   });
 
   it('does not change missingRequired', () => {

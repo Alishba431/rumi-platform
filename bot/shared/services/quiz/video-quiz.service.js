@@ -6,7 +6,7 @@
  *   teacher picks a video -> video delivered -> 3 s pause -> "want the quiz?"
  *   -> yes -> 15 questions, one at a time, each with per-answer feedback
  *   -> finish -> survey covering the video AND the quiz
- *   -> optionally: share it with her class (see video-quiz-share.service.js)
+ *   -> optionally: share it with their class (see video-quiz-share.service.js)
  *
  * WHY A SEPARATE SERVICE FROM quiz-session.service.js
  * The parent quiz is adaptive: it picks the next question by difficulty from a
@@ -25,19 +25,113 @@ const { logToFile } = require('../../utils/logger');
 const { logEvent } = require('../../utils/structured-logger');
 const render = require('./video-quiz-render.service');
 const sender = require('./video-quiz-sender.service');
+// sender.sendPhase() already throttles every message it sends, but
+// this file makes two DIRECT WhatsAppService calls of its own (the "Here we
+// go" opener below and "Question N of M" in sendNextQuestion) that bypassed
+// the throttle entirely. Meta's per-recipient rate limit counts every send
+// regardless of which code path made it, so those two "side door" sends
+// still spent the recipient's real budget while the throttle's own window
+// never learned about them — a real production session, shortly after the
+// throttle shipped, hit exactly this gap.
+const rateLimiter = require('./video-quiz-rate-limiter.service');
+const Funnel = require('./quiz-funnel');
+const { resolveUx, clampLanguage } = require('../../config/ux-strings');
+
+// Chrome a CHILD reads around the questions, in the quiz language.
+const ux = (key, language, params) => resolveUx(key, { language, params });
 
 const QUESTIONS_PER_SESSION = 15;
-const OFFER_DELAY_MS = 3000;          // operator spec: 3 s after the video
+const OFFER_DELAY_MS = 3000;          // the offer lands 3 s after the video
 const STATE_TTL_SECS = 24 * 60 * 60;
 const OFFER_TTL_SECS = 60 * 60;
+
+// A WhatsApp per-recipient-pair rate limit (#131056) hit mid-session
+// in production (confirmed in the logs — 8x whatsapp.message.failed in the
+// same session window). The old pickerFailed branch skipped the question and
+// recursed into the next one with ZERO delay, so every remaining question in
+// the session failed the same way within milliseconds — a 15-question quiz
+// silently completed at 10. A short backoff gives a transient rate limit a
+// chance to clear; the cap stops the quiz from hammering a limit that isn't
+// clearing, and ends gracefully instead of cascading through every slot.
+//
+// WHAT "ENDS" MEANS. Giving up used to FINISH the session on whatever had been
+// answered: a child who answered one question and then could not be sent the
+// second was scored 1/1 = 100%, sent a "mastered" scorecard, and counted at
+// full marks in the class report (sandbox, a question card the bot could not
+// fetch). Now the two budgets below mean two different things:
+//   - MAX_CONSECUTIVE_SEND_FAILURES is PER QUESTION. A question that still
+//     cannot be sent after that many tries is skipped for this session and the
+//     quiz carries on with the next one (skipQuestion). The scored total is
+//     what was actually asked.
+//   - MAX_FAILED_SENDS_IN_A_ROW is ACROSS questions. When that many pickers in
+//     a row fail — a skipped question AND the next one straight after — the
+//     channel is down, not the question, and the session ends UNFINISHED
+//     (endUnfinished): no score, no scorecard. It is 5, not 6, so a storm still
+//     costs at most five picker attempts, the cap the rate-limit fix set.
+const SEND_FAILURE_BACKOFF_MS = 2500;
+const MAX_CONSECUTIVE_SEND_FAILURES = 3;
+const MAX_FAILED_SENDS_IN_A_ROW = 5;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const stripPlus = (p) => (p && p.startsWith('+') ? p.slice(1) : p);
 const STATE_KEY = (phone) => `videoquiz:${stripPlus(phone)}:active`;
 const OFFER_KEY = (phone) => `videoquiz:${stripPlus(phone)}:offer`;
+// The run's language, kept per phone for a week — longer than the offer (1 h)
+// and the session state (24 h). Two lines fire exactly when those are gone: a tap
+// on a lapsed offer, and a tap on an answer after the quiz ended. Without this
+// they could only answer in the floor language, whatever the run spoke.
+const LANG_KEY = (phone) => `videoquiz:${stripPlus(phone)}:lang`;
+const LANG_TTL_SECS = 7 * 24 * 60 * 60;
+
+async function rememberRunLanguage(phone, language) {
+  try {
+    await redisService.set(LANG_KEY(phone), clampLanguage(language), LANG_TTL_SECS);
+  } catch (err) {
+    logToFile('❌ video-quiz: could not remember the run language', { error: err.message }, 'error');
+  }
+}
+
+/** The language of this phone's last video-quiz run, else the floor. */
+async function lastRunLanguage(phone) {
+  try {
+    return clampLanguage(await redisService.get(LANG_KEY(phone)));
+  } catch (err) {
+    logToFile('❌ video-quiz: could not read the run language', { error: err.message }, 'error');
+    return clampLanguage(null);
+  }
+}
+
+// A per-recipient send throttle (video-quiz-rate-limiter.
+// service.js) can back a single handleAnswer up for minutes, so overlapping
+// taps on ONE phone (a concurrent answer to a different question, a Flow
+// submission racing a button tap) used to interleave inside that answer-phase
+// send, each reading the same stale `state.index` and each writing an
+// increment on top of it — a lost update. This lock serialises the whole
+// answer path per phone; see acquireAnswerLock/handleAnswer/handleMultiAnswer.
+const ANSWER_LOCK_KEY = (phone) => `videoquiz:${stripPlus(phone)}:answerlock`;
+// Poll budget while WAITING for someone else's lock, not the lock's own TTL.
+const ANSWER_LOCK_WAIT_MS = 30 * 1000;
+const ANSWER_LOCK_STEP_MS = 250;
+// The lock must outlive the worst realistic single handleAnswer/
+// handleMultiAnswer run, so a crashed handler can't wedge a phone forever,
+// and comfortably outlive a legitimate slow one so it is never torn down
+// mid-send. Worst case inside the critical section: one
+// rateLimiter.throttle() wait for the FULL per-recipient window
+// (rateLimiter.WINDOW_MS, 5 min) during the answer-phase send, plus that
+// phase's own pacing (up to 4 messages — verdict, explanation image,
+// explanation audio — each gapped by sender.GAP_MEDIA_MS), plus
+// sendNextQuestion's own retry ceiling — every failed picker in a row across a
+// skipped question and the one after it (MAX_FAILED_SENDS_IN_A_ROW *
+// SEND_FAILURE_BACKOFF_MS, defined above). 300_000 + 4*1_200 + 5*2_500 =
+// 317_300 ms; doubled for margin.
+const ANSWER_LOCK_TTL_SECS = Math.ceil(
+  (2 * (rateLimiter.WINDOW_MS + 4 * sender.GAP_MEDIA_MS
+    + MAX_FAILED_SENDS_IN_A_ROW * SEND_FAILURE_BACKOFF_MS)) / 1000,
+);
 
 const OFFER_YES = 'vq_offer_yes';
 const OFFER_NO = 'vq_offer_no';
-// the third way out: she wants it for her class, not for herself.
+// The third way out: the teacher wants it for their class, not for themselves.
 const OFFER_SHARE = 'vq_offer_share';
 
 // ─── Offer ──────────────────────────────────────────────────────────────────
@@ -66,9 +160,10 @@ async function quizForVideo(videoId) {
  * Two surveys about the same video, 30 s apart, is the thing to avoid.
  */
 async function offerAfterVideo({ userId, phone, video, language = 'en', deliveryId = null }) {
-  // Region gate: the quiz corpus belongs to the bundled Pakistani-curriculum
-  // video library. Deployments outside region='pakistan' see the video exactly
-  // as before, with no offer — the standalone survey fires instead.
+  // Region gate: video quizzes are switched on per region
+  // (region_features.video_quizzes_enabled). With the flag off the video is
+  // delivered exactly as before — no offer, the standalone survey untouched —
+  // and the gate sits in front of the quiz lookup, so nothing is read.
   const { isVideoQuizzesEnabled } = require('../region-features.service');
   const { detectRegion } = require('../../utils/region');
   if (!(await isVideoQuizzesEnabled(detectRegion()))) return false;
@@ -88,12 +183,13 @@ async function sendOffer({ userId, phone, video, quiz, language, deliveryId }) {
     quizId: quiz.id, videoId: video.id, userId, deliveryId,
     topic: quiz.topic, language,
   }, OFFER_TTL_SECS);
+  await rememberRunLanguage(phone, language);
 
   const t = offerStrings(language);
   await WhatsAppService.sendInteractiveButtons(phone, {
     body: t.body(video.clean_title || quiz.topic),
     // Exactly three — WhatsApp's hard cap on reply buttons. Order is deliberate:
-    // taking it herself first (the common case), then the class route, then out.
+    // taking it themselves first (the common case), then the class route, then out.
     buttons: [
       { id: OFFER_YES, title: t.yes },
       { id: OFFER_SHARE, title: t.share },
@@ -107,6 +203,72 @@ async function sendOffer({ userId, phone, video, quiz, language, deliveryId }) {
       .eq('id', deliveryId);
   }
   logEvent('video_quiz.offered', { userId, videoId: video.id, quizId: quiz.id });
+  // Sibling of the offer_answered already logged in
+  // handleOfferButton, so one query answers the whole quiz-offer funnel.
+  // sessionId is null here: no session exists until the offer is accepted.
+  logEvent('video_quiz.offer_shown', {
+    kind: 'quiz', sessionId: null, quizId: quiz.id, source: 'video_solo', language,
+  });
+}
+
+/**
+ * TODO: same catalog migration as offerStrings(). Kept as an explicit
+ * per-language map — not a hardcoded English string — so the shape is already
+ * per-language and the sweep is mechanical.
+ */
+function lessonStrings(language) {
+  const map = {
+    en: {
+      ack: '🎬 First, here is the lesson. Watch it, then I will ask you about it.',
+      caption: (grade, subject, title) => `📚 ${grade} · ${subject}\n${title}`,
+    },
+    ur: {
+      ack: '🎬 پہلے یہ سبق دیکھیں۔ پھر میں آپ سے اس کے بارے میں سوال کروں گی۔',
+      caption: (grade, subject, title) => `📚 ${grade} · ${subject}\n${title}`,
+    },
+  };
+  return map[language] || map.en;
+}
+
+/**
+ * Send the lesson a shared link points at, before its quiz.
+ *
+ * BEST-EFFORT BY DESIGN, and that is the whole contract. 14 of 884 R2 objects
+ * 404 and 6 rows are not migrated; a child who came to answer questions must
+ * never be dead-ended by a missing file. Every failure path logs and returns
+ * false, and the caller starts the quiz regardless.
+ *
+ * Mirrors what /video already does for teachers, including the pre-send ack —
+ * that path learned the hard way that a silent 5-15 s upload reads as a hang.
+ */
+async function sendLessonFirst(phone, videoId, language) {
+  try {
+    const { data: row, error } = await supabase
+      .from('student_videos')
+      .select('id, grade, subject, clean_title, r2_url, migration_status')
+      .eq('id', videoId)
+      .single();
+    if (error || !row || row.migration_status !== 'done' || !row.r2_url) {
+      logEvent('video_quiz.lesson_skipped', {
+        videoId, why: (!row || error) ? 'not_found' : 'not_migrated',
+      });
+      return false;
+    }
+    const s = lessonStrings(language);
+    const grade = /^\d+$/.test(String(row.grade)) ? `Grade ${row.grade}` : String(row.grade);
+    await WhatsAppService.sendMessage(phone, s.ack);
+    const ok = await WhatsAppService.sendVideoFromUrl(
+      phone, row.r2_url, s.caption(grade, row.subject, row.clean_title));
+    logEvent(ok ? 'video_quiz.lesson_sent' : 'video_quiz.lesson_failed', {
+      videoId, grade: row.grade, subject: row.subject,
+    });
+    return !!ok;
+  } catch (err) {
+    logToFile('⚠️ video-quiz: lesson send threw, starting the quiz anyway', {
+      videoId, error: err.message,
+    });
+    return false;
+  }
 }
 
 /**
@@ -122,7 +284,7 @@ function offerStrings(language) {
         + `15 quick questions — I'll tell you how you did after each one. `
         + `Or send it straight to your class.`,
       yes: 'Yes, start', no: 'No thanks',
-      // . WhatsApp truncates a reply-button title past 20 characters
+      // WhatsApp truncates a reply-button title past 20 characters
       // SILENTLY, so these are counted, not eyeballed: 16 and 14.
       share: 'Send to my class',
     },
@@ -144,8 +306,8 @@ async function handleOfferButton(buttonId, phone) {
   }
   const offer = await redisService.get(OFFER_KEY(phone));
   if (!offer) {
-    await WhatsAppService.sendMessage(phone,
-      "That quiz offer has expired — pick the video again and I'll offer it fresh.");
+    // The offer (and its language) is gone; the run's language outlives it.
+    await WhatsAppService.sendMessage(phone, ux('vqOfferExpired', await lastRunLanguage(phone)));
     return true;
   }
   await redisService.delete(OFFER_KEY(phone));
@@ -155,19 +317,21 @@ async function handleOfferButton(buttonId, phone) {
   if (offer.deliveryId) {
     await supabase.from('video_quiz_deliveries').update({
       // 'shared' is its own answer, not a flavour of accepted: a teacher who
-      // sends it to her class without taking it is a different behaviour from
-      // one who sits the quiz, and collapsing them would hide that.
+      // sends it to their class without taking it is a different behaviour
+      // from one who sits the quiz, and collapsing them would hide that.
       quiz_response: shared ? 'shared' : (accepted ? 'accepted' : 'declined'),
       quiz_responded_at: new Date().toISOString(),
     }).eq('id', offer.deliveryId);
   }
+  // choice is a stable token, never the button title.
+  const choice = shared ? 'share' : (accepted ? 'yes' : 'no');
   logEvent('video_quiz.offer_answered', {
-    userId: offer.userId, quizId: offer.quizId, accepted, shared,
+    userId: offer.userId, quizId: offer.quizId, accepted, shared, kind: 'quiz', choice,
   });
 
   if (shared) {
-    // Straight to the class link — no solo session, so she is never sent
-    // question 1 while also holding the message she is meant to forward.
+    // Straight to the class link — no solo session, so the teacher is never
+    // sent question 1 while also holding the message they are meant to forward.
     const VideoQuizShare = require('./video-quiz-share.service');
     await VideoQuizShare.deliverClassLink({
       quizId: offer.quizId, videoId: offer.videoId, userId: offer.userId,
@@ -179,7 +343,7 @@ async function handleOfferButton(buttonId, phone) {
   if (!accepted) {
     // Declined: the video-only survey fires, as it always did.
     const StudentVideoFeedback = require('../student-video-feedback.service');
-    await WhatsAppService.sendMessage(phone, 'No problem — enjoy the video!');
+    await WhatsAppService.sendMessage(phone, ux('vqOfferDeclined', offer.language));
     StudentVideoFeedback.scheduleFeedbackPrompt({
       videoId: offer.videoId, userId: offer.userId, phone,
       context: { language: offer.language, scope: 'video', deliveryId: offer.deliveryId },
@@ -197,18 +361,69 @@ async function handleOfferButton(buttonId, phone) {
 // ─── Session ────────────────────────────────────────────────────────────────
 
 /**
+ * The order the questions are ASKED in.
+ *
+ * A transcript quiz's `external_id` is `tq:<quizId>:<sloId>:<n>` (see
+ * transcript-quiz-generate.service.js), so the DB's own `order('external_id')`
+ * walks the bank in SLO-id STRING order — which has nothing to do with the
+ * order the cards were numbered in. A transcript card's printed number is its
+ * `sort_order + 1` (renderCards numbers `i + 1` from `sort_order`), so the
+ * chrome counter ("Question N of M") only agrees with the card's own printed
+ * number when the session itself asks questions in `sort_order`.
+ *
+ * The video bank has no such mismatch — it is left exactly as before:
+ * `leg:`-prefixed rows first, then the rest, each group in the order the DB
+ * returned it (by design — the legacy bank is the media-rich one, so
+ * a child gets the richer items first).
+ *
+ * `Array.prototype.sort` is stable in Node (V8 has guaranteed this since
+ * Node 11), so a tie (missing/equal `sort_order`) keeps the DB's own order,
+ * and a null/undefined `sort_order` sorts last rather than first.
+ */
+function orderForSession(questions) {
+  if (!questions.length) return [];
+  const isTranscriptBank = questions.every((q) => (q.external_id || '').startsWith('tq:'));
+  if (isTranscriptBank) {
+    return [...questions].sort((a, b) => {
+      const an = a.sort_order == null ? Infinity : a.sort_order;
+      const bn = b.sort_order == null ? Infinity : b.sort_order;
+      return an - bn;
+    });
+  }
+  const legacy = questions.filter((q) => (q.external_id || '').startsWith('leg:'));
+  const generated = questions.filter((q) => !(q.external_id || '').startsWith('leg:'));
+  return [...legacy, ...generated];
+}
+
+/**
  * Pick the questions and open a session.
  *
- * SELECTION: legacy first, generated as top-up (operator decision). The legacy
- * bank is the media-rich one — real recorded audio, real illustration — so a
- * child gets the richer items before any generated text MCQ. Ordered within
- * each source by sort_order so a video's questions arrive in their authored
- * sequence rather than shuffled.
+ * SELECTION: legacy first, generated as top-up for the
+ * video bank; a transcript bank is ordered by `sort_order` instead — see
+ * `orderForSession` above for why the two banks need different rules.
  */
+/**
+ * The teacher's own run of their class link — never a child. A share_link
+ * session carries a user id ONLY then: every child's share_link session is
+ * inserted with userId null, and the self-test passes the teacher's id
+ * (teacher-self-test.js explains the marker; the report excludes the same run).
+ * The child funnel stages say so (`kind: 'self_test'`), so the funnel watcher
+ * counts children, not the teacher checking the link. A video_solo run also
+ * carries a user id, but it has no class link and is not a class quiz at all.
+ */
+const SELF_TEST = 'self_test';
+function isSelfTestRun({ source, userId } = {}) {
+  return source === 'share_link' && Boolean(userId);
+}
+
 async function startSession({ phone, userId, quizId, videoId, language, deliveryId,
                               source = 'video_solo', studentName = null,
                               studentClass = null, shareCodeId = null,
                               studentId = null, invitedByStudentId = null }) {
+  // Every run starts here — the solo one after an offer, and a child's from a
+  // class link, which never saw an offer — so this is where the phone learns the
+  // run's language for the taps that arrive after the run is over.
+  await rememberRunLanguage(phone, language);
   const { data: questions, error } = await supabase
     .from('quiz_questions')
     .select('id, external_id, sort_order')
@@ -218,28 +433,35 @@ async function startSession({ phone, userId, quizId, videoId, language, delivery
 
   if (error || !questions || !questions.length) {
     logToFile('❌ video-quiz: no questions for quiz', { quizId, error: error?.message });
-    await WhatsAppService.sendMessage(phone,
-      "Sorry — I couldn't load that quiz just now. Please try again later.");
+    await WhatsAppService.sendMessage(phone, ux('vqNoQuestions', language));
     return null;
   }
 
-  const legacy = questions.filter((q) => (q.external_id || '').startsWith('leg:'));
-  const generated = questions.filter((q) => !(q.external_id || '').startsWith('leg:'));
-  const chosen = [...legacy, ...generated].slice(0, QUESTIONS_PER_SESSION);
+  const chosen = orderForSession(questions).slice(0, QUESTIONS_PER_SESSION);
+
+  // video_solo (a teacher taking the quiz themselves) never collects
+  // a name — share_link already has one (the child gave it at join time). For
+  // the solo path, look their own name up so the scorecard isn't anonymous.
+  let takerName = studentName;
+  if (!takerName && source === 'video_solo' && userId) {
+    const { data: user } = await supabase
+      .from('users').select('name').eq('id', userId).maybeSingle();
+    takerName = user?.name || null;
+  }
 
   const { data: session, error: sErr } = await supabase
     .from('quiz_sessions')
     .insert({
       quiz_id: quizId,
       user_id: userId,
-      // the FK to `students` has existed since the schema landed but
+      // The FK to `students` has existed since the schema landed but
       // was never populated. Filling it is what lets a child be recognised on
       // their next quiz, and what ties a run to a person rather than a string.
       student_id: studentId,
-      // set when this child came through a friend's invite. On
+      // Set when this child came through a friend's invite. On
       // completion the friend is told how they did.
       invited_by_student_id: invitedByStudentId,
-      student_name: studentName,
+      student_name: takerName,
       student_class: studentClass,
       share_code_id: shareCodeId,
       source,
@@ -252,19 +474,70 @@ async function startSession({ phone, userId, quizId, videoId, language, delivery
 
   if (sErr || !session) {
     // Checked, not ignored: the parent quiz silently swallowed exactly this
-    // error for months  and nobody noticed the status never moved.
+    // error for months and nobody noticed the status never moved.
     logToFile('❌ video-quiz: could not create session', { quizId, error: sErr?.message });
-    await WhatsAppService.sendMessage(phone,
-      "Sorry — I couldn't start that quiz. Please try again in a moment.");
+    await WhatsAppService.sendMessage(phone, ux('vqStartFailed', language));
     return null;
+  }
+
+  // The delivery row is the offer, the session is the answer — link
+  // them, or the funnel can only be reconstructed by a user+quiz join that
+  // breaks the moment a teacher gets the same video offered twice.
+  if (deliveryId) {
+    const { error: dErr } = await supabase.from('video_quiz_deliveries')
+      .update({ quiz_session_id: session.id })
+      .eq('id', deliveryId);
+    if (dErr) {
+      logToFile('⚠️ video-quiz: could not link session to delivery',
+        { deliveryId, sessionId: session.id, error: dErr.message });
+    }
+  }
+
+  // Count the join here, where every share-code route funnels
+  // (Flow join, chat fallback, returning child, invite) — the old call site
+  // covered one route and its .catch() fallback was dead code, because
+  // supabase .rpc() resolves with {error}, it never rejects.
+  if (shareCodeId) {
+    try {
+      const { error: rpcErr } = await supabase
+        .rpc('increment_share_code_uses', { code_id: shareCodeId });
+      if (rpcErr) {
+        logToFile('⚠️ video-quiz: increment_share_code_uses failed, using fallback',
+          { shareCodeId, error: rpcErr.message });
+        const { data: sc } = await supabase.from('quiz_share_codes')
+          .select('uses_count').eq('id', shareCodeId).maybeSingle();
+        await supabase.from('quiz_share_codes')
+          .update({ uses_count: (sc?.uses_count || 0) + 1 })
+          .eq('id', shareCodeId);
+      }
+    } catch (e) {
+      // Counting must never block a child's quiz from starting.
+      logToFile('⚠️ video-quiz: increment_share_code_uses threw',
+        { shareCodeId, error: e.message });
+    }
+  }
+
+  // The quiz's STREAM (quizzes.quiz_source) for the funnel — `source` above is
+  // the session engine, not the stream. One primary-key read, and a failure is
+  // a missing label, never a child whose quiz did not start.
+  let quizSource = null;
+  try {
+    const { data: qs, error: qsErr } = await supabase.from('quizzes').select('quiz_source').eq('id', quizId).maybeSingle();
+    if (qsErr) throw new Error(qsErr.message);
+    quizSource = (qs && qs.quiz_source) || null;
+  } catch (e) {
+    logToFile('⚠️ video-quiz: quiz stream unreadable at session start (the quiz goes on)', { quizId, error: e.message });
   }
 
   const state = {
     sessionId: session.id, quizId, videoId, userId, language, deliveryId, source,
+    quizSource,
     shareCodeId,
-    // carried so the invite offer at the end knows who to attribute it
+    // Carried so the invite offer at the end knows who to attribute it
     // to — without it we would offer an invite we cannot report back on.
     studentId,
+    // Carried so finish() can put a name on the scorecard.
+    takerName,
     questionIds: chosen.map((q) => q.id),
     index: 0, correct: 0, answered: 0,
     currentQuestionId: null,
@@ -273,9 +546,28 @@ async function startSession({ phone, userId, quizId, videoId, language, delivery
   logEvent('video_quiz.session_started', {
     sessionId: session.id, quizId, source, questions: chosen.length,
   });
+  Funnel.emit('child_joined', {
+    quiz_id: quizId, session_id: session.id, share_code_id: shareCodeId, source: quizSource,
+    ...(isSelfTestRun({ source, userId }) ? { kind: SELF_TEST } : {}),
+  });
 
-  await WhatsAppService.sendMessage(phone,
-    `Here we go — ${chosen.length} questions. Take your time!`);
+  // A child who arrived on a shared class link has NOT seen the
+  // lesson — the teacher sent them a link, not a classroom. Send it before the
+  // first question. Gated on share_link because a teacher who reached this
+  // quiz through /video has just watched the video (their source is video_solo).
+  //
+  // AWAITED deliberately. WhatsApp does not guarantee ordering for rapid
+  // sends, so question 1 firing during a 5-15 s upload is the same class of bug
+  // as the R18 out-of-order clip: a race, not a layout problem.
+  //
+  // A TRANSCRIPT quiz has no lesson video (video_id null): the lesson was
+  // the teacher's own class, so there is nothing to send first.
+  if (source === 'share_link' && videoId) {
+    await sendLessonFirst(phone, videoId, language);
+  }
+
+  await rateLimiter.throttle(phone);
+  await WhatsAppService.sendMessage(phone, ux('vqHereWeGo', language, { n: chosen.length }));
   await sendNextQuestion(phone, state);
   return state;
 }
@@ -286,113 +578,564 @@ async function sendNextQuestion(phone, state) {
   const questionId = state.questionIds[state.index];
   const { data: q, error } = await supabase
     .from('quiz_questions')
-    .select('id, question_text, option_a, option_b, option_c, option_d, correct_option, '
+    // external_id: video-quiz-render.service.js's displayOrder seeds the
+    // shuffle on external_id || id — without it this re-select shuffles the
+    // options differently from the card the child was actually shown.
+    .select('id, external_id, question_text, option_a, option_b, option_c, option_d, correct_option, '
             + 'explanation, option_feedback, media, render_pattern')
     .eq('id', questionId)
     .single();
   if (error || !q) {
-    logToFile('⚠️ video-quiz: question missing, skipping', { questionId });
-    state.index += 1;
-    await redisService.set(STATE_KEY(phone), state, STATE_TTL_SECS);
+    logToFile('⚠️ video-quiz: question missing, skipping', { questionId, error: error && error.message });
+    // Skipped QUIETLY: a row that cannot be read is usually a quiz rewritten
+    // under a live session, which takes several rows at once, and a line per
+    // row would be a burst of messages. The finish (or its floor) explains.
+    await skipQuestion(phone, state, questionId, 'missing', { tell: false });
     return sendNextQuestion(phone, state);
   }
 
-  const msgs = render.build(q);
-  const ctx = { questionId: q.id, sessionId: state.sessionId };
+  // "Question n of N" used to be a WhatsAppService.sendMessage of its own right
+  // here. It cost a full unit of the recipient's 5-minute send window for
+  // eleven characters of chrome — an eighth of the whole budget across an
+  // 8-question quiz, and the difference between a session that finishes and one
+  // that stalls for three minutes a question. It is now data on the question's
+  // own message (render.build's `counter`), folded into that message's body or
+  // caption by the sender; on a question card it is dropped entirely, because
+  // the card paints the number into the picture itself.
+  const msgs = render.build(q, {
+    questionNumber: state.index + 1, totalQuestions: state.questionIds.length,
+  });
+  // Asked as lettered text only where answerTypedLetter reads the letter: a
+  // lesson quiz with the lesson quiz on. A v1.2.0 video quiz keeps its taps
+  // (numbered text on Baileys and Matrix, answered by number, as on main).
+  const typedAnswers = lessonQuizOn() && await isLessonQuizState(state);
+  const ctx = {
+    questionId: q.id, sessionId: state.sessionId, language: state.language, typedAnswers,
+  };
 
-  await WhatsAppService.sendMessage(phone,
-    `*Question ${state.index + 1} of ${state.questionIds.length}*`);
   await sender.sendPhase(phone, msgs, 'question', ctx);
   const res = await sender.sendPhase(phone, msgs, 'interaction', ctx);
 
   if (res.pickerFailed) {
-    // No tap surface reached the child — do not leave them waiting on a
-    // question they cannot answer.
-    await WhatsAppService.sendMessage(phone,
-      "Sorry — that question didn't load properly. Moving on to the next one.");
-    state.index += 1;
-    await redisService.set(STATE_KEY(phone), state, STATE_TTL_SECS);
+    // No tap surface reached the child. Most of the time this is transient
+    // (a WhatsApp rate-limit window) — retry the SAME question after
+    // a backoff rather than skipping it, so a child doesn't lose a real
+    // question to a send blip that clears a moment later.
+    state.sendFailures = (state.sendFailures || 0) + 1;
+    state.failedSendsInARow = (state.failedSendsInARow || 0) + 1;
+    await saveState(phone, state, 'sendNextQuestion:pickerFailed');
+
+    if (state.failedSendsInARow >= MAX_FAILED_SENDS_IN_A_ROW) {
+      // Nothing is getting through, on this question or the one before it.
+      // Grading what was answered as a finished quiz is the false 100% this
+      // replaces; the session ends unfinished instead.
+      logToFile('⚠️ video-quiz: nothing is getting through — ending the session unfinished', {
+        phone: phone.slice(-4), sessionId: state.sessionId, atIndex: state.index,
+        failedSendsInARow: state.failedSendsInARow,
+      });
+      return endUnfinished(phone, state, 'undeliverable');
+    }
+
+    await sleep(SEND_FAILURE_BACKOFF_MS);
+    if (state.sendFailures >= MAX_CONSECUTIVE_SEND_FAILURES) {
+      // This question will not go. Skip it for this session and carry on: a
+      // question that could not be asked is not in the child's score at all.
+      logToFile('⚠️ video-quiz: question could not be delivered, skipping it', {
+        phone: phone.slice(-4), sessionId: state.sessionId, questionId: q.id, atIndex: state.index,
+      });
+      await skipQuestion(phone, state, q.id, 'undeliverable');
+    }
     return sendNextQuestion(phone, state);
   }
 
+  state.sendFailures = 0;
+  state.failedSendsInARow = 0;
   state.currentQuestionId = q.id;
   state.sentAt = Date.now();
-  await redisService.set(STATE_KEY(phone), state, STATE_TTL_SECS);
+  await saveState(phone, state, 'sendNextQuestion:sent');
   return null;
 }
 
 /**
- * Grade a tap and move on. Returns true if the input belonged to a video quiz.
+ * Take one question out of THIS session: it could not be asked.
+ *
+ * Recorded in `state.skippedIds` rather than removed from `questionIds`, for
+ * two reasons. The next question is derived from the answers table on every
+ * answer (nextIndexFromTruth), and without the record an unanswered question
+ * looks like the next one to ask — the session walked back to it, skipped it
+ * again and re-sent the question the child had just answered. And a question
+ * card paints its own "QUESTION 5 OF 8" into the picture, so positions and the
+ * total in "Question n of N" must not shift under it.
+ *
+ * The child is told which question did not come (`tell`), so the gap in the
+ * numbering is explained, not mysterious. The scored total needs nothing extra:
+ * finish() counts the answers table, and a question that was never asked has
+ * no answer.
  */
-async function handleAnswer(phone, inputId) {
+async function skipQuestion(phone, state, questionId, reason, { tell = true } = {}) {
+  const position = state.index + 1;
+  state.skippedIds = [...(state.skippedIds || []), questionId];
+  state.index += 1;
+  state.sendFailures = 0;
+  state.currentQuestionId = null;
+  await saveState(phone, state, `sendNextQuestion:skipped:${reason}`);
+  logEvent('video_quiz.question_skipped', {
+    sessionId: state.sessionId, questionId, position, reason,
+    questions: (state.questionIds || []).length, skipped: state.skippedIds.length,
+  });
+  if (!tell) return;
+  await rateLimiter.throttle(phone);
+  const told = await WhatsAppService.sendMessage(phone, ux('vqQuestionSkipped', state.language, { i: position }));
+  if (!told) {
+    logToFile('⚠️ video-quiz: skipped-question notice not delivered', {
+      phone: String(phone).slice(-4), sessionId: state.sessionId, position,
+    });
+  }
+}
+
+/**
+ * End a session the child could not finish — the quiz stopped on our side, or
+ * the child typed STOP (stopTyped). `messageKey` is what the child is told:
+ * the trouble message by default, vqStopped for a STOP.
+ *
+ * `incomplete`, never `completed`: every reader of quiz_sessions (the class
+ * report, the /quiz list and Flow, the child's own quiz list, the nobody-
+ * started nudge, the teacher's pending items) counts `completed` as finished
+ * and anything else as started-but-unfinished, which is exactly the truth
+ * here. It is also terminal, which `in_progress` is not: the adaptive quiz's
+ * state recovery treats the phone's newest `in_progress` row as a live quiz,
+ * so a row left there would catch every later text from that phone with the
+ * "tap an answer button" nudge — and there is no resume path for a video-quiz
+ * session to keep a promise of "in progress" anyway.
+ *
+ * The counters are the answers table's (what the child did answer, for the
+ * teacher's roster); no mastery percentage or level is written because nothing
+ * was finished to score, and no scorecard is sent. `completed_at` stays empty —
+ * it means completed. The status filter keeps this from ever overwriting a
+ * session that did finish.
+ */
+async function endUnfinished(phone, state, reason, { messageKey = 'vqTrouble' } = {}) {
+  let answered = state.answered || 0;
+  let correct = state.correct || 0;
+  try {
+    const truth = await truthFromAnswers(state.sessionId);
+    answered = truth.answered;
+    correct = truth.correct;
+  } catch (e) {
+    logToFile('❌ video-quiz: could not read the answers table while ending unfinished (using the state)', {
+      sessionId: state.sessionId, error: e.message,
+    }, 'error');
+  }
+
+  const { error } = await supabase.from('quiz_sessions').update({
+    status: 'incomplete',
+    total_questions_answered: answered,
+    correct_answers: correct,
+  }).eq('id', state.sessionId).eq('status', 'in_progress');
+  if (error) {
+    logToFile('❌ video-quiz: could not close the unfinished session', {
+      sessionId: state.sessionId, error: error.message,
+    }, 'error');
+  }
+  logEvent('video_quiz.counters_written', {
+    sessionId: state.sessionId, reason: 'ended_unfinished',
+    phoneTail: String(phone).slice(-4),
+    toAnswered: answered, toCorrect: correct, guarded: false,
+    error: error ? error.message : null,
+  });
+
+  await redisService.delete(STATE_KEY(phone));
+
+  await rateLimiter.throttle(phone);
+  const told = await WhatsAppService.sendMessage(phone, ux(messageKey, state.language));
+  if (!told) {
+    logToFile('❌ video-quiz: the child was not told the quiz stopped', {
+      phone: String(phone).slice(-4), sessionId: state.sessionId,
+    }, 'error');
+  }
+
+  logEvent('video_quiz.ended_unfinished', {
+    sessionId: state.sessionId, quizId: state.quizId, reason, answered, correct,
+    skipped: (state.skippedIds || []).length, questions: (state.questionIds || []).length,
+    source: state.source,
+  });
+  return null;
+}
+
+/** 'card' | 'image' | 'none' — what the question showed alongside the text. */
+function mediaKind(q) {
+  const media = (q && q.media) || {};
+  if (media.question_card) return 'card';
+  if (media.question_image) return 'image';
+  return 'none';
+}
+
+/**
+ * Acquire the per-phone answer lock, waiting in ANSWER_LOCK_STEP_MS steps up
+ * to ANSWER_LOCK_WAIT_MS. Fail-open on timeout — a rare duplicate answer is
+ * far better than dropping a child's tap entirely, and the truth-derived
+ * index (nextIndexFromTruth) makes a duplicate harmless. Redis being down
+ * makes `setNX` itself return true unconditionally (railway-redis.service.js)
+ * so this resolves immediately in that case too.
+ *
+ * @returns {Promise<{key: string, waitedMs: number, timedOut: boolean}>}
+ */
+async function acquireAnswerLock(phone) {
+  const key = ANSWER_LOCK_KEY(phone);
+  const start = Date.now();
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const claimed = await redisService.setNX(key, Date.now(), ANSWER_LOCK_TTL_SECS);
+    const waitedMs = Date.now() - start;
+    if (claimed) return { key, waitedMs, timedOut: false };
+    if (waitedMs >= ANSWER_LOCK_WAIT_MS) return { key, waitedMs, timedOut: true };
+    await sleep(ANSWER_LOCK_STEP_MS);
+  }
+}
+
+/**
+ * A TYPED reply was matched to the question that was waiting when it was read,
+ * outside the answer lock. Two fast replies ("B" then "C") both read the same
+ * question; by the time the second holds the lock the first has graded it and
+ * the quiz has moved on. That second reply is dropped here (taken, nothing sent)
+ * — grading it would hit the unique answer and re-send the next question.
+ * A tap is not checked: a button names its own question, and a re-tap is the
+ * duplicate path's job.
+ */
+function typedReplyIsStale(state, questionId) {
+  return !state || state.currentQuestionId !== questionId;
+}
+
+/**
+ * Grade a tap and move on. Returns true if the input belonged to a video quiz.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.typed] the answer came from answerTypedLetter
+ */
+async function handleAnswer(phone, inputId, { typed = false } = {}) {
+  // The child's tap is what needs measuring, so the clock starts on the
+  // FIRST line, before the render parse — not on our own bookkeeping.
+  const answerStart = Date.now();
   const parsed = render.parseAnswer(inputId);
   if (!parsed) return false;
-  const state = await redisService.get(STATE_KEY(phone));
-  if (!state) {
-    await WhatsAppService.sendMessage(phone,
-      "That quiz has finished. Pick another video and I'll offer you a fresh one!");
+
+  // The lock covers the WHOLE answer path, not just the DB write: the read
+  // of `state` below must happen INSIDE the critical section, or a second
+  // overlapping call can still read the same stale value this one did.
+  const { key: lockKey, waitedMs, timedOut } = await acquireAnswerLock(phone);
+  try {
+    const state = await redisService.get(STATE_KEY(phone));
+    const phoneTail = String(phone).slice(-4);
+    if (timedOut) {
+      logEvent('video_quiz.answer_lock_timeout', {
+        sessionId: state ? state.sessionId : null, questionId: parsed.questionId,
+        waitedMs, phoneTail,
+      });
+    } else if (waitedMs > 0) {
+      logEvent('video_quiz.answer_lock', {
+        sessionId: state ? state.sessionId : null, questionId: parsed.questionId,
+        waitedMs, phoneTail,
+      });
+    }
+    logEvent('video_quiz.state_read', {
+      where: 'handleAnswer', found: !!state,
+      sessionId: state ? state.sessionId : null,
+      index: state ? state.index : null,
+      answered: state ? state.answered : null,
+      questions: state ? (state.questionIds || []).length : 0,
+      questionId: parsed.questionId,
+    });
+    if (typed && typedReplyIsStale(state, parsed.questionId)) {
+      logEvent('video_quiz.typed_stale', {
+        sessionId: state ? state.sessionId : null, questionId: parsed.questionId, phoneTail,
+      });
+      return true;
+    }
+    if (!state) {
+      // The quiz's state is gone with it; the run's language is not.
+      await WhatsAppService.sendMessage(phone, ux('vqQuizFinished', await lastRunLanguage(phone)));
+      return true;
+    }
+
+    const { data: q } = await supabase
+      .from('quiz_questions')
+      // external_id: same seed reason as sendNextQuestion's select above — the
+      // grading path must reconstruct the SAME shuffle the child was shown.
+      .select('id, external_id, question_text, option_a, option_b, option_c, option_d, correct_option, '
+              + 'explanation, option_feedback, media, render_pattern')
+      .eq('id', parsed.questionId)
+      .single();
+    if (!q) return true;
+
+    const correctIdx = render.correctIndices(q);
+    const isCorrect = correctIdx.includes(parsed.index);
+    const letter = 'ABCD'[parsed.index] || 'A';
+
+    const { error: aErr } = await supabase.from('quiz_answers').insert({
+      session_id: state.sessionId,
+      question_id: q.id,
+      selected_option: letter,
+      is_correct: isCorrect,
+      response_time_seconds: state.sentAt
+        ? Math.round((Date.now() - state.sentAt) / 1000) : null,
+    });
+    if (aErr && aErr.code === '23505') {
+      logEvent('video_quiz.answer_duplicate', {
+        sessionId: state.sessionId, questionId: q.id,
+        index: state.index, answered: state.answered,
+      });
+      // UNIQUE(session_id, question_id): either a double tap, or the answer was
+      // recorded and the process died before the state advanced (a deploy landed
+      // mid-quiz in testing: all eight answers stored, the session stuck at 5/8,
+      // every later tap swallowed here). Rebuild the state from the answers table
+      // and carry on — the next question, or the finish. This tap never
+      // delivered a verdict, so it gets no answer_latency — one would
+      // misrepresent a re-tap or a resumed process as a normal graded answer.
+      return reconcileFromAnswers(phone, state);
+    }
+    if (aErr) logToFile('⚠️ video-quiz: answer insert failed', { error: aErr.message });
+
+    // No emoji reaction here: sendReaction needs the message id of the child's
+    // own reply, which the webhook gives us but this path does not carry. Calling
+    // it with null would fail silently on every single answer — dead code that
+    // reads like a working feature. The verdict text opens with ✅ / "Not quite"
+    // anyway, so the feedback is not lost.
+    const msgs = render.build(q);
+    await sender.sendPhase(phone, msgs, 'answer', {
+      questionId: q.id, sessionId: state.sessionId, language: state.language,
+      isCorrect, selectedIndex: parsed.index,
+    });
+    const msToFeedback = Date.now() - answerStart;
+
+    // The columns come from the table this call has just written to, never from
+    // the counters carried in `state` — see writeCountersFromAnswers. `state` then
+    // MIRRORS that truth rather than accumulating its own, so a stale blob cannot
+    // put a number on a child's scorecard that nothing in the database supports.
+    const truth = await writeCountersFromAnswers(state.sessionId, { reason: 'answer', phone });
+    state.answered = truth.answered;
+    state.correct = truth.correct;
+    // Derived, never incremented: an increment on a stale-but-locked read
+    // would still be wrong the moment two DIFFERENT questions are answered
+    // out of order (a duplicate-tap retry, a resumed process) — the index has
+    // to be recomputed from the durable record every time, exactly like
+    // reconcileFromAnswers already does.
+    state.index = nextIndexFromTruth(state.questionIds, truth, state.skippedIds);
+    state.currentQuestionId = null;
+    await saveState(phone, state, 'handleAnswer');
+
+    // Over when there is no question left to ask — answered, or skipped because
+    // it could not be asked. Without skips this is exactly the old
+    // `answered >= questionIds.length`.
+    const finished = state.index >= state.questionIds.length;
+    const msPause = 1200;
+    await new Promise((r) => setTimeout(r, msPause));
+    if (finished) {
+      await finish(phone, state);
+    } else {
+      await sendNextQuestion(phone, state);
+    }
+    logEvent('video_quiz.answer_latency', {
+      sessionId: state.sessionId, questionId: q.id, isCorrect,
+      msToFeedback, msToNextQuestion: Date.now() - answerStart, msPause,
+      media: mediaKind(q), finished,
+    });
     return true;
+  } finally {
+    await redisService.delete(lockKey);
   }
+}
 
-  const { data: q } = await supabase
-    .from('quiz_questions')
-    .select('id, question_text, option_a, option_b, option_c, option_d, correct_option, '
-            + 'explanation, option_feedback, media, render_pattern')
-    .eq('id', parsed.questionId)
-    .single();
-  if (!q) return true;
+/**
+ * Rebuild a session's progress from quiz_answers and continue. Idempotent:
+ * a second call after the finish finds no state and does nothing.
+ */
+/**
+ * What the answers table says about a session — the truth the card and the
+ * report are built from. In a test run the session row had drifted to 5
+ * while eight answers were stored, and a reconcile that intersected the
+ * state's question list with the table counted six. Count the table itself.
+ */
+/**
+ * Where the session continues, derived from the durable record rather than
+ * incremented — the ONE rule reconcileFromAnswers, handleAnswer and
+ * handleMultiAnswer all share, so it cannot drift into a second copy.
+ *
+ * A SKIPPED question (state.skippedIds — it could not be asked) is not open:
+ * it is never the next question, and it does not count towards the total that
+ * has to be answered. A skipped question that nevertheless got an answer (the
+ * picker did land although the send reported a failure) counts as answered.
+ *
+ * @param {string[]} questionIds state.questionIds, in the order asked
+ * @param {{byQ: Map, answered: number}} truth from truthFromAnswers()
+ * @param {string[]} [skippedIds] state.skippedIds
+ * @returns {number} the index of the first question that is neither answered
+ *   nor skipped, or questionIds.length when there is none (or answered has
+ *   already overtaken what can be asked — a stale/short question list is over,
+ *   not stuck).
+ */
+function nextIndexFromTruth(questionIds, truth, skippedIds = []) {
+  const ids = questionIds || [];
+  const skipped = new Set(skippedIds || []);
+  const open = (id) => !truth.byQ.has(id) && !skipped.has(id);
+  const askable = ids.filter((id) => truth.byQ.has(id) || !skipped.has(id)).length;
+  const firstOpen = ids.findIndex(open);
+  return (firstOpen < 0 || truth.answered >= askable) ? ids.length : firstOpen;
+}
 
-  const correctIdx = render.correctIndices(q);
-  const isCorrect = correctIdx.includes(parsed.index);
-  const letter = 'ABCD'[parsed.index] || 'A';
+async function truthFromAnswers(sessionId) {
+  const { data: rows } = await supabase
+    .from('quiz_answers')
+    .select('question_id, is_correct')
+    .eq('session_id', sessionId);
+  const byQ = new Map((rows || []).map((r) => [r.question_id, !!r.is_correct]));
+  let correct = 0;
+  for (const v of byQ.values()) if (v) correct += 1;
+  return { byQ, answered: byQ.size, correct };
+}
 
-  const { error: aErr } = await supabase.from('quiz_answers').insert({
-    session_id: state.sessionId,
-    question_id: q.id,
-    selected_option: letter,
-    is_correct: isCorrect,
-    response_time_seconds: state.sentAt
-      ? Math.round((Date.now() - state.sentAt) / 1000) : null,
+/**
+ * Write the session's counters FROM THE ANSWERS TABLE, and never downwards.
+ *
+ * THE BUG THIS EXISTS TO END. A test run stored eight answers, one per
+ * question, no duplicates — and `total_questions_answered` sat at five, with no
+ * error and no warning anywhere. The counters were being written from
+ * `state.answered`: a Redis blob, which is a CACHE, while `quiz_answers` is the
+ * record. That cache can lose an update through two doors, and neither raises
+ * anything a caller can see —
+ *
+ *   1. `redisService.set()` swallows every Redis failure, logs a warning and
+ *      returns `false` (railway-redis.service.js). Nothing here checked the
+ *      return value, so a dropped write left `state.answered` behind and every
+ *      later answer counted up from the stale number.
+ *   2. The read-to-write window in `handleAnswer` spans the whole answer-phase
+ *      send — verdict, explanation image, explanation audio, each behind a
+ *      throttle and a 700-1200 ms gap. Two calls overlapping there both read
+ *      `answered = n` and both write `n + 1`.
+ *
+ * Patching either door leaves the other, and leaves the next one. The counters
+ * simply have no business depending on the cache: `truthFromAnswers()` already
+ * fed `finish()` and `reconcileFromAnswers()` from the table, and the per-answer
+ * write was the one place still trusting the blob.
+ *
+ * The `.lte()` guard is the second half. Reads of the table are monotonic, but
+ * two concurrent WRITES can still land out of order, and an out-of-order write
+ * is how a session that has recorded eight answers reports five. The filter
+ * makes a lower number a no-op at the database, so the columns can move up and
+ * never down.
+ *
+ * @returns {Promise<{answered:number, correct:number}>} the truth it wrote from
+ */
+async function writeCountersFromAnswers(sessionId, { reason, phone } = {}) {
+  const truth = await truthFromAnswers(sessionId);
+  const { data: before } = await supabase
+    .from('quiz_sessions')
+    .select('total_questions_answered, correct_answers')
+    .eq('id', sessionId)
+    .maybeSingle();
+
+  // `id=eq.<session> AND (total_questions_answered IS NULL OR <= n)` — verified
+  // against the client, not assumed from the docs. A bare `.lte()` would have
+  // been a trap: the column is nullable, and `NULL <= n` is UNKNOWN in SQL, so
+  // a session whose counter was never set would silently match no rows and
+  // never be written again.
+  const { error } = await supabase.from('quiz_sessions')
+    .update({ total_questions_answered: truth.answered, correct_answers: truth.correct })
+    .eq('id', sessionId)
+    .or(`total_questions_answered.is.null,total_questions_answered.lte.${truth.answered}`);
+
+  logEvent('video_quiz.counters_written', {
+    sessionId, reason,
+    phoneTail: phone ? String(phone).slice(-4) : null,
+    fromAnswered: before ? before.total_questions_answered : null,
+    fromCorrect: before ? before.correct_answers : null,
+    toAnswered: truth.answered,
+    toCorrect: truth.correct,
+    // A guard that fires is not an error: it means a later write already got
+    // there. It IS the signal that two writers overlapped, so it is worth
+    // counting in the logs rather than inferring from a gap.
+    guarded: !!(before && (before.total_questions_answered || 0) > truth.answered),
+    error: error ? error.message : null,
   });
-  if (aErr && aErr.code === '23505') {
-    // UNIQUE(session_id, question_id) — a double tap, already recorded.
-    return true;
+  if (error) {
+    logToFile('\u26a0\ufe0f video-quiz: counter write failed', { sessionId, error: error.message });
   }
-  if (aErr) logToFile('⚠️ video-quiz: answer insert failed', { error: aErr.message });
+  return truth;
+}
 
-  // No emoji reaction here: sendReaction needs the message id of the child's
-  // own reply, which the webhook gives us but this path does not carry. Calling
-  // it with null would fail silently on every single answer — dead code that
-  // reads like a working feature. The verdict text opens with ✅ / "Not quite"
-  // anyway, so the feedback is not lost.
-  const msgs = render.build(q);
-  await sender.sendPhase(phone, msgs, 'answer', {
-    questionId: q.id, sessionId: state.sessionId,
-    isCorrect, selectedIndex: parsed.index,
+/**
+ * Put the session state back in Redis, and SAY SO when the write is lost.
+ *
+ * `redisService.set()` returns false on any failure and logs it as a warning
+ * nobody reads. A lost state write is not fatal any more — the counters come
+ * from the answers table — but it is exactly the event that has to be visible
+ * when a session behaves oddly, so it gets its own name.
+ */
+async function saveState(phone, state, where) {
+  const ok = await redisService.set(STATE_KEY(phone), state, STATE_TTL_SECS);
+  logEvent('video_quiz.state_written', {
+    sessionId: state.sessionId, where, ok: ok !== false,
+    index: state.index, answered: state.answered, correct: state.correct,
+    questions: (state.questionIds || []).length, ttlSecs: STATE_TTL_SECS,
   });
+  return ok;
+}
 
-  state.answered += 1;
-  state.correct += isCorrect ? 1 : 0;
-  state.index += 1;
+async function reconcileFromAnswers(phone, state) {
+  const truth = await truthFromAnswers(state.sessionId);
+  state.answered = truth.answered;
+  state.correct = truth.correct;
+  // The first unanswered question is where the child continues; a stale
+  // question list that is shorter than the answers means the quiz is over.
+  // A skipped question is never where the child continues.
+  state.index = nextIndexFromTruth(state.questionIds, truth, state.skippedIds);
   state.currentQuestionId = null;
-  await redisService.set(STATE_KEY(phone), state, STATE_TTL_SECS);
-
-  await supabase.from('quiz_sessions').update({
-    total_questions_answered: state.answered,
-    correct_answers: state.correct,
-  }).eq('id', state.sessionId);
-
-  await new Promise((r) => setTimeout(r, 1200));
+  await saveState(phone, state, 'reconcileFromAnswers');
+  await writeCountersFromAnswers(state.sessionId, { reason: 'reconcile', phone });
+  logEvent('video_quiz.reconciled', { sessionId: state.sessionId, answered: state.answered, index: state.index });
+  // sendNextQuestion's own `state.index >= state.questionIds.length` guard
+  // finishes the session when nextIndexFromTruth above has already derived
+  // the end — unlike handleAnswer/handleMultiAnswer, there is no separately
+  // stale index here to second-guess it against.
   await sendNextQuestion(phone, state);
   return true;
 }
 
+/**
+ * The fewest questions a child must have been asked for the session to be
+ * scored: half the quiz, rounded up. Below it the attempt measures a fragment
+ * of what the quiz checks, and a score on it (1/1 = 100%) would stand in the
+ * class report beside children who sat all of it.
+ */
+function minAskedToScore(state) {
+  return Math.ceil((state.questionIds || []).length / 2);
+}
+
 async function finish(phone, state) {
-  const total = state.answered || 0;
-  const pct = total ? Math.round((state.correct / total) * 100) : 0;
+  // The answers table is the truth; the in-memory counters are a cache that
+  // has been seen to drift (6/5 in the state, 8/7 stored).
+  let total = state.answered || 0;
+  let correct = state.correct || 0;
+  try {
+    const truth = await truthFromAnswers(state.sessionId);
+    if (truth.answered > 0) { total = truth.answered; correct = truth.correct; }
+  } catch (e) {
+    logToFile('⚠️ video-quiz: could not read the answers table at finish (using the state)', { error: e.message });
+  }
+  // Nothing answered is nothing to score: every question was skipped because
+  // it could not be asked. Marking that `completed` at 0% would put a child in
+  // the report as "needs practice" on a quiz they were never shown.
+  if (!total) return endUnfinished(phone, state, 'nothing_answered');
+  // And a child who was asked fewer than half the quiz is not scored either.
+  // 1/1 on a quiz of 8 is exactly the false "mastered" this floor exists for;
+  // the send-failure guard catches it when sends fail, but a run of unreadable
+  // question rows never fails a send. Such a child is started-but-unfinished.
+  if (total < minAskedToScore(state)) return endUnfinished(phone, state, 'too_few_asked');
+  state.answered = total;
+  state.correct = correct;
+  const pct = total ? Math.round((correct / total) * 100) : 0;
   const level = pct >= 80 ? 'mastered' : pct >= 60 ? 'developing' : 'needs_practice';
 
-  await supabase.from('quiz_sessions').update({
+  const { error: fErr } = await supabase.from('quiz_sessions').update({
     status: 'completed',
     total_questions_answered: total,
     correct_answers: state.correct,
@@ -400,29 +1143,71 @@ async function finish(phone, state) {
     mastery_level: level,
     completed_at: new Date().toISOString(),
   }).eq('id', state.sessionId);
+  // Deliberately NOT guarded by `.lte()`: this write is the session's last word
+  // and it carries `status`, `mastery_percentage` and `completed_at` with it, so
+  // refusing it over a counter would leave a finished quiz marked in_progress.
+  // It is safe unguarded precisely because `total` was read from the answers
+  // table two lines up rather than from the cache.
+  logEvent('video_quiz.counters_written', {
+    sessionId: state.sessionId, reason: 'finish',
+    phoneTail: String(phone).slice(-4),
+    toAnswered: total, toCorrect: state.correct, guarded: false,
+    error: fErr ? fErr.message : null,
+  });
 
   await redisService.delete(STATE_KEY(phone));
 
-  await WhatsAppService.sendMessage(phone,
-    `🎉 All done!\n\nYou got *${state.correct} out of ${total}* right (${pct}%).\n\n`
-    + (pct >= 80 ? 'Brilliant work!' : pct >= 60
-      ? "Nicely done — a little more practice and you'll have it."
-      : 'Good effort — this one is worth another go.'));
+  // The designed scorecard (navy/gold, stars + score) was never
+  // wired in; a child got only this plain text. Best-effort: if the render
+  // or send fails, fall back to exactly what shipped before this feature so
+  // a child is never left with nothing.
+  const { data: quizMeta } = await supabase
+    .from('quizzes').select('topic, grade, subject, quiz_source').eq('id', state.quizId).maybeSingle();
+  const Scorecard = require('./video-quiz-scorecard.service');
+  const sentScorecard = await Scorecard.sendScorecard(phone, {
+    topic: quizMeta?.topic, grade: quizMeta?.grade, subject: quizMeta?.subject,
+    correct: state.correct, total, pct, takerName: state.takerName, language: state.language,
+  }).catch((err) => {
+    logToFile('⚠️ video-quiz: scorecard send threw', { error: err.message });
+    return false;
+  });
+  if (!sentScorecard) {
+    const tierKey = level === 'mastered' ? 'vqTierMastered' : level === 'developing' ? 'vqTierDeveloping' : 'vqTierNeedsPractice';
+    await WhatsAppService.sendMessage(phone, ux('vqDoneFallback', state.language, {
+      correct: state.correct, total, pct, tier: ux(tierKey, state.language),
+    }));
+  }
+  logEvent('video_quiz.scorecard_sent', {
+    sessionId: state.sessionId, quizId: state.quizId,
+    ok: !!sentScorecard, fallback: !sentScorecard, pct, language: state.language,
+  });
 
   logEvent('video_quiz.completed', {
     sessionId: state.sessionId, quizId: state.quizId, total,
     correct: state.correct, pct, source: state.source,
+    // Questions that could not be asked this session: `total` is what WAS asked.
+    skipped: (state.skippedIds || []).length,
   });
+  const stream = (quizMeta && quizMeta.quiz_source) || state.quizSource;
+  const selfTest = isSelfTestRun(state) ? { kind: SELF_TEST } : {};
+  Funnel.emit('child_completed', { quiz_id: state.quizId, session_id: state.sessionId, source: stream, n: total, pct, ...selfTest });
+  Funnel.emit('scorecard_sent', { quiz_id: state.quizId, session_id: state.sessionId, source: stream, ok: Boolean(sentScorecard), ...selfTest });
 
-  // a child finishing a shared quiz may have been the last one. If
-  // every session on that share code is now terminal, the teacher's report goes
-  // out immediately instead of waiting for the morning.
+  // A child finishing a shared quiz may be arriving AFTER their teacher's report
+  // already went out. The old hook here sent an early report the
+  // moment every session it could see was terminal, which closed the door on
+  // children still to come. Now it asks the opposite question — has enough
+  // changed since the report to be worth one follow-up?
   if (state.source === 'share_link' && state.shareCodeId) {
     const report = require('./video-quiz-report.service');
-    await report.maybeSendEarly(state.shareCodeId)
-      .catch((err) => logToFile('⚠️ early report failed', { error: err.message }));
+    await report.maybeSendFollowUp(state.shareCodeId)
+      .catch((err) => logToFile('⚠️ follow-up report failed', { error: err.message }));
+    // Once the teacher's report is out, a late finisher gets
+    // their class card now (their free-form window is open); nothing before it.
+    await report.sendLateClassCards(state.shareCodeId)
+      .catch((err) => logToFile('⚠️ late class card failed', { error: err.message }));
 
-    // if a friend sent them here, tell that friend how they did, then
+    // If a friend sent them here, tell that friend how they did, then
     // offer them the same. Both are best-effort: a child's own quiz must never
     // fail because of something that happens after they finish it.
     const Invite = require('./video-quiz-invite.service');
@@ -433,12 +1218,13 @@ async function finish(phone, state) {
       .eq('id', state.sessionId)
       .maybeSingle();
     if (session?.invited_by_student_id) {
-      await Invite.notifyInviter(session)
+      // The quiz's language — quiz_sessions carries none, the state does.
+      await Invite.notifyInviter(session, state.language)
         .catch((err) => logToFile('⚠️ inviter notify failed', { error: err.message }));
     }
     await Invite.offerInvite({
       phone, studentId: state.studentId, shareCodeId: state.shareCodeId,
-      language: state.language,
+      language: state.language, sessionId: state.sessionId, quizId: state.quizId,
     }).catch((err) => logToFile('⚠️ invite offer failed', { error: err.message }));
   }
 
@@ -448,7 +1234,7 @@ async function finish(phone, state) {
     const share = require('./video-quiz-share.service');
     await share.offerShare({
       phone, userId: state.userId, quizId: state.quizId,
-      videoId: state.videoId, language: state.language,
+      videoId: state.videoId, language: state.language, sessionId: state.sessionId,
     }).catch((err) => logToFile('⚠️ share offer failed', { error: err.message }));
 
     const StudentVideoFeedback = require('../student-video-feedback.service');
@@ -463,17 +1249,382 @@ async function finish(phone, state) {
   return null;
 }
 
+/**
+ * Stamp offers nobody answered as 'ignored' once they are older than
+ * the cutoff. The CHECK constraint admitted the value from day one but nothing
+ * wrote it, so unanswered offers sat at NULL forever and response-rate queries
+ * had to guess what NULL meant. Runs from the worker janitor, daily; the
+ * update is idempotent, so concurrent runs from regional workers on the
+ * shared DB are safe. Filters on quiz_offered_at (not created_at): a delivery
+ * whose offer was never sent stays NULL, which is the truth.
+ */
+async function sweepIgnoredOffers({ maxAgeHours = 24 } = {}) {
+  try {
+    const cutoff = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase.from('video_quiz_deliveries')
+      .update({ quiz_response: 'ignored' })
+      .is('quiz_response', null)
+      .lt('quiz_offered_at', cutoff)
+      .select('id');
+    if (error) {
+      logToFile('⚠️ video-quiz: ignored-offer sweep failed', { error: error.message });
+      return { swept: 0 };
+    }
+    const swept = data?.length || 0;
+    if (swept) logEvent('video_quiz.offers_swept_ignored', { count: swept });
+    return { swept };
+  } catch (e) {
+    logToFile('⚠️ video-quiz: ignored-offer sweep threw', { error: e.message });
+    return { swept: 0 };
+  }
+}
+
+// ─── "select all that apply" ───────────────────────────────────
+//
+// A question whose answer is a SET arrives as typed letters ("A C"), not from a
+// tap (answerTypedLetter below parses them). Its grading is the sibling of
+// handleAnswer above and lives here for the same reason it does: the session state, the duplicate reconcile and the
+// next-question walk are all in this file. The policy — what a set IS, how it
+// scores, what the verdict says — is in
+// transcript-quiz-multi, which is a LEAF module (video-quiz-render and
+// video-quiz-sender both require it, so it may not require back).
+
+const MULTI_QUESTION_COLUMNS = 'id, external_id, question_text, option_a, option_b, option_c, '
+  + 'option_d, correct_option, explanation, option_feedback, media, render_pattern';
+
+/**
+ * Grade one submitted set and move the session on.
+ *
+ * Deliberately a sibling of handleAnswer rather than a branch inside it: the
+ * two differ in what they store ("A,C" not "A"), how they score (set equality,
+ * not membership) and what they say (a composed verdict, not one of N pre-built
+ * branches the sender filters). Everything they share is called, not copied.
+ *
+ * @returns {Promise<boolean>} true when the reply belonged to a video quiz
+ */
+async function handleMultiAnswer(phone, parsed, { typed = false } = {}) {
+  const Multi = require('./transcript-quiz-multi');
+  if (!parsed || !parsed.questionId) return false;
+
+  // Same lock, same key as handleAnswer: a typed set and a button tap on one
+  // phone must not overlap either.
+  const { key: lockKey, waitedMs, timedOut } = await acquireAnswerLock(phone);
+  try {
+    const state = await redisService.get(STATE_KEY(phone));
+    const phoneTail = String(phone).slice(-4);
+    if (timedOut) {
+      logEvent('video_quiz.answer_lock_timeout', {
+        sessionId: state ? state.sessionId : null, questionId: parsed.questionId,
+        waitedMs, phoneTail,
+      });
+    } else if (waitedMs > 0) {
+      logEvent('video_quiz.answer_lock', {
+        sessionId: state ? state.sessionId : null, questionId: parsed.questionId,
+        waitedMs, phoneTail,
+      });
+    }
+    if (typed && typedReplyIsStale(state, parsed.questionId)) {
+      logEvent('video_quiz.typed_stale', {
+        sessionId: state ? state.sessionId : null, questionId: parsed.questionId, phoneTail,
+      });
+      return true;
+    }
+    if (!state) {
+      await WhatsAppService.sendMessage(phone, ux('vqExpired', undefined));
+      return true;
+    }
+    const language = state.language;
+
+    const { data: q } = await supabase
+      .from('quiz_questions')
+      .select(MULTI_QUESTION_COLUMNS)
+      .eq('id', parsed.questionId)
+      .single();
+    if (!q) return true;
+
+    const labels = render.optionLabels(q);
+    const correct = Multi.indicesFor(q.correct_option);
+    const { isCorrect } = Multi.scoreSet(parsed.indices, correct);
+
+    const { error: aErr } = await supabase.from('quiz_answers').insert({
+      session_id: state.sessionId,
+      question_id: q.id,
+      // The whole set, in the same comma-joined letter shape correct_option uses,
+      // so the report can compare a child's answer to the key without a second
+      // encoding to get wrong.
+      selected_option: Multi.lettersFor(parsed.indices),
+      is_correct: isCorrect,
+      response_time_seconds: state.sentAt ? Math.round((Date.now() - state.sentAt) / 1000) : null,
+    });
+    if (aErr && aErr.code === '23505') {
+      // A set can be sent twice exactly as a button can be tapped twice, and a
+      // deploy can still land between the insert and the state write.
+      return reconcileFromAnswers(phone, state);
+    }
+    if (aErr) logToFile('⚠️ video-quiz: multi answer insert failed', { error: aErr.message });
+
+    const verdict = Multi.verdictText(q, { selectedIndices: parsed.indices, labels, language });
+    await rateLimiter.throttle(phone);
+    await WhatsAppService.sendMessage(phone, render.withVerdictMark(
+      verdict.text, verdict.isCorrect ? render.VERDICT_CORRECT : render.VERDICT_WRONG,
+    ));
+
+    logEvent('video_quiz.multi_answered', {
+      sessionId: state.sessionId,
+      questionId: q.id,
+      selected: parsed.indices.length,
+      correctCount: correct.length,
+      isCorrect,
+    });
+
+    // Same rule as handleAnswer: the columns come from the answers table, never
+    // from the counters carried in `state`, and `state` mirrors what was written.
+    const truth = await writeCountersFromAnswers(state.sessionId, { reason: 'multi_answer', phone });
+    state.answered = truth.answered;
+    state.correct = truth.correct;
+    // Derived, never incremented — same rule as handleAnswer.
+    state.index = nextIndexFromTruth(state.questionIds, truth, state.skippedIds);
+    state.currentQuestionId = null;
+    await saveState(phone, state, 'handleMultiAnswer');
+
+    await new Promise((r) => setTimeout(r, 1200));
+    if (state.index >= (state.questionIds || []).length) {
+      await finish(phone, state);
+    } else {
+      await sendNextQuestion(phone, state);
+    }
+    return true;
+  } finally {
+    await redisService.delete(lockKey);
+  }
+}
+
 async function getActiveState(phone) {
   return redisService.get(STATE_KEY(phone));
+}
+
+/**
+ * STOP typed during a video / transcript / lesson-plan quiz: the child is done
+ * for now. The session ends the way every unfinished run ends (endUnfinished:
+ * `incomplete`, the answers so far counted, no score, the state cleared), and
+ * the child is told it stopped — in the quiz's language — instead of the
+ * trouble message.
+ *
+ * The words are the ones the adaptive quiz has always taken ("stop", "روکیں"),
+ * in any case and with a full stop after them. Anything else, the lesson quiz
+ * switched off, or no quiz running on this phone, is not ours: false, and the
+ * message goes on.
+ *
+ * Under the answer lock, like an answer: a tap being graded while STOP arrives
+ * finishes first (its answer counts), and cannot put the state back after the
+ * stop has cleared it.
+ *
+ * @returns {Promise<boolean>} true when a running quiz was stopped
+ */
+const STOP_RX = /^(stop|روکیں)[.!۔]?$/i;
+async function stopTyped(phone, text) {
+  if (!STOP_RX.test(String(text || '').trim())) return false;
+  // Lesson quiz off: main's video engine never read a typed STOP (it went on
+  // to the adaptive quiz and chat), so neither does this.
+  if (!lessonQuizOn()) return false;
+  const { key: lockKey, waitedMs, timedOut } = await acquireAnswerLock(phone);
+  try {
+    const state = await redisService.get(STATE_KEY(phone));
+    if (!state) return false;
+    if (timedOut) {
+      logEvent('video_quiz.answer_lock_timeout', {
+        sessionId: state.sessionId, where: 'stop', waitedMs, phoneTail: String(phone).slice(-4),
+      });
+    }
+    await endUnfinished(phone, state, 'stopped', { messageKey: 'vqStopped' });
+    return true;
+  } finally {
+    await redisService.delete(lockKey);
+  }
+}
+
+/**
+ * A letter TYPED instead of tapped ("B", "b.", "2") while a question waits for
+ * its answer — the same answer the child would have tapped. On Baileys and
+ * Matrix this is the ONLY way to answer: the question arrives as lettered text
+ * (video-quiz-sender sendLetteredAsk) and the menu matcher refuses one-letter
+ * replies by design, so the quiz reads them itself, before generic chat.
+ *
+ * The letter is the one the child SAW: position n of the options as this
+ * question was drawn (render.build reproduces the stored display order, the
+ * shuffle is seeded on the question itself), mapped back to the option's own
+ * index before it is graded. A number names the same position ("2" = B).
+ *
+ * A select-all question takes a SET — "A C", "a, c", "a and c" — graded by
+ * exact set equality in handleMultiAnswer (a partial set is wrong, and the
+ * verdict says what was missed).
+ *
+ * A reply that IS a letter / number list but cannot be graded — a letter the
+ * question does not offer, a set on a one-answer question — is asked again
+ * (the re-ask names STOP) and nothing is counted.
+ *
+ * Not ours (false, the message goes on to the handler exactly as before this
+ * step existed):
+ *   - the lesson quiz is off (TRANSCRIPT_QUIZ_ENABLED, RUMI_FEATURE_LESSON_QUIZ);
+ *   - the waiting question is not a LESSON quiz's (transcript, lesson plan,
+ *     topic). A v1.2.0 video quiz is answered by taps; on main free text during
+ *     one went on to chat, and a bare "1" meant for another menu must not be
+ *     graded as A;
+ *   - anything that is not a strict letter / number / letter set ("yes",
+ *     "banana", a sentence) — it is chat, not an answer;
+ *   - a join step pending on this phone (a sibling answering "who is taking
+ *     it?" with "2" — consumeJoinReply owns that reply);
+ *   - no question waiting, STOP (stopTyped), a slash command, a share code.
+ *
+ * @returns {Promise<boolean>} true when the reply was taken (graded or re-asked)
+ */
+const TYPED_ONE_RX = /^([a-j]|\d{1,2})\s*[.)]?$/i;
+// Separators between letters of a set: spaces, commas (Latin and Arabic), "&",
+// "+", "/", and the words "and" / "اور".
+const TYPED_SET_SPLIT_RX = /(?:\s*(?:,|،|&|\+|\/|\band\b|اور)\s*|\s+)/i;
+const SHARE_CODE_RX = /\bQUIZ-[A-Z0-9]{6}\b/i;
+
+/**
+ * The positions a typed reply names, 0-based in the order shown, or null when
+ * the reply is not a letter / number list at all.
+ */
+// An Urdu keyboard types ۰-۹ and an Arabic one ٠-٩: "۲" is the child's "2".
+// The same mapping as text-format's normaliseDigits (not exported there).
+function asLatinDigits(s) {
+  return s
+    .replace(/[\u06F0-\u06F9]/g, (d) => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660));
+}
+
+function typedPositions(text) {
+  const cleaned = asLatinDigits(String(text || '')).trim().replace(/[.)!۔]+$/, '').trim();
+  if (!cleaned) return null;
+  const tokens = cleaned.split(TYPED_SET_SPLIT_RX).map((t) => t.trim()).filter(Boolean);
+  if (!tokens.length) return null;
+  const out = [];
+  for (const t of tokens) {
+    const m = TYPED_ONE_RX.exec(t);
+    if (!m) return null;
+    const v = m[1];
+    const pos = /\d/.test(v) ? Number(v) - 1 : v.toUpperCase().charCodeAt(0) - 'A'.charCodeAt(0);
+    if (!out.includes(pos)) out.push(pos);
+  }
+  return out;
+}
+
+async function reaskTyped(phone, state, count, { multi }) {
+  const language = state.language;
+  const letters = render.letterListLabel(count, {
+    separator: ux('vqLetterSep', language),
+    conjunction: ux('vqLetterOr', language),
+  });
+  await rateLimiter.throttle(phone);
+  await WhatsAppService.sendMessage(phone, ux(multi ? 'vqMultiTypeReask' : 'vqTypedReask', language, { letters }));
+  logEvent('video_quiz.typed_reask', {
+    sessionId: state.sessionId, questionId: state.currentQuestionId, multi,
+  });
+  return true;
+}
+
+// The join's pending step (name / class / which sibling) — the same key as
+// video-quiz-share.service JOIN_KEY. Read here, not required from there: the
+// share service requires this file.
+const JOIN_PENDING_KEY = (phone) => `videoquiz:${stripPlus(phone)}:join`;
+
+/** Is the lesson quiz on? Asked of the offer service, which owns the flag. */
+function lessonQuizOn() {
+  try {
+    return require('./transcript-quiz-offer.service').enabled() === true;
+  } catch (err) {
+    logToFile('❌ video-quiz: the lesson-quiz flag could not be read — typed answers stay off', { error: err.message }, 'error');
+    return false;
+  }
+}
+
+/**
+ * Does this running quiz belong to a lesson quiz? startSession carries the
+ * stream on the state (quizSource); a state written without it (v1.2.0's
+ * shape, or a failed read at start) is classified by its quiz row.
+ */
+async function isLessonQuizState(state) {
+  const { isLessonQuiz } = require('./quiz-sources');
+  if (state.quizSource) return isLessonQuiz(state.quizSource);
+  if (!state.quizId) return false;
+  try {
+    const { data, error } = await supabase.from('quizzes').select('quiz_source').eq('id', state.quizId).maybeSingle();
+    if (error) throw new Error(error.message);
+    return isLessonQuiz(data && data.quiz_source);
+  } catch (err) {
+    logToFile('⚠️ video-quiz: typed letter — quiz stream unreadable, not taken', { quizId: state.quizId, error: err.message });
+    return false;
+  }
+}
+
+async function answerTypedLetter(phone, text) {
+  const raw = String(text || '').trim();
+  if (!raw || raw.startsWith('/') || STOP_RX.test(raw) || SHARE_CODE_RX.test(raw)) return false;
+  if (!lessonQuizOn()) return false;
+  // Only a strict letter / number / letter set is ever an answer; anything
+  // else is chat and goes on.
+  const positions = typedPositions(raw);
+  if (!positions || !positions.length) return false;
+  const state = await redisService.get(STATE_KEY(phone));
+  if (!state || !state.currentQuestionId) return false;
+  if (await redisService.get(JOIN_PENDING_KEY(phone))) return false;
+  if (!(await isLessonQuizState(state))) return false;
+
+  const { data: q, error } = await supabase
+    .from('quiz_questions')
+    .select(MULTI_QUESTION_COLUMNS)
+    .eq('id', state.currentQuestionId)
+    .single();
+  if (error || !q) {
+    logToFile('⚠️ video-quiz: typed letter — current question not readable', {
+      sessionId: state.sessionId, questionId: state.currentQuestionId, error: error && error.message,
+    });
+    return false;
+  }
+
+  const picker = render.build(q).find((m) => m.phase === 'interaction'
+    && (m.role === 'ask' || m.role === 'picture_flow'));
+  if (!picker || !Array.isArray(picker.options)) return false;
+  const shown = picker.options.length;
+  const multi = picker.kind === 'multiflow';
+  const valid = positions.every((p) => p >= 0 && p < shown)
+    && (multi || positions.length === 1);
+  if (!valid) return reaskTyped(phone, state, shown, { multi });
+
+  const order = picker.optionIndices || picker.options.map((_, i) => i);
+  const indices = positions.map((p) => order[p]);
+  logEvent('video_quiz.typed_answer', {
+    sessionId: state.sessionId, questionId: q.id, positions, indices, multi,
+  });
+  if (multi) {
+    return handleMultiAnswer(phone,
+      { sessionId: state.sessionId, questionId: q.id, indices: [...indices].sort((a, b) => a - b) },
+      { typed: true });
+  }
+  return handleAnswer(phone, render.answerId(q.id, indices[0]), { typed: true });
 }
 
 module.exports = {
   offerAfterVideo,
   handleOfferButton,
   handleAnswer,
+  handleMultiAnswer,
+  // Shared with the multi-select path: a set can be sent twice exactly as a
+  // button can be tapped twice, and there must be ONE implementation of what a
+  // duplicate means.
+  reconcileFromAnswers,
   startSession,
+  orderForSession,
+  finish,
+  sweepIgnoredOffers,
   sendNextQuestion,
+  writeCountersFromAnswers,
   getActiveState,
+  answerTypedLetter,
+  stopTyped,
   quizForVideo,
   QUESTIONS_PER_SESSION,
   OFFER_YES,

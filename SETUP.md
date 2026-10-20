@@ -19,7 +19,7 @@ working is not asked about twice.
 | **The AI** — one key, many models | [openrouter.ai/keys](https://openrouter.ai/keys) | a few dollars goes a long way |
 | **WhatsApp** | your own phone | — |
 
-Node.js 20+ and git need to be installed. Redis is required too, but the wizard offers to start one for you
+Node.js 22+ and git need to be installed. Redis is required too, but the wizard offers to start one for you
 with Docker if you have it — otherwise paste any reachable address (Railway, Upstash, your own server).
 
 > **You do not need a Meta WhatsApp Business account to try Rumi.** The wizard's default links your own
@@ -83,7 +83,7 @@ Flows, workers) are needed for a real deployment either way.
 
 | Requirement | Where to Get It |
 |------------|----------------|
-| Node.js 20+ | [nodejs.org](https://nodejs.org) |
+| Node.js 22+ | [nodejs.org](https://nodejs.org) |
 | GitHub account | [github.com](https://github.com) (to fork the repo) |
 | Supabase account | [supabase.com](https://supabase.com) (free tier works) |
 | Railway account | [railway.app](https://railway.app) (for hosting + Redis) |
@@ -115,11 +115,16 @@ cd bot && npm install && cd ..
 
 ## Step 2: Create Supabase Database
 
+> **No Supabase account?** For a laptop, demo or test setup you can skip this step and Step 3:
+> `bash infrastructure/local/up.sh` starts a private Postgres, PostgREST and Redis (no Docker), applies
+> the schema, and prints the `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `REDIS_URL` lines for `.env`.
+> Not for production. See [docs/local-stack.md](docs/local-stack.md).
+
 1. **Create account** at [supabase.com](https://supabase.com) (free tier is sufficient)
 2. **Create a new project** — choose a region closest to your users
 3. **Run the schema.** Two ways:
 
-   **Option A — one command (recommended):** First create the tiny `exec_sql` helper that `npm run bootstrap:db` uses to apply SQL. A brand-new Supabase project does not have it, so paste this **once** in the SQL Editor (ALTER OWNER gives it extension-creation rights; search_path includes `extensions` because uuid-ossp lives there; GRANT and NOTIFY make PostgREST see it):
+   **Option A — one command (recommended):** First create the tiny `exec_sql` helper that `npm run bootstrap:db` uses to apply SQL. A brand-new Supabase project does not have it, so paste this **once** in the SQL Editor (ALTER OWNER gives it extension-creation rights; search_path includes `extensions` because uuid-ossp lives there; REVOKE keeps anyone holding your public anon key from calling it, since it runs any SQL as the database owner; GRANT and NOTIFY make PostgREST see it):
    ```sql
    CREATE OR REPLACE FUNCTION public.exec_sql(query text)
    RETURNS void
@@ -129,6 +134,7 @@ cd bot && npm install && cd ..
    AS $$ BEGIN EXECUTE query; END; $$;
 
    ALTER FUNCTION public.exec_sql(text) OWNER TO postgres;
+   REVOKE EXECUTE ON FUNCTION public.exec_sql(text) FROM PUBLIC, anon, authenticated;
    GRANT EXECUTE ON FUNCTION public.exec_sql(text) TO service_role;
    NOTIFY pgrst, 'reload schema';
    ```
@@ -195,6 +201,18 @@ Required if you want voice message support (Urdu, English, Arabic, Spanish).
 ```env
 SONIOX_API_KEY=your-soniox-key
 ```
+
+### Lesson-plan fidelity (optional, off by default)
+
+With Soniox set, classroom coaching can also check whether a lesson followed the teacher's plan, move by move. It
+needs no new key — it uses `OPENROUTER_API_KEY` and Soniox's timestamped transcripts:
+
+```env
+LP_FIDELITY_ENABLED=true
+```
+
+`rumi doctor` then shows how many recent classroom recordings came back with speech timings. See
+[docs/features/lesson-plan-fidelity.md](docs/features/lesson-plan-fidelity.md).
 
 ### ElevenLabs (Tier 3 — Full, for Voice Responses)
 
@@ -414,6 +432,74 @@ There are **no tiers** — each feature turns on the moment its key(s) are prese
 3. Set up the stale session cron job (Step 11)
 4. Redeploy
 
+### Set test papers from your own textbooks
+
+Test papers (`/testpaper`) are on with the LLM key you already have; teachers can build them from their own
+lesson plans or an uploaded chapter straight away. To let them pick chapters of **your** textbooks, run the
+[curriculum pipeline](curriculum/README.md) over the books, then load its page-truth output:
+
+```bash
+node bot/scripts/testpaper/import-curriculum-corpus.js path/to/curriculum-project --dry-run   # what it would write
+node bot/scripts/testpaper/import-curriculum-corpus.js path/to/curriculum-project
+```
+
+Printing needs Chromium on the bot's host (`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`), and papers are written by
+the background worker. Existing databases: apply `infrastructure/supabase/migrations/V2.4.0__test_papers.sql`.
+See [docs/features/test-papers.md](docs/features/test-papers.md).
+### Add staff attendance for a head teacher (optional)
+
+Class attendance needs nothing. For a head teacher's **staff** attendance and register:
+
+1. Apply the attendance migration on an existing database: `node infrastructure/scripts/migrate.js`
+   (fresh installs already have it from `00_complete-schema.sql`)
+2. Set the school's timezone: `ATTENDANCE_TZ=Africa/Nairobi` (any IANA name; default UTC)
+3. Link the school, its head teacher and staff (from `bot/`):
+   `node scripts/attendance/link-school.js --school "Your School" --head <phone or channel id> --staff <…> --staff-name "…"`
+4. The head teacher says "attendance". See [docs/features/attendance.md](docs/features/attendance.md).
+
+### Add teacher nudges (optional)
+
+1. Set `TEACHER_NUDGES_ENABLED=true` (and `TEACHER_NUDGES_TZ` to your timezone)
+2. Run the worker (`node bot/workers/sqs-worker.js`) — it sweeps every `TEACHER_NUDGES_SWEEP_MINUTES` — or
+   schedule `node bot/workers/teacher-nudges.worker.js` from cron. See [docs/features/teacher-nudges.md](docs/features/teacher-nudges.md).
+
+### Add Observe — the coach's assistant
+
+1. Make sure voice transcription is on (`SONIOX_API_KEY`, above) and the background worker runs (Step 11).
+2. Existing database: apply `infrastructure/supabase/migrations/V2.6.0__observe_coach_assistant.sql`
+   (fresh installs already have it from `00_complete-schema.sql`).
+3. Add to your environment: `OBSERVE_ENABLED=true` (optionally `OBSERVE_FRAMEWORK`, default `teach`).
+   Set `OBSERVE_ENABLED=true` on the dashboard service as well: the portal's coach view ("My observations") reads its own environment and stays off without it.
+4. Give your coaches their schools and teachers:
+   `node bot/scripts/observe-roster.js import roster.csv` (columns `coach_phone,school_ext_id,school_name,teacher_phone,teacher_name`),
+   or one at a time with `grant-coach`, `add-school` and `add-teacher`.
+5. Redeploy. A coach types `/observe`. Details: [docs/features/observe.md](docs/features/observe.md).
+6. Optional: send each coach their portal invite on the channel they use:
+   `node bot/scripts/observe-roster.js portal-invite <coach-phone>` (needs the portal, below).
+
+### Add the teacher portal (optional)
+
+1. Build it into the dashboard: `cd portal && npm ci && npm run build && cp -R dist ../dashboard/portal-frontend/dist`.
+   A production install works for both (`npm ci --omit=dev`): what the dashboard loads and what the portal build
+   needs are dependencies.
+   On a deployment with no WhatsApp (`CHANNEL_DRIVER=none`), set the same `CHANNEL_DRIVER` on the dashboard, and
+   optionally `PORTAL_CHAT_URL` (where "Chat with Rumi" goes, e.g. your messenger's address): the landing page and the
+   portal then name WhatsApp only when the bot runs it.
+2. Run the dashboard on an `https://` address (its session cookie is `Secure`).
+3. Set `PORTAL_URL` (the dashboard's address) on the bot, and `MAIN_BOT_URL` plus the same random
+   `INTERNAL_API_KEY` on both services, so reset codes reach each teacher's own chat.
+4. A teacher types `/portal`. Details, including Rumi Messenger users: [docs/features/teacher-portal.md](docs/features/teacher-portal.md).
+
+### Run Rumi in public (optional)
+
+For a link anyone can sign up on:
+
+1. Set the daily caps in `.env` (`DAILY_MESSAGE_CAP_UNREGISTERED=40`, `DAILY_MESSAGE_CAP_REGISTERED=300`, `DAILY_LESSON_PLAN_CAP_UNREGISTERED=3`,
+   `DAILY_COACHING_CAP_UNREGISTERED=0`, `DAILY_QUIZ_CAP_UNREGISTERED=2`) and `SCHOOL_TIMEZONE`. The per-sender
+   rate limit (`INBOUND_RATE_LIMIT_PER_MINUTE`, 30; media `INBOUND_MEDIA_RATE_LIMIT_PER_MINUTE`, 120) is already on.
+2. Use an OpenRouter key made for this deployment, with a credit limit, and make sure Redis is running.
+3. On Matrix, harden the homeserver too. Checklist: [docs/running-in-public.md](docs/running-in-public.md).
+
 ### Add regional-language speech-to-text (optional)
 
 Speech-to-text for regional Pakistani languages (Balochi, Sindhi, Pashto) uses Meta's MMS-ASR model deployed on [Modal.com](https://modal.com).
@@ -445,6 +531,20 @@ MMS_API_KEY=your-secret-key-here
 | WhatsApp webhook fails | Verify `WEBHOOK_VERIFY_TOKEN` matches between Meta and Railway |
 | Schema too large to paste | Split `00_complete-schema.sql` at section headers and run each section separately |
 | `validate:env` fails | Check that all REQUIRED variables in `.env.template` are filled in |
+
+## Optional: your own Android app
+
+Teachers can reach Rumi on an app you own instead of WhatsApp. Two separate apps, both optional:
+
+1. **Rumi Messenger** (chat with Rumi and colleagues): first run Rumi on a Matrix server
+   ([docs/channels/matrix.md](docs/channels/matrix.md)), then brand, build and publish the Android app —
+   [docs/android-app.md](docs/android-app.md).
+2. **Portal app** (the teacher dashboard): on the dashboard service set `PORTAL_APP_ENABLED=true` (and
+   `ANDROID_APP_PACKAGE` + `ANDROID_APP_SHA256_FINGERPRINTS` for tapped links), then
+   `cd portal && cp .env.app.example .env.app && npm run android:debug` — full guide in
+   [portal/ANDROID.md](portal/ANDROID.md). Needs JDK 21 and the Android SDK.
+
+---
 
 ## Pulling Updates
 

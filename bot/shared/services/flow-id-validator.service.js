@@ -100,6 +100,14 @@ function checkOneFlow(envName, flowId, wabaFlows) {
  * @returns {Promise<{validated: number, drifted: object[], skipped: string[], reason?: string}>}
  */
 async function validateFlowIdsOnBoot({ env = process.env, fetchImpl = fetch } = {}) {
+  // WhatsApp Flows only exist on the Meta driver. A deployment answering on
+  // other channels (CHANNEL_DRIVER=none or baileys) has nothing to check, even
+  // with leftover Meta values in its env.
+  // eslint-disable-next-line global-require -- lazy, like the rest of this boot-only module
+  if (require('../config/feature-availability').resolveChannelDriver(env) !== 'meta') {
+    logToFile('flow_id.validator.skipped', { reason: 'no WhatsApp (Meta) channel on this deployment' });
+    return { validated: 0, drifted: [], skipped: EXPECTED_FLOW_ID_ENV_VARS, reason: 'no_whatsapp_channel' };
+  }
   const token = env.WHATSAPP_TOKEN;
   const wabaId = env.WABA_ID;
   if (!token || !wabaId) {

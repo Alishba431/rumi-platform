@@ -11,6 +11,7 @@
 
 const supabase = require('../config/supabase');
 const { logToFile } = require('../utils/logger');
+const { ownCoaching } = require('./coaching/own-coaching');
 
 class ContextService {
   /**
@@ -146,13 +147,13 @@ class ContextService {
       }
 
       if (!featureType || featureType === 'coaching') {
-        const { data: coaching } = await supabase
+        const { data: coaching } = await ownCoaching(supabase
           .from('coaching_sessions')
           .select(mode === 'detailed'
             ? 'id, status, analysis_data, created_at'
             : 'status, analysis_data, created_at')
           .eq('user_id', userId)
-          .eq('status', 'completed')
+          .eq('status', 'completed')) // never a coach's observation of this teacher: its score is the coach's rating
           .order('created_at', { ascending: false })
           .limit(2);
 

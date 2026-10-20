@@ -6,8 +6,8 @@
   <title><%= title %> - Rumi Observability Portal</title>
   <link rel="icon" type="image/png" href="/images/rumi-logo.png">
   <link rel="stylesheet" href="/css/main.css">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+  <script src="/vendor/chart-4.4.0.umd.min.js"></script>
+  <script src="/vendor/apexcharts-4.7.0.min.js"></script>
   </style>
 </head>
 <body class="bg-background">
@@ -185,17 +185,17 @@
   </div>
 
   <!-- Charts JavaScript -->
-  <script>
+  <script nonce="<%= cspNonce %>">
     // Funnel Chart (Inverted Pyramid using ApexCharts)
     const funnelOptions = {
       series: [
         {
           name: 'Users',
           data: [
-            <%= funnelMetrics.counts.websiteVisits %>,
-            <%= funnelMetrics.counts.ctaClicks %>,
-            <%= funnelMetrics.counts.chatStarts %>,
-            <%= funnelMetrics.counts.registrations %>
+            <%- safeJson(funnelMetrics.counts.websiteVisits) %>,
+            <%- safeJson(funnelMetrics.counts.ctaClicks) %>,
+            <%- safeJson(funnelMetrics.counts.chatStarts) %>,
+            <%- safeJson(funnelMetrics.counts.registrations) %>
           ]
         }
       ],
@@ -225,9 +225,9 @@
         formatter: function(val, opt) {
           const rates = [
             '100%',
-            '<%= funnelMetrics.conversionRates.visitToCta %>%',
-            '<%= funnelMetrics.conversionRates.ctaToChat %>%',
-            '<%= funnelMetrics.conversionRates.chatToRegistration %>%'
+            <%- safeJson(funnelMetrics.conversionRates.visitToCta + '%') %>,
+            <%- safeJson(funnelMetrics.conversionRates.ctaToChat + '%') %>,
+            <%- safeJson(funnelMetrics.conversionRates.chatToRegistration + '%') %>
           ];
           return val + ' users (' + rates[opt.dataPointIndex] + ')';
         },
@@ -269,9 +269,9 @@
           formatter: function(value, { seriesIndex, dataPointIndex, w }) {
             const rates = [
               '100%',
-              '<%= funnelMetrics.conversionRates.visitToCta %>%',
-              '<%= funnelMetrics.conversionRates.ctaToChat %>%',
-              '<%= funnelMetrics.conversionRates.chatToRegistration %>%'
+              <%- safeJson(funnelMetrics.conversionRates.visitToCta + '%') %>,
+              <%- safeJson(funnelMetrics.conversionRates.ctaToChat + '%') %>,
+              <%- safeJson(funnelMetrics.conversionRates.chatToRegistration + '%') %>
             ];
             return value + ' users (Conversion Rate: ' + rates[dataPointIndex] + ')';
           }
@@ -285,7 +285,7 @@
     // Traffic Sources Pie Chart
     <% if (trafficSources && trafficSources.length > 0) { %>
     const trafficSourcesCtx = document.getElementById('trafficSourcesChart').getContext('2d');
-    const trafficSourcesData = <%- JSON.stringify(trafficSources) %>;
+    const trafficSourcesData = <%- safeJson(trafficSources) %>;
 
     new Chart(trafficSourcesCtx, {
       type: 'doughnut',
@@ -315,7 +315,7 @@
 
     // Daily Trends Chart
     const dailyTrendsCtx = document.getElementById('dailyTrendsChart').getContext('2d');
-    const dailyMetricsData = <%- JSON.stringify(dailyMetrics) %>;
+    const dailyMetricsData = <%- safeJson(dailyMetrics) %>;
 
     new Chart(dailyTrendsCtx, {
       type: 'line',

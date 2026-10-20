@@ -26,6 +26,12 @@ const SessionService = require('../../bot/shared/services/session.service');
 const WhatsAppService = require('../../bot/shared/services/whatsapp.service');
 const { runWithCorrelation, getCurrentCorrelationId } = require('../../bot/shared/utils/structured-logger');
 
+// Loading bot/workers/sqs-worker.js pulls in every job handler and the queue
+// drivers, which need the bot's own node_modules. CI runs the root suite BEFORE
+// `cd bot && npm ci`, so that test skips on the first pass (same as worker-boot).
+const BOT_NODE_MODULES_PRESENT = require('fs').existsSync(require('path').resolve(__dirname, '../../bot/node_modules'));
+const itWithBotDeps = BOT_NODE_MODULES_PRESENT ? it : it.skip;
+
 // Mock SessionService directly to isolate message deduplication without touching Redis
 const mockProcessedSet = new Set();
 jest.mock('../../bot/shared/services/session.service', () => ({
@@ -113,7 +119,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
               messages: [{
                 id: 'wamid.perf_test_001',
                 from: '923001234567',
-                timestamp: '1790561399',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'text',
                 text: { body: 'Rapid ack test' }
               }]
@@ -139,31 +145,6 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
       expect(memoryQueue.size('main')).toBe(1);
     });
 
-    it('POST /api/slack/events acknowledges Slack event with HTTP 200 in < 100ms', async () => {
-      const bodyPayload = JSON.stringify({
-        type: 'url_verification',
-        challenge: 'slack_perf_challenge_999'
-      });
-      const timestamp = Math.floor(Date.now() / 1000).toString();
-      const signature = computeSlackSignature(timestamp, bodyPayload);
-
-      const startTime = Date.now();
-      const response = await fetch(`${serverUrl}/api/slack/events`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-slack-request-timestamp': timestamp,
-          'x-slack-signature': signature
-        },
-        body: bodyPayload
-      });
-      const durationMs = Date.now() - startTime;
-
-      expect(response.status).toBe(200);
-      const data = await response.json();
-      expect(data).toEqual({ challenge: 'slack_perf_challenge_999' });
-      expect(durationMs).toBeLessThan(100);
-    });
   });
 
   describe('2. Canonical InboundMessageEnvelope Normalization', () => {
@@ -181,7 +162,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
               messages: [{
                 id: messageId,
                 from: '923001234567',
-                timestamp: '1790561399',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'text',
                 text: { body: 'Hello normalized universe' }
               }]
@@ -223,7 +204,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
               messages: [{
                 id: 'wamid.btn_reply_001',
                 from: '923001234567',
-                timestamp: '1790561399',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'interactive',
                 interactive: {
                   type: 'button_reply',
@@ -393,7 +374,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
       expect(mockHandler).toHaveBeenCalledTimes(1);
     });
 
-    it('sends immediate reaction and typing indicator for WhatsApp messages', async () => {
+    it('leaves the reaction and typing indicator to handleWebhookPost (sent only after the inbound limits)', async () => {
       const mockHandler = jest.fn().mockResolvedValue({ handled: true });
       InboundMessageWorker.setHandler(mockHandler);
 
@@ -408,8 +389,9 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
 
       await InboundMessageWorker.process(envelope);
 
-      expect(WhatsAppService.sendReaction).toHaveBeenCalledWith('923009998877', msgId, expect.any(String));
-      expect(WhatsAppService.showTypingIndicator).toHaveBeenCalledWith('923009998877', msgId);
+      expect(mockHandler).toHaveBeenCalledTimes(1);
+      expect(WhatsAppService.sendReaction).not.toHaveBeenCalled();
+      expect(WhatsAppService.showTypingIndicator).not.toHaveBeenCalled();
     });
 
     it('handles interactive button envelope and constructs proper Meta structure', async () => {
@@ -523,7 +505,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
   });
 
   describe('5. SQS Worker Integration Bridge', () => {
-    it('dispatches inbound_message job through InboundMessageWorker', async () => {
+    itWithBotDeps('dispatches inbound_message job through InboundMessageWorker', async () => {
       const { SQSCoachingWorker } = require('../../bot/workers/sqs-worker');
       const worker = new SQSCoachingWorker();
 
@@ -569,7 +551,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
               messages: [{
                 id: 'wamid.corr_test_001',
                 from: '923001234567',
-                timestamp: '1790561399',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'text',
                 text: { body: 'Trace check' }
               }]
@@ -629,7 +611,7 @@ describe('Gateway Queue-and-Ack Integration (Phase 2)', () => {
               messages: [{
                 id: 'wamid.fail_test_001',
                 from: '923001234567',
-                timestamp: '1790561399',
+                timestamp: String(Math.floor(Date.now() / 1000)),
                 type: 'text',
                 text: { body: 'Trigger failure' }
               }]

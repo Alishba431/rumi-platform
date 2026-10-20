@@ -15,10 +15,11 @@
  */
 
 const fs = require('fs');
-const path = require('path');
 const axios = require('axios');
 const supabase = require('../../config/supabase');
 const { logToFile } = require('../../utils/logger');
+const { redactUrl } = require('../../utils/redact-url');
+const { displayName } = require('../../utils/display-name');
 const GPT5MiniService = require('../gpt5-mini.service');
 const ContentService = require('../content.service');
 const AudioService = require('../audio.service');
@@ -27,8 +28,9 @@ const CoachingSessionService = require('./coaching-session.service');
 const CoachingHelpersService = require('./coaching-helpers.service');
 const PDFReportService = require('../pdf-report.service');
 const FeatureLinkerService = require('../feature-linker.service');
-const { uploadVoiceDebrief, uploadReportPDF } = require('../../storage/r2');
+const { uploadVoiceDebrief, uploadReportPDF, isR2Configured } = require('../../storage/r2');
 const { TEMP_DIR } = require('../../utils/constants');
+const { privateTempPath, removePrivateTemp } = require('../../utils/private-temp');
 const { getCoachingMessage } = require('../../config/coaching-messages');
 
 /**
@@ -44,6 +46,7 @@ const {
   CLASSROOM_MARKS_WITH_LP
 } = require('../../constants/scoring.constants');
 const { getReportTransformer } = require('./report-transformers/report-transformer-dispatch');
+const { ownCoaching } = require('./own-coaching');
 
 class ReportGeneratorService {
   /**
@@ -79,7 +82,7 @@ class ReportGeneratorService {
       }
 
       const from = payload.from || session.users.phone_number;
-      const teacherName = `${session.users.first_name} ${session.users.last_name}`.trim();
+      const teacherName = displayName(session.users);
       const isRetry = payload.attempt && payload.attempt > 1;
 
       // Guardrail: report generation should never run before analysis is available.
@@ -165,7 +168,7 @@ class ReportGeneratorService {
       let reportPdfUrl = null;
       try {
         reportPdfUrl = await uploadReportPDF(pdfBuffer, session.user_id, coachingSessionId);
-        logToFile('✅ Report PDF uploaded to R2', { reportPdfUrl });
+        logToFile('✅ Report PDF uploaded to R2', { reportPdfUrl: redactUrl(reportPdfUrl) });
 
         // Store PDF URL in database
         await supabase
@@ -179,7 +182,19 @@ class ReportGeneratorService {
       }
 
       // Send PDF immediately with proper filename
-      await this.sendPDFReport(from, coachingSessionId, pdfBuffer, session.users.first_name, session.created_at);
+      await this.sendPDFReport(from, coachingSessionId, pdfBuffer, displayName(session.users, 'Teacher', { firstOnly: true }), session.created_at);
+
+      // Lesson-plan fidelity: one line saying how the lesson compared with the plan, or exactly why it wasn't
+      // compared. Only when the feature ran (analysis_data.lp_fidelity); never fails the report.
+      if (enhancedAnalysis.lp_fidelity) {
+        try {
+          const { fidelityChatLineFor } = require('./fidelity/fidelity-report');
+          const line = fidelityChatLineFor(enhancedAnalysis.lp_fidelity, _languageFromSession(session));
+          if (line) await WhatsAppService.sendMessage(from, line);
+        } catch (lineError) {
+          logToFile('⚠️ Fidelity summary line failed (non-critical)', { coachingSessionId, error: lineError.message });
+        }
+      }
 
       // Generate and send voice debrief (optional, won't fail entire process)
       if (!isRetry) {
@@ -296,50 +311,129 @@ class ReportGeneratorService {
 
       logToFile('✅ Report generation complete', { coachingSessionId });
 
-      // Trigger 3: Offer quiz to teacher's students after coaching report
-      try {
-        const language = session.users?.preferred_language || session.transcript_language || 'en';
-        const quizTopic = enhancedAnalysis?.topic;
-        if (quizTopic) {
-          // Find the most recent lesson plan for this teacher to anchor the quiz
-          const { data: recentLP } = await supabase
-            .from('lesson_plans')
-            .select('id, topic')
-            .eq('user_id', session.user_id)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .single();
-
-          if (recentLP) {
-            await this.offerQuizAfterReport(
-              { id: session.user_id },
-              from,
-              recentLP.id,
-              recentLP.topic || quizTopic,
-              language
-            );
-          }
-        }
-      } catch (error) {
-        logToFile('⚠️ Trigger 3: Error offering quiz after coaching', { error: error.message });
-      }
-
-      // Suggest next feature after coaching completion
-      try {
-        const language = session.users?.preferred_language || session.transcript_language || 'en';
-        await FeatureLinkerService.suggestNext(
-          'coaching',
-          session.user_id,
-          from,
-          language,
-          { coachingSessionId }
-        );
-      } catch (error) {
-        logToFile('⚠️ Error in feature linker after coaching', { error: error.message });
-      }
+      await this.afterReportOffers(session, coachingSessionId, from, enhancedAnalysis);
     } catch (error) {
       await this.handleReportError(coachingSessionId, error, payload?.from);
       throw error;
+    }
+  }
+
+  /**
+   * The asks that follow a delivered coaching report: the lesson-quiz offer
+   * (a quiz written from this lesson's transcript), Trigger 3 (a quiz to the
+   * teacher's students' parents) and the next-feature suggestion. Each is
+   * non-fatal — the report is already sent.
+   *
+   * One ask at a time: when the lesson-quiz offer is on its way, Trigger 3
+   * and the suggestion stay quiet (both asks are about a quiz) — and if the
+   * offer job later decides not to offer, it runs them itself
+   * (transcript-quiz-offer runReportFollowUps). With TRANSCRIPT_QUIZ_ENABLED
+   * unset the offer answers false without a read or a write, so the two
+   * follow-ups run here exactly as they did before.
+   *
+   * @param {object} session            coaching_sessions row (with users join)
+   * @param {string} coachingSessionId
+   * @param {string} from               teacher recipient id
+   * @param {object} enhancedAnalysis
+   */
+  static async afterReportOffers(session, coachingSessionId, from, enhancedAnalysis) {
+    const reportLanguage = session.users?.preferred_language || session.transcript_language || 'en';
+    const quizOfferScheduled = await this.scheduleTranscriptQuiz(
+      session, coachingSessionId, from, reportLanguage, enhancedAnalysis?.topic
+    );
+    if (!quizOfferScheduled) {
+      await this.reportFollowUps(session, coachingSessionId, from, enhancedAnalysis?.topic);
+    }
+  }
+
+  /**
+   * Trigger 3 and the next-feature suggestion, exactly as the report has
+   * always sent them. Called by afterReportOffers, and by the lesson-quiz
+   * offer job when it held them back and then made no offer — which is why
+   * it needs only the teacher's id, their language and the lesson's topic.
+   *
+   * @param {object} session            { user_id, users?: { preferred_language }, transcript_language? }
+   * @param {string} coachingSessionId
+   * @param {string} from               teacher recipient id
+   * @param {string} [quizTopic]        the analysed lesson's topic
+   */
+  static async reportFollowUps(session, coachingSessionId, from, quizTopic) {
+    // Trigger 3: Offer quiz to teacher's students after coaching report
+    try {
+      const language = session.users?.preferred_language || session.transcript_language || 'en';
+      if (quizTopic) {
+        // Find the most recent lesson plan for this teacher to anchor the quiz
+        const { data: recentLP } = await supabase
+          .from('lesson_plans')
+          .select('id, topic')
+          .eq('user_id', session.user_id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (recentLP) {
+          await this.offerQuizAfterReport(
+            { id: session.user_id },
+            from,
+            recentLP.id,
+            recentLP.topic || quizTopic,
+            language
+          );
+        }
+      }
+    } catch (error) {
+      logToFile('⚠️ Trigger 3: Error offering quiz after coaching', { error: error.message });
+    }
+
+    // Suggest next feature after coaching completion
+    try {
+      const language = session.users?.preferred_language || session.transcript_language || 'en';
+      await FeatureLinkerService.suggestNext(
+        'coaching',
+        session.user_id,
+        from,
+        language,
+        { coachingSessionId }
+      );
+    } catch (error) {
+      logToFile('⚠️ Error in feature linker after coaching', { error: error.message });
+    }
+  }
+
+  /**
+   * Schedule the lesson-quiz offer for this coaching session. It is sent
+   * after the report's reply window by the `quiz_offer` job; the offer
+   * service owns every word of it (nothing is sent from here).
+   *
+   * Never throws into the report: a quiz offer is not worth failing a
+   * session over. With TRANSCRIPT_QUIZ_ENABLED unset the offer service
+   * answers false immediately, which is what makes this call inert.
+   *
+   * @param {object} session            coaching_sessions row (with users join)
+   * @param {string} coachingSessionId
+   * @param {string} from               teacher recipient id
+   * @param {string} outputLanguage     the report's language
+   * @param {string} [reportTopic]      the analysed topic, for the follow-ups the job may run
+   * @returns {Promise<boolean>} true when the offer is scheduled
+   */
+  static async scheduleTranscriptQuiz(session, coachingSessionId, from, outputLanguage, reportTopic) {
+    try {
+      const TranscriptQuizOffer = require('../quiz/transcript-quiz-offer.service');
+      const scheduled = await TranscriptQuizOffer.scheduleOffer({
+        coachingSessionId,
+        userId: session.user_id,
+        phone: from || session?.users?.phone_number,
+        language: outputLanguage,
+        transcriptChars: String(session.transcript_text || '').length,
+        source: 'self',
+        reportTopic,
+      });
+      return Boolean(scheduled);
+    } catch (error) {
+      logToFile('⚠️ lesson quiz: offer scheduling failed (non-fatal)', {
+        coachingSessionId, error: error.message,
+      });
+      return false;
     }
   }
 
@@ -412,11 +506,11 @@ class ReportGeneratorService {
     try {
       logToFile('Fetching prior coaching sessions with compression', { userId, currentSessionId });
 
-      const { data: priorSessions, error } = await supabase
+      const { data: priorSessions, error } = await ownCoaching(supabase
         .from('coaching_sessions')
         .select('id, created_at, analysis_data')
         .eq('user_id', userId)
-        .eq('status', 'completed')
+        .eq('status', 'completed')) // never a coach's observation of this teacher: it is not their own session
         .neq('id', currentSessionId)
         .order('created_at', { ascending: false });
 
@@ -491,11 +585,11 @@ class ReportGeneratorService {
     try {
       logToFile('⚠️  Using deprecated fetchPriorSession() - use fetchAndCompressPriorFeedback() instead', { userId });
 
-      const { data: priorSession, error } = await supabase
+      const { data: priorSession, error } = await ownCoaching(supabase
         .from('coaching_sessions')
         .select('id, created_at, analysis_data')
         .eq('user_id', userId)
-        .eq('status', 'completed')
+        .eq('status', 'completed')) // never a coach's observation of this teacher: it is not their own session
         .neq('id', currentSessionId)
         .order('created_at', { ascending: false })
         .limit(1)
@@ -576,11 +670,11 @@ class ReportGeneratorService {
     // Check if user has prior completed sessions (needed by OECD transformer)
     let hasPriorSessions = false;
     try {
-      const { count, error: countError } = await supabase
+      const { count, error: countError } = await ownCoaching(supabase
         .from('coaching_sessions')
         .select('id', { count: 'exact', head: true })
         .eq('user_id', session.user_id)
-        .eq('status', 'completed')
+        .eq('status', 'completed')) // never a coach's observation of this teacher: it is not their own session
         .neq('id', session.id);
       if (!countError) hasPriorSessions = (count || 0) > 0;
     } catch (e) {
@@ -853,11 +947,11 @@ class ReportGeneratorService {
     // PRIOR FEEDBACK (separate from 5 main goals, 5 marks total)
     // Check if user has prior completed sessions
     let hasPriorSessions = false;
-    const { count, error: countError } = await supabase
+    const { count, error: countError } = await ownCoaching(supabase
       .from('coaching_sessions')
       .select('id', { count: 'exact', head: true })
       .eq('user_id', session.user_id)
-      .eq('status', 'completed')
+      .eq('status', 'completed')) // never a coach's observation of this teacher: it is not their own session
       .neq('id', session.id);
 
     if (countError) {
@@ -1198,15 +1292,16 @@ class ReportGeneratorService {
    * @private
    */
   static async sendPDFReport(phoneNumber, coachingSessionId, pdfBuffer, teacherFirstName = 'Teacher', observationDate = null, languageCode = 'en') {
+    let tmp = null;
     try {
       await WhatsAppService.sendMessage(phoneNumber, getCoachingMessage('reportReady', languageCode));
 
-      const tempPdfPath = path.join(TEMP_DIR, `report_${coachingSessionId}_${Date.now()}.pdf`);
-
-      // Ensure temp directory exists
-      if (!fs.existsSync(TEMP_DIR)) {
-        fs.mkdirSync(TEMP_DIR, { recursive: true });
-      }
+      // A directory of this call's own (created with TEMP_DIR if absent). The
+      // session id and the clock do not make the path unique: the same session's
+      // report sent twice in one millisecond shared it, and one send could upload
+      // the other's bytes or lose its file to the other's cleanup.
+      tmp = privateTempPath(TEMP_DIR, `report_${coachingSessionId}.pdf`, 'coaching-report-');
+      const tempPdfPath = tmp.filePath;
 
       // Write PDF buffer to temp file
       fs.writeFileSync(tempPdfPath, pdfBuffer);
@@ -1228,11 +1323,6 @@ class ReportGeneratorService {
       // Send document with formatted filename
       await WhatsAppService.sendDocument(phoneNumber, tempPdfPath, filename);
 
-      // Clean up temp file
-      if (fs.existsSync(tempPdfPath)) {
-        fs.unlinkSync(tempPdfPath);
-      }
-
       logToFile('PDF report sent', { coachingSessionId });
     } catch (error) {
       logToFile('Warning: Failed to send PDF', {
@@ -1240,6 +1330,8 @@ class ReportGeneratorService {
         error: error.message
       });
       throw error; // PDF delivery is critical, fail if it doesn't work
+    } finally {
+      removePrivateTemp(tmp);
     }
   }
 
@@ -1263,15 +1355,23 @@ class ReportGeneratorService {
         session.transcript_language
       );
 
-      const voiceScript = await GPT5MiniService.summarizeForVoiceDebrief(
-        {
-          analysis: enhancedAnalysis,
-          conversation: session.conversation_state,
-          hasLessonPlan: !!enhancedAnalysis.has_lesson_plan,
-          fidelityScore: enhancedAnalysis.fidelity_analysis?.score || null
-        },
-        outputLanguage
-      );
+      // With lesson-plan fidelity measured, the voice gets the band in words and the move count — never a
+      // percentage it could read out (projectForVoice). Without it, the payload is as it always was.
+      const voiceData = {
+        analysis: enhancedAnalysis,
+        conversation: session.conversation_state,
+        hasLessonPlan: !!enhancedAnalysis.has_lesson_plan,
+        fidelityScore: enhancedAnalysis.fidelity_analysis?.score || null
+      };
+      if (enhancedAnalysis.lp_fidelity) {
+        const { projectForVoice } = require('./fidelity/fidelity-report');
+        const projected = projectForVoice(enhancedAnalysis, outputLanguage);
+        voiceData.analysis = projected.analysis;
+        voiceData.hasLessonPlan = voiceData.hasLessonPlan || !!enhancedAnalysis.lp_fidelity.source;
+        voiceData.fidelityScore = null;
+        voiceData.lessonPlanFidelity = projected.lessonPlanFidelity;
+      }
+      const voiceScript = await GPT5MiniService.summarizeForVoiceDebrief(voiceData, outputLanguage);
 
       logToFile('Voice debrief script generated', {
         coachingSessionId,
@@ -1287,6 +1387,14 @@ class ReportGeneratorService {
       // Generate audio from script
       const voiceBuffer = await AudioService.generateSpeechForLanguage(voiceScript, outputLanguage);
 
+      // Without object storage (R2 is optional) the voice note is sent from memory instead of by URL.
+      if (!isR2Configured()) {
+        await WhatsAppService.sendMessage(phoneNumber, getCoachingMessage('voiceSummaryReady', _languageFromSession(session)));
+        await WhatsAppService.sendAudio(phoneNumber, voiceBuffer, TEMP_DIR);
+        logToFile('Voice debrief sent without object storage', { coachingSessionId });
+        return;
+      }
+
       // Upload voice debrief to R2
       const voiceUrl = await uploadVoiceDebrief(
         voiceBuffer,
@@ -1295,7 +1403,7 @@ class ReportGeneratorService {
         outputLanguage
       );
 
-      logToFile('Voice debrief uploaded', { coachingSessionId, voiceUrl });
+      logToFile('Voice debrief uploaded', { coachingSessionId, voiceUrl: redactUrl(voiceUrl) });
 
       // Update database
       await supabase

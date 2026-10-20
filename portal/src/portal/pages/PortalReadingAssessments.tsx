@@ -8,6 +8,7 @@ import type { Pagination } from '../types/portal';
 import PortalLayout from '../components/PortalLayout';
 import LoadingState from '../components/LoadingState';
 import EmptyState from '../components/EmptyState';
+import { getApiBaseUrl, isNativeApp } from '@/lib/runtime';
 
 const PortalReadingAssessments = () => {
   const navigate = useNavigate();
@@ -62,12 +63,11 @@ const PortalReadingAssessments = () => {
   };
 
   const handleDownloadPdf = (id: string) => {
-    // UPDATED: Use relative URL since frontend and backend are on same domain
-    const baseUrl = import.meta.env.PROD
-      ? '' // Empty string for relative URL in production (same domain)
-      : 'http://localhost:4000'; // Absolute URL for local development
-
-    window.open(`${baseUrl}/api/portal/reading-assessment/${id}/pdf`, '_blank');
+    // Same base as every API call (src/lib/runtime.ts): relative on the web,
+    // absolute in the Android app, whose WebView has no portal origin. In the
+    // app the PDF stays in the WebView (allowNavigation) so the session cookie
+    // goes with it; a new window would hand it to the browser, which has none.
+    window.open(`${getApiBaseUrl()}/reading-assessment/${id}/pdf`, isNativeApp() ? '_self' : '_blank');
   };
 
   if (loading) return <PortalLayout><LoadingState /></PortalLayout>;

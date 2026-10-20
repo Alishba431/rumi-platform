@@ -99,9 +99,36 @@ async function getOrCreateUser(phoneNumber) {
  * @param {string} channelUserId - the bare identifier on that channel (a
  *   WhatsApp phone number, a Slack user id, a Discord snowflake — never a
  *   "channel:id"-prefixed string; that prefix is a messaging-router concern)
+ * @param {object} [opts]
+ * @param {string} [opts.replyIdentifier] - the exact identifier this message came
+ *   from, as the messaging router addresses it ("slack:U…", a channel's own short
+ *   form, …). Stored on the user_channels row so a later proactive send (one with
+ *   no inbound message to reply to) can deliver back to it rather than re-derive it.
  * @returns {Promise<object>} User record (the same shape getOrCreateUser returns)
  */
-async function getOrCreateUserByChannel(channel, channelUserId) {
+/**
+ * The phone number a new Matrix user can be recorded with, or null. Only the
+ * bare-digits identity counts ("mtx:<digits>": the "+<digits>" account on the
+ * bot's own homeserver, see matrix-identity.js). The "t" account
+ * ("mtx:t<digits>") and every other server's users keep their number out of
+ * users.phone_number: it is only a username, and recording it would let that
+ * account claim the WhatsApp teacher with the same number. Even for the "+"
+ * account the number is admin-asserted, not verified (docs/channels/matrix.md).
+ */
+async function matrixPhoneNumberFor(channel, channelUserId) {
+  if (channel !== 'matrix' || !/^\d{7,15}$/.test(String(channelUserId))) return null;
+  // limit(1), not single(): single() errors when two users already hold the
+  // number, and an error must not read as "nobody has it".
+  const { data: taken, error } = await supabase
+    .from('users')
+    .select('id')
+    .eq('phone_number', String(channelUserId))
+    .limit(1);
+  if (error) return null;
+  return taken && taken.length ? null : String(channelUserId);
+}
+
+async function getOrCreateUserByChannel(channel, channelUserId, { replyIdentifier = null } = {}) {
   if (channel === 'whatsapp') {
     // The legacy path is authoritative for WhatsApp — same lookup key
     // (phone_number), same insert shape, zero behavior change. Only make sure
@@ -123,7 +150,8 @@ async function getOrCreateUserByChannel(channel, channelUserId) {
     if (existingLink) {
       const nowIso = new Date().toISOString();
       try {
-        await supabase.from('user_channels').update({ last_message_at: nowIso }).eq('channel', channel).eq('channel_user_id', channelUserId);
+        const stamp = replyIdentifier ? { last_message_at: nowIso, reply_identifier: replyIdentifier } : { last_message_at: nowIso };
+        await supabase.from('user_channels').update(stamp).eq('channel', channel).eq('channel_user_id', channelUserId);
       } catch (stampErr) {
         console.error('user_channels last_message_at update failed:', stampErr.message);
       }
@@ -137,15 +165,28 @@ async function getOrCreateUserByChannel(channel, channelUserId) {
         console.error('Error fetching user for existing channel link:', fetchUserError);
         throw fetchUserError;
       }
+      // A Matrix teacher created before their number was recorded (see below).
+      if (user && !user.phone_number) {
+        const phoneNumber = await matrixPhoneNumberFor(channel, channelUserId);
+        if (phoneNumber) {
+          await supabase.from('users').update({ phone_number: phoneNumber }).eq('id', user.id);
+          user.phone_number = phoneNumber;
+        }
+      }
       return user;
     }
 
     // No existing link — brand-new person on this channel. Create both the
-    // users row (no phone_number — see the schema's relaxed NOT NULL) and its
-    // first user_channels row together.
+    // users row and its first user_channels row together. A users row has no
+    // phone_number (see the schema's relaxed NOT NULL), except for a Matrix
+    // teacher whose username is their phone number (mtx:<digits>, see
+    // matrix-identity.js): the portal signs teachers in by phone_number. It is
+    // only recorded when no other user has that number already.
+    const phoneNumber = await matrixPhoneNumberFor(channel, channelUserId);
     const { data: newUser, error: createUserError } = await supabase
       .from('users')
       .insert({
+        ...(phoneNumber ? { phone_number: phoneNumber } : {}),
         registration_completed: false,
         created_at: new Date().toISOString(),
         last_message_at: new Date().toISOString(),
@@ -158,7 +199,7 @@ async function getOrCreateUserByChannel(channel, channelUserId) {
       throw createUserError;
     }
 
-    await ensureUserChannelRow(newUser.id, channel, channelUserId, { isPrimary: true });
+    await ensureUserChannelRow(newUser.id, channel, channelUserId, { isPrimary: true, replyIdentifier });
     console.log(`✅ New user created via ${channel}: ${channelUserId}`);
     return newUser;
   } catch (error) {
@@ -172,7 +213,7 @@ async function getOrCreateUserByChannel(channel, channelUserId) {
  * channelUserId) — the lazy-backfill helper getOrCreateUserByChannel uses for
  * both the whatsapp delegation path and brand-new channel identities.
  */
-async function ensureUserChannelRow(userId, channel, channelUserId, { isPrimary = false } = {}) {
+async function ensureUserChannelRow(userId, channel, channelUserId, { isPrimary = false, replyIdentifier = null } = {}) {
   try {
     const { data: existing } = await supabase
       .from('user_channels')
@@ -187,6 +228,7 @@ async function ensureUserChannelRow(userId, channel, channelUserId, { isPrimary 
       channel,
       channel_user_id: channelUserId,
       is_primary: isPrimary,
+      ...(replyIdentifier ? { reply_identifier: replyIdentifier } : {}),
       created_at: new Date().toISOString(),
       last_message_at: new Date().toISOString(),
     });
@@ -625,6 +667,7 @@ async function trackChatStart(user, phoneNumber, messageBody) {
 module.exports = {
   getOrCreateUser,
   getOrCreateUserByChannel,
+  matrixPhoneNumberFor,
   getSendTargetsForUser,
   getOrCreateSession,
   updateSessionType,

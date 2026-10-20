@@ -20,6 +20,7 @@ const WhatsAppService = require('./whatsapp.service');
 const FeatureIntroService = require('./feature-intro.service');
 const { FEATURE_VIDEO_URLS, FEATURE_CONSENT_MESSAGES, CONSENT_BUTTON_LABELS } = require('../constants/feature-videos');
 const redisService = require('./cache/railway-redis.service');
+const { ownCoaching } = require('./coaching/own-coaching');
 
 /**
  * Feature linking matrix with probabilities and messages
@@ -345,10 +346,10 @@ class FeatureLinkerService {
         .order('created_at', { ascending: false })
         .limit(1);
 
-      const { data: coachingSessions } = await supabase
+      const { data: coachingSessions } = await ownCoaching(supabase
         .from('coaching_sessions')
         .select('created_at')
-        .eq('user_id', userId)
+        .eq('user_id', userId)) // never a coach's observation of this teacher: it is not their own session
         .order('created_at', { ascending: false })
         .limit(1);
 

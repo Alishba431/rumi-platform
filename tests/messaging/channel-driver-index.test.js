@@ -101,6 +101,35 @@ describe('messaging channel driver selector', () => {
     expectResolvesToBaileys(facade);
   });
 
+  it('with an additive channel configured, a prefixed identifier routes to it instead of the WhatsApp-family driver', async () => {
+    jest.resetModules();
+    mockCommon();
+    process.env.CHANNEL_DRIVER = 'baileys';
+    process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.org';
+    process.env.MATRIX_ACCESS_TOKEN = 'test-token';
+    jest.doMock('../../bot/shared/services/messaging/pending-options', () => ({
+      remember: jest.fn().mockResolvedValue(undefined),
+      get: jest.fn().mockResolvedValue(null),
+      clear: jest.fn().mockResolvedValue(undefined),
+      resolveSelection: jest.fn(() => null),
+    }));
+    jest.doMock('../../bot/shared/services/messaging/matrix-connection', () => ({
+      getClient: jest.fn().mockRejectedValue(new Error('not connected in this test')),
+      isE2eeActive: jest.fn(() => false),
+    }));
+    try {
+      require('../../bot/shared/services/messaging/matrix-outbound-relay').ownConnectionInThisProcess(); // this test plays the bot, the connection owner
+      const idx = require('../../bot/shared/services/messaging');
+      // sendMessage rejects (no real connection) rather than throwing
+      // "is not a function" or silently hitting the Baileys driver instead,
+      // proof the Proxy actually routed this call to the Matrix driver.
+      await expect(idx.sendMessage('matrix:@teacher:example.org', 'hi')).resolves.toBe(false);
+    } finally {
+      delete process.env.MATRIX_HOMESERVER_URL;
+      delete process.env.MATRIX_ACCESS_TOKEN;
+    }
+  });
+
   it('with no additive channel configured, the Proxy forwards every call to the real driver unchanged', async () => {
     jest.resetModules();
     mockCommon();
@@ -112,8 +141,8 @@ describe('messaging channel driver selector', () => {
     // preserve (see tests/whatsapp/send-image-from-url.test.js for the real
     // regression this guards against).
     const spy = jest.spyOn(baileys, 'sendReaction').mockResolvedValue('spied');
-    await expect(idx.sendReaction('923001234567', 'msg-1')).resolves.toBe('spied');
-    expect(spy).toHaveBeenCalledWith('923001234567', 'msg-1');
+    await expect(idx.sendReaction('15550101234', 'msg-1')).resolves.toBe('spied');
+    expect(spy).toHaveBeenCalledWith('15550101234', 'msg-1');
     spy.mockRestore();
   });
 });

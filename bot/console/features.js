@@ -29,14 +29,15 @@ const WHEN_OFF = {
   stt_soniox: 'Voice notes are not transcribed. Teachers who send audio get no reply, and reading assessments cannot run.',
   tts_elevenlabs: 'Rumi answers in text only. Nothing breaks; spoken replies just stop.',
   tts_uplift: 'Urdu, Sindhi and Balochi replies fall back to a general-purpose voice, which reads them less naturally.',
-  lesson_plans_gamma: 'Lesson plans are still written, but not turned into slides.',
+  lesson_plans_gamma: 'Teachers who ask for a lesson plan or presentation are told it is not available here. Photo lesson plans still work with a Kie.ai key.',
   pronunciation_azure: 'Reading assessments still score speed and accuracy, but not pronunciation.',
   video_kie: 'The video option disappears from the menu. Everything else is unaffected.',
   exam_ocr: 'Photographed exam papers cannot be marked. Typed and printed worksheets still work.',
   observability_axiom: 'Logs stay in the terminal and the daily file instead of going to Axiom.',
   morning_brief: 'The daily programme-health message stops being sent.',
-  channel_slack: 'Teachers can no longer reach Rumi in Slack. WhatsApp is unaffected.',
-  channel_discord: 'Teachers can no longer reach Rumi in Discord. WhatsApp is unaffected.',
+  channel_slack: 'Teachers can no longer reach Rumi in Slack. Your other channels are unaffected.',
+  channel_discord: 'Teachers can no longer reach Rumi in Discord. Your other channels are unaffected.',
+  channel_matrix: 'Teachers can no longer reach Rumi on your Matrix messenger. Your other channels are unaffected.',
 };
 
 /** Human titles, borrowed from the wizard where it has one. */

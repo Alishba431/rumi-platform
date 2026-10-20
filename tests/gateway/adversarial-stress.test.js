@@ -173,84 +173,6 @@ describe('Adversarial Stress & Chaos Test Suite', () => {
       expect(receivedEnvelopeIds.size).toBe(concurrency);
     });
 
-    it('verifies Slack queue handoff in standalone gateway server', async () => {
-      // In bot/gateway/server.js, an independent IngressDispatcher is instantiated.
-      // With router created per mount invocation, Slack events are routed to
-      // server.js's queueProducer and enqueued successfully.
-
-      const timestamp = Math.floor(Date.now() / 1000);
-      const slackBody = JSON.stringify({
-        type: 'event_callback',
-        event_id: `slack_trace_${Date.now()}`,
-        event: {
-          type: 'message',
-          user: 'U_AUDIT_USER',
-          text: 'Auditing Slack queue handoff',
-          ts: `${timestamp}.000100`
-        }
-      });
-      const signature = computeSlackSignature(timestamp, slackBody, TEST_SLACK_SECRET);
-
-      const res = await fetch(`${serverUrl}/api/slack/events`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-slack-request-timestamp': String(timestamp),
-          'x-slack-signature': signature
-        },
-        body: slackBody
-      });
-
-      // HTTP response acknowledges 200 OK (< 100ms)
-      expect(res.status).toBe(200);
-
-      // Remediation: The envelope is queued to memoryQueue in server.js
-      expect(memoryQueue.size('main')).toBe(1);
-    });
-
-    it('verifies Slack queue handoff when defaultDispatcher is configured with queueProducer', async () => {
-      // Configure defaultDispatcher to prove that the queueProducer logic itself works
-      // once the singleton routing flaw is circumvented.
-      defaultDispatcher.setQueueProducer(async (envelope) => {
-        return await memoryQueue.queueJob(
-          envelope.from || envelope.id,
-          'inbound_message',
-          envelope,
-          { deduplicationId: envelope.id }
-        );
-      });
-
-      const timestamp = Math.floor(Date.now() / 1000);
-      const slackBody = JSON.stringify({
-        type: 'event_callback',
-        event_id: `slack_fixed_${Date.now()}`,
-        event: {
-          type: 'message',
-          user: 'U_FIXED_USER',
-          text: 'Testing with configured defaultDispatcher',
-          ts: `${timestamp}.000200`
-        }
-      });
-      const signature = computeSlackSignature(timestamp, slackBody, TEST_SLACK_SECRET);
-
-      const res = await fetch(`${serverUrl}/api/slack/events`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-slack-request-timestamp': String(timestamp),
-          'x-slack-signature': signature
-        },
-        body: slackBody
-      });
-
-      expect(res.status).toBe(200);
-      expect(memoryQueue.size('main')).toBe(1);
-
-      const jobs = await memoryQueue.receiveJobs(1);
-      expect(jobs[0].body.payload.channel).toBe('slack');
-      expect(jobs[0].body.payload.payload.text).toBe('Testing with configured defaultDispatcher');
-    });
-
     it('sustains 4 waves of 50 requests (200 total) without degradation or memory exhaustion', async () => {
       const waves = 4;
       const waveSize = 50;
@@ -335,8 +257,8 @@ describe('Adversarial Stress & Chaos Test Suite', () => {
       const firstResult = await InboundMessageWorker.process(envelope);
       expect(firstResult).toEqual({ success: true });
       expect(domainHandlerMock).toHaveBeenCalledTimes(1);
-      expect(WhatsAppService.sendReaction).toHaveBeenCalledTimes(1);
-      expect(WhatsAppService.showTypingIndicator).toHaveBeenCalledTimes(1);
+      expect(WhatsAppService.sendReaction).not.toHaveBeenCalled(); // reaction is handleWebhookPost's, after the limits
+      expect(WhatsAppService.showTypingIndicator).not.toHaveBeenCalled(); // reaction is handleWebhookPost's, after the limits
 
       // Deliver 29 duplicates sequentially
       for (let i = 0; i < 29; i++) {
@@ -346,8 +268,8 @@ describe('Adversarial Stress & Chaos Test Suite', () => {
 
       // Crucial: Domain handler and feedback must NOT have been called again
       expect(domainHandlerMock).toHaveBeenCalledTimes(1);
-      expect(WhatsAppService.sendReaction).toHaveBeenCalledTimes(1);
-      expect(WhatsAppService.showTypingIndicator).toHaveBeenCalledTimes(1);
+      expect(WhatsAppService.sendReaction).not.toHaveBeenCalled(); // reaction is handleWebhookPost's, after the limits
+      expect(WhatsAppService.showTypingIndicator).not.toHaveBeenCalled(); // reaction is handleWebhookPost's, after the limits
     });
 
     it('measures concurrent duplicate race in InboundMessageWorker', async () => {

@@ -5,10 +5,8 @@
  * provider adapters, and gateway router in isolation.
  */
 
-const { createInboundEnvelope, ENVELOPE_TYPES } = require('../../bot/gateway/envelope');
+const { createInboundEnvelope, ENVELOPE_TYPES, whatsAppRequestToEnvelope } = require('../../bot/gateway/envelope');
 const { IngressDispatcher } = require('../../bot/gateway/ingress-dispatcher');
-const whatsappAdapter = require('../../bot/gateway/adapters/whatsapp.adapter');
-const slackAdapter = require('../../bot/gateway/adapters/slack.adapter');
 const { createWebhookRoutes } = require('../../bot/gateway/webhook.routes');
 
 describe('Canonical Inbound Message Envelope', () => {
@@ -122,7 +120,7 @@ describe('Ingress Dispatcher', () => {
   });
 });
 
-describe('WhatsApp Ingress Adapter', () => {
+describe('WhatsApp request -> envelope (whatsAppRequestToEnvelope)', () => {
   const originalVerifyToken = process.env.WEBHOOK_VERIFY_TOKEN;
 
   beforeEach(() => {
@@ -131,44 +129,6 @@ describe('WhatsApp Ingress Adapter', () => {
 
   afterEach(() => {
     process.env.WEBHOOK_VERIFY_TOKEN = originalVerifyToken;
-  });
-
-  it('verifies handshake when mode and token match', () => {
-    const req = {
-      query: {
-        'hub.mode': 'subscribe',
-        'hub.verify_token': 'test_secret_token',
-        'hub.challenge': 'meta_challenge_xyz'
-      }
-    };
-    const res = {
-      status: jest.fn().mockReturnThis(),
-      send: jest.fn()
-    };
-
-    whatsappAdapter.verifyWebhook(req, res);
-
-    expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.send).toHaveBeenCalledWith('meta_challenge_xyz');
-  });
-
-  it('rejects handshake with 403 Forbidden when token does not match', () => {
-    const req = {
-      query: {
-        'hub.mode': 'subscribe',
-        'hub.verify_token': 'wrong_token',
-        'hub.challenge': 'meta_challenge_xyz'
-      }
-    };
-    const res = {
-      status: jest.fn().mockReturnThis(),
-      send: jest.fn()
-    };
-
-    whatsappAdapter.verifyWebhook(req, res);
-
-    expect(res.status).toHaveBeenCalledWith(403);
-    expect(res.send).toHaveBeenCalledWith('Forbidden');
   });
 
   it('parses WhatsApp text message into canonical envelope', () => {
@@ -201,7 +161,7 @@ describe('WhatsApp Ingress Adapter', () => {
       }
     };
 
-    const envelope = whatsappAdapter.parseToEnvelope(req, 'test-corr-1');
+    const envelope = whatsAppRequestToEnvelope(req, 'test-corr-1');
 
     expect(envelope).toBeDefined();
     expect(envelope.id).toBe('wamid.12345');
@@ -247,7 +207,7 @@ describe('WhatsApp Ingress Adapter', () => {
       }
     };
 
-    const envelope = whatsappAdapter.parseToEnvelope(req, 'test-corr-btn');
+    const envelope = whatsAppRequestToEnvelope(req, 'test-corr-btn');
 
     expect(envelope).toBeDefined();
     expect(envelope.type).toBe(ENVELOPE_TYPES.INTERACTIVE_BUTTON);
@@ -282,7 +242,7 @@ describe('WhatsApp Ingress Adapter', () => {
       }
     };
 
-    const envelope = whatsappAdapter.parseToEnvelope(req, 'test-corr-status');
+    const envelope = whatsAppRequestToEnvelope(req, 'test-corr-status');
 
     expect(envelope).toBeDefined();
     expect(envelope.type).toBe(ENVELOPE_TYPES.STATUS_UPDATE);
@@ -291,43 +251,8 @@ describe('WhatsApp Ingress Adapter', () => {
   });
 });
 
-describe('Slack Ingress Adapter', () => {
-  it('normalizes Slack event into canonical envelope', () => {
-    const syntheticReq = {
-      body: {
-        entry: [
-          {
-            changes: [
-              {
-                value: {
-                  messages: [
-                    {
-                      id: 'slack_msg_1',
-                      from: 'slack:U123456',
-                      timestamp: 1790561399,
-                      type: 'text',
-                      text: { body: 'Hello Slack Rumi' }
-                    }
-                  ]
-                }
-              }
-            ]
-          }
-        ]
-      }
-    };
-
-    const envelope = slackAdapter.normalizeSlackEvent(syntheticReq);
-
-    expect(envelope.channel).toBe('slack');
-    expect(envelope.from).toBe('slack:U123456');
-    expect(envelope.type).toBe(ENVELOPE_TYPES.TEXT);
-    expect(envelope.payload.text).toBe('Hello Slack Rumi');
-  });
-});
-
 describe('Webhook Routes Router Factory', () => {
-  it('creates an Express router with /webhook and /api/slack mounts', () => {
+  it('creates an Express router serving /webhook', () => {
     const mockDispatcher = new IngressDispatcher();
     const router = createWebhookRoutes(mockDispatcher);
 

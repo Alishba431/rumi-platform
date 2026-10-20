@@ -21,6 +21,12 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const SERVER_PATH = path.resolve(REPO_ROOT, 'bot/gateway/server.js');
 const memoryQueue = require('../../bot/shared/services/queue/memory-queue.service');
 
+// Booting the standalone server in a child process needs the bot's own
+// node_modules (pino, the queue drivers). CI runs the root suite BEFORE
+// `cd bot && npm ci`, so these skip on that first pass (same as worker-boot).
+const BOT_NODE_MODULES_PRESENT = fs.existsSync(path.resolve(__dirname, '../../bot/node_modules'));
+const itWithBotDeps = BOT_NODE_MODULES_PRESENT ? it : it.skip;
+
 const TEST_VERIFY_TOKEN = 'standalone_meta_verify_token_456';
 const TEST_SLACK_SECRET = 'standalone_slack_signing_secret_123';
 
@@ -232,52 +238,17 @@ describe('Standalone Gateway Microservice (bot/gateway/server.js)', () => {
       expect(job.body.payload.payload.text).toBe('Hello Gateway!');
     });
 
-    it('POST /api/slack/events with valid HMAC signature returns 200 with challenge', async () => {
-      const challengeCode = 'slack_challenge_xyz_standalone';
-      const bodyPayload = JSON.stringify({
-        type: 'url_verification',
-        token: 'legacy_token_ignored',
-        challenge: challengeCode
-      });
-
-      const timestamp = Math.floor(Date.now() / 1000).toString();
-      const signature = computeSlackSignature(timestamp, bodyPayload);
-
+    it('does not serve Slack: Slack stays on the bot, whose modals need the live trigger_id', async () => {
       const res = await request('/api/slack/events', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-slack-request-timestamp': timestamp,
-          'x-slack-signature': signature
-        },
-        body: bodyPayload
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'url_verification', challenge: 'x' })
       });
 
-      expect(res.status).toBe(200);
-      expect(res.body).toEqual({ challenge: challengeCode });
+      expect(res.status).toBe(404);
+      expect(memoryQueue.size('main')).toBe(0);
     });
 
-    it('POST /api/slack/events with invalid HMAC signature returns 401', async () => {
-      const bodyPayload = JSON.stringify({
-        type: 'url_verification',
-        challenge: 'test_challenge'
-      });
-
-      const timestamp = Math.floor(Date.now() / 1000).toString();
-      const invalidSignature = 'v0=0000000000000000000000000000000000000000000000000000000000000000';
-
-      const res = await request('/api/slack/events', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-slack-request-timestamp': timestamp,
-          'x-slack-signature': invalidSignature
-        },
-        body: bodyPayload
-      });
-
-      expect(res.status).toBe(401);
-    });
   });
 
   describe('startServer Export and Port Resolution', () => {
@@ -290,7 +261,7 @@ describe('Standalone Gateway Microservice (bot/gateway/server.js)', () => {
   });
 
   describe('Boot Independence (No Supabase or DB Credentials)', () => {
-    it('boots standalone server in child process without SUPABASE_URL and responds to /health', async () => {
+    itWithBotDeps('boots standalone server in child process without SUPABASE_URL and responds to /health', async () => {
       const testPort = 4822;
       const childEnv = {
         ...process.env,

@@ -19,10 +19,8 @@
   <p class="lede">
     <% if (standalone) { %>
       This console is running on its own so you can fix the settings. Start the bot with <code>rumi start</code> when you are done.
-    <% } else if (channel === 'baileys') { %>
-      Answering as a linked WhatsApp account — the try-it-out setup, no Meta approval needed.
     <% } else { %>
-      Answering on an official WhatsApp Business number.
+      <%= answeringOn %>
     <% } %>
   </p>
   <dl class="hero-grid">
@@ -52,7 +50,7 @@
 <h2 class="section">Connections</h2>
 <div class="panel">
   <div class="panel-body flush">
-    <div id="probes" data-probes='<%- JSON.stringify([
+    <div id="probes" data-probes='<%= JSON.stringify([
         { id: "supabase",   label: "Database",  what: "Where teachers, lessons and assessments are stored", keys: ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"] },
         { id: "tables",     label: "Tables",    what: "Whether the schema has been applied to that database", keys: [] },
         { id: "openrouter", label: "AI",        what: "Every word Rumi writes", keys: ["OPENROUTER_API_KEY"] },

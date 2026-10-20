@@ -68,6 +68,10 @@ function renderReadiness(doctor, opts = {}) {
     rows.push(['Discord', ui.paint('brand', 'connected')]);
   }
 
+  if (doctor.activeChannels && doctor.activeChannels.includes('matrix')) {
+    rows.push(['Matrix', ui.paint('brand', 'connected')]);
+  }
+
   const on = doctor.featureResults.filter((f) => f.status === 'on');
   const off = doctor.featureResults.filter((f) => f.status !== 'on');
 
@@ -114,6 +118,11 @@ function renderNextSteps(opts) {
 
   if (opts.discord) {
     lines.push(ui.aside('Discord is connected too — message the bot in a Discord DM the same way, on the same account.'));
+    lines.push('');
+  }
+
+  if (opts.matrix) {
+    lines.push(ui.aside('Matrix is connected too — message the bot in a direct chat on your Matrix messenger the same way, on the same account.'));
     lines.push('');
   }
 

@@ -43,6 +43,21 @@ describe('share code parsing', () => {
   });
 });
 
+describe('"join <CODE>" works on any channel', () => {
+  test('a child who types the code after "join" joins, with or without the QUIZ- prefix', () => {
+    expect(share.parseShareCode('join A7K3M2')).toBe('A7K3M2');
+    expect(share.parseShareCode('Join a7k3m2')).toBe('A7K3M2');
+    expect(share.parseShareCode('  JOIN QUIZ-A7K3M2. ')).toBe('A7K3M2');
+  });
+
+  test('ordinary sentences that start with "join" are not claimed', () => {
+    ['join', 'join the class', 'join me at 4', 'join A7K3M2 tomorrow', 'please join A7K3M2',
+     'join OLIVER'].forEach((t) => {
+      expect(share.parseShareCode(t)).toBeNull();
+    });
+  });
+});
+
 describe('generated codes', () => {
   test('are six characters from the unambiguous alphabet', () => {
     for (let i = 0; i < 200; i += 1) {

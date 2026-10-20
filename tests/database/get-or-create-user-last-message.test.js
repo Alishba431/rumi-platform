@@ -24,6 +24,12 @@ beforeEach(() => {
   mockState.existingUser = null;
   mockState.calls = { updates: [], inserts: [] };
 
+  // Not `{ virtual: true }`: config/supabase.js is a real file. Jest's resolver
+  // caches a module id per (requiring file, name) for the whole worker, and a
+  // virtual mock of a real file gets an id without its extension — so mixing
+  // the two in one worker left bot-helpers' cached id pointing at the other
+  // form, the mock was skipped and the real client ran. No suite mocks a real
+  // repo file as virtual any more.
   jest.doMock('../../bot/shared/config/supabase', () => {
     const api = {
       from() { return api; },
@@ -46,7 +52,7 @@ beforeEach(() => {
       },
     };
     return api;
-  }, { virtual: true });
+  });
 
   ({ getOrCreateUser } = require('../../bot/shared/database/bot-helpers'));
 });

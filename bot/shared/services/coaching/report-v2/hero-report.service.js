@@ -19,11 +19,16 @@ const { logToFile } = require('../../../utils/logger');
 /**
  * @param {object} session - coaching_sessions row (transcript_text, user_id, created_at, classroom_photos)
  * @param {object} analysis - enhancedAnalysis (framework, scores, domains, reflective_corpus, …)
- * @param {object} opts - { teacherName, commitmentAction, language }
+ * @param {object} opts - { teacherName, commitmentAction, language, scoreless, beforeRender }
+ *   scoreless    — render with NO score anywhere (no headline %, marks, scorecard or
+ *                  trend). For reports a teacher receives from someone else's
+ *                  observation, where a number would read as a verdict.
+ *   beforeRender — (vm) => void, called with the view model before rendering; it may
+ *                  scrub fields, or throw to stop the render.
  * @returns {Promise<{png:Buffer, caption:string}>}
  */
 async function generateHeroReport(session, analysis, opts = {}) {
-  const { teacherName = 'Teacher', commitmentAction = '', language } = opts;
+  const { teacherName = 'Teacher', commitmentAction = '', language, scoreless = false, beforeRender } = opts;
   const lang = language || analysis.language || session.transcript_language || 'en';
   const framework = (analysis.framework || 'oecd').toLowerCase();
 
@@ -33,13 +38,16 @@ async function generateHeroReport(session, analysis, opts = {}) {
   // with no coaching_sessions yet will return [] and the template renders the
   // hero without the sparkline.
   let trend = [];
-  try {
-    const raw = await loadTrendData(session.user_id, { limit: 12, locale: 'en' });
-    trend = raw
-      .map((t) => ({ date: String(t.date || '').slice(0, 10), pct: Math.round(parseFloat(t.pct || 0)) }))
-      .filter((t) => t.pct > 0);
-  } catch (e) {
-    logToFile('hero-report: trend load failed (non-fatal)', { error: e.message });
+  // A scoreless report draws no trend, so it does not load one.
+  if (!scoreless) {
+    try {
+      const raw = await loadTrendData(session.user_id, { limit: 12, locale: 'en' });
+      trend = raw
+        .map((t) => ({ date: String(t.date || '').slice(0, 10), pct: Math.round(parseFloat(t.pct || 0)) }))
+        .filter((t) => t.pct > 0);
+    } catch (e) {
+      logToFile('hero-report: trend load failed (non-fatal)', { error: e.message });
+    }
   }
 
   const narrative = await generateReportNarrative(analysis, {
@@ -54,13 +62,16 @@ async function generateHeroReport(session, analysis, opts = {}) {
     teacherName,
     topic: (narrative && narrative.topic) || analysis.topic || '',
     date: String(session.created_at || '').slice(0, 10),
-    score: { overall: score.overall, marks: score.marks, max: score.max },
-    groups: score.groups,
+    score: scoreless ? null : { overall: score.overall, marks: score.marks, max: score.max },
+    groups: scoreless ? [] : score.groups,
+    scoreless,
     narrative: narrative || {},
     tryNext: commitmentAction || '',
     trend,
     photoB64: '', // classroom-photo embedding = follow-up; solid-navy hero is the default
   };
+
+  if (typeof beforeRender === 'function') await beforeRender(vm);
 
   const png = await htmlToImage(buildHeroReportHtml(vm), { selector: '.report', width: 794, deviceScaleFactor: 2 });
   return { png, caption: buildReportCaption(vm) };

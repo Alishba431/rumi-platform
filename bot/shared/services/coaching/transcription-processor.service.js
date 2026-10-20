@@ -13,14 +13,15 @@
  */
 
 const fs = require('fs');
-const path = require('path');
 const supabase = require('../../config/supabase');
 const { logToFile } = require('../../utils/logger');
+const { redactUrl } = require('../../utils/redact-url');
 const AudioService = require('../audio.service');
 const WhatsAppService = require('../whatsapp.service');
 const CoachingSessionService = require('./coaching-session.service');
-const { uploadClassroomAudio } = require('../../storage/r2');
+const { uploadClassroomAudio, isR2Configured } = require('../../storage/r2');
 const { TEMP_DIR, LISTENING_ANIMATION_MEDIA_ID } = require('../../utils/constants');
+const { privateTempPath, removePrivateTemp } = require('../../utils/private-temp');
 const { getUserLanguage, setUserLanguage } = require('../../utils/language-cache');
 const { analyzeLanguage } = require('../../utils/language-detector');
 const { getCoachingMessage } = require('../../config/coaching-messages');
@@ -33,13 +34,15 @@ class TranscriptionProcessorService {
    * @returns {Promise<void>}
    */
   static async processTranscription(coachingSessionId, payload) {
-    const tempAudioPath = path.join(TEMP_DIR, `classroom_${coachingSessionId}_${Date.now()}.ogg`);
+    // A private directory per job (privateTempPath also creates TEMP_DIR): a
+    // path from the session id and the clock is shared by two deliveries of
+    // the same job in one millisecond, and one would transcribe — then delete —
+    // the other's file.
+    let temp = null;
 
     try {
-      // Ensure temp directory exists
-      if (!fs.existsSync(TEMP_DIR)) {
-        fs.mkdirSync(TEMP_DIR, { recursive: true });
-      }
+      temp = privateTempPath(TEMP_DIR, `classroom_${coachingSessionId}.ogg`, 'classroom-');
+      const tempAudioPath = temp.filePath;
 
       logToFile('🔄 Starting transcription processing', { coachingSessionId });
 
@@ -55,6 +58,10 @@ class TranscriptionProcessorService {
       }
 
       const from = payload.from || session.users.phone_number;
+      // A coach's observation of a teacher (/observe). Read from the ROW, never
+      // the payload. The person in this chat is the coach, not the teacher whose
+      // row this is, so none of the teacher-facing steps below apply to it.
+      const isObservation = session.observation_type === 'leader_observation';
 
       // Update status
       await CoachingSessionService.updateStatus(coachingSessionId, 'transcribing', {
@@ -62,7 +69,7 @@ class TranscriptionProcessorService {
       });
 
       // Send progress update with listening animation
-      await this.sendProgressUpdate(from, 1);
+      if (!isObservation) await this.sendProgressUpdate(from, 1);
 
       // Download audio from WhatsApp
       const audioId = payload.audioId;
@@ -78,8 +85,8 @@ class TranscriptionProcessorService {
         fileSize: audioData.length
       });
 
-      // Upload to R2 storage
-      const r2Url = await uploadClassroomAudio(
+      // Archive to R2 storage (when configured)
+      const r2Url = await TranscriptionProcessorService.archiveClassroomAudio(
         tempAudioPath,
         session.user_id,
         coachingSessionId,
@@ -90,7 +97,7 @@ class TranscriptionProcessorService {
         }
       );
 
-      logToFile('Audio uploaded to R2', { coachingSessionId, r2Url });
+      logToFile('Audio uploaded to R2', { coachingSessionId, r2Url: redactUrl(r2Url) });
 
       // Transcribe with diarization
       const transcriptionResult = await this.transcribeWithDiarization(tempAudioPath);
@@ -115,7 +122,9 @@ class TranscriptionProcessorService {
         currentLanguage
       );
 
-      if (languageAnalysis.shouldUpdate && languageAnalysis.newLanguage) {
+      // An observation's lesson language says nothing about the coach's (or the
+      // teacher's) chosen language, so it never rewrites a preference.
+      if (!isObservation && languageAnalysis.shouldUpdate && languageAnalysis.newLanguage) {
         const updateSuccess = await setUserLanguage(session.user_id, languageAnalysis.newLanguage);
 
         if (updateSuccess) {
@@ -139,7 +148,7 @@ class TranscriptionProcessorService {
       const transcriptLength = transcriptionResult.transcript.length;
       const estimatedTokens = Math.ceil(transcriptLength / 3); // Rough estimate
 
-      if (transcriptLength > 15000) {
+      if (transcriptLength > 15000 && !isObservation) {
         logToFile('⚠️  Long transcript detected', {
           coachingSessionId,
           transcriptLength,
@@ -187,6 +196,17 @@ class TranscriptionProcessorService {
         .update(updateData)
         .eq('id', coachingSessionId);
 
+      // An observation goes straight on to analysis: the coach already got an
+      // ack, and the photo / lesson-plan questions below are for a teacher
+      // coaching themselves.
+      if (isObservation) {
+        const CoachingJobQueueService = require('./coaching-job-queue.service');
+        await CoachingJobQueueService.queueAnalysis(coachingSessionId, { from });
+        removePrivateTemp(temp);
+        logToFile('✅ Transcription complete (observation) — analysis queued', { coachingSessionId });
+        return;
+      }
+
       // Send encouraging message
       const CoachingHelpersService = require('./coaching-helpers.service');
       const encouragingMessage = await CoachingHelpersService.generateEncouragingMessage(
@@ -232,20 +252,29 @@ class TranscriptionProcessorService {
       await CoachingSessionService.updateStatus(coachingSessionId, 'awaiting_photo');
 
       // Clean up temp file
-      if (fs.existsSync(tempAudioPath)) {
-        fs.unlinkSync(tempAudioPath);
-      }
+      removePrivateTemp(temp);
 
       logToFile('✅ Transcription processing complete', { coachingSessionId });
     } catch (error) {
       // Clean up temp file on error
-      if (fs.existsSync(tempAudioPath)) {
-        fs.unlinkSync(tempAudioPath);
-      }
+      removePrivateTemp(temp);
 
       await this.handleTranscriptionError(coachingSessionId, error, payload.from);
       throw error;
     }
+  }
+
+  /**
+   * Archive the classroom audio to object storage. R2 is optional: without it the audio is not archived (audio_url
+   * stays null) and coaching carries on — transcription works from the local file.
+   * @returns {Promise<string|null>} the archived URL, or null when no object storage is configured
+   */
+  static async archiveClassroomAudio(audioPath, userId, coachingSessionId, metadata) {
+    if (!isR2Configured()) {
+      logToFile('Classroom audio not archived (object storage not configured)', { coachingSessionId });
+      return null;
+    }
+    return uploadClassroomAudio(audioPath, userId, coachingSessionId, metadata);
   }
 
   /**

@@ -22,12 +22,9 @@ const ROOT = path.resolve(__dirname, '../..');
 const SCHEMA_PATH = path.join(ROOT, 'infrastructure/supabase/00_complete-schema.sql');
 
 // Tables intentionally defined but not yet referenced by code — each justified.
-const ALLOWLIST = new Set([
-  // Curriculum page-level capture table; part of the textbooks / textbook_toc /
-  // pre_generated_lps set. Populated by a curriculum-ingestion path not yet in
-  // the OSS tree (the OSS curriculum-LP path serves pre_generated_lps + toc).
-  'textbook_pages',
-]);
+// (textbook_pages left this list once the test-paper sources read it and the
+// curriculum corpus importer wrote it.)
+const ALLOWLIST = new Set([]);
 
 function collectFiles(dir, exts) {
   const out = [];

@@ -10,6 +10,7 @@ const { createClient } = require('@supabase/supabase-js');
 const ExcelJS = require('exceljs');
 const path = require('path');
 const { getPresignedUrl } = require('../shared/storage/r2');
+const { ownCoaching } = require('../shared/services/coaching/own-coaching');
 
 // Initialize Supabase
 const supabase = createClient(
@@ -18,10 +19,11 @@ const supabase = createClient(
 );
 
 async function generateCoachingExcel() {
+  await require('../shared/services/coaching/own-coaching').probe();
   console.log('📊 Generating Coaching Sessions Excel...\n');
 
   // Query all completed coaching sessions with user data
-  const { data: sessions, error } = await supabase
+  const { data: sessions, error } = await ownCoaching(supabase
     .from('coaching_sessions')
     .select(`
       id,
@@ -38,7 +40,7 @@ async function generateCoachingExcel() {
       conversation_state,
       status
     `)
-    .eq('status', 'completed')
+    .eq('status', 'completed')) // a coach's observation of a teacher is the coach's session, not one of the teacher's
     .order('created_at', { ascending: false });
 
   if (error) {
