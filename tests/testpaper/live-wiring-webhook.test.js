@@ -110,10 +110,16 @@ function load() {
   O = require('../../bot/shared/services/testpaper/testpaper-orchestrator.service');
 }
 
-/** The handler express runs for METHOD PATH — the live mount, not a re-export. */
+/**
+ * The handler express runs for METHOD PATH — the live mount, not a re-export.
+ * A path can be served by a route on the app itself or by a mounted router
+ * (POST /webhook is the WhatsApp gateway router, bot/gateway/).
+ */
 function routeHandler(app, method, path) {
   const router = app.router || app._router;
-  const layer = router.stack.find((l) => l.route && l.route.path === path && l.route.methods[method]);
+  const matches = (l) => l.route && [].concat(l.route.path).includes(path) && l.route.methods[method];
+  const layer = router.stack.find(matches)
+    || router.stack.flatMap((l) => (l.handle && Array.isArray(l.handle.stack) ? l.handle.stack : [])).find(matches);
   if (!layer) throw new Error(`no ${method.toUpperCase()} ${path} route on the app`);
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }

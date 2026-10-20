@@ -40,6 +40,9 @@ const supabase = require('./shared/config/supabase');
 const flowEndpointRoutes = require('./shared/routes/flow-endpoint.routes');
 const PortalInternalEndpoint = require('./shared/routes/portal-internal-endpoint');
 
+// Import Ingress Gateway (Strangler Fig)
+const { createSlackRouter, createWhatsAppRouter } = require('./gateway');
+
 // Maps an additive-channel identifier ("slack:U…", "mtx:1555…") to the
 // (channel, channelUserId) pair user_channels expects, or null for a bare
 // WhatsApp phone number. Lives in channel-registry so it can be unit-tested
@@ -51,21 +54,11 @@ const { nativeFlowIdFor } = require('./shared/services/messaging/channel-capabil
 // Create Express app
 const app = express();
 
-// Slack's request signature is an HMAC over the EXACT raw bytes it sent —
-// must be captured before ANY body parser (including the global
-// express.json() below) reconstructs the body, since a reconstruction can
-// differ in whitespace/key order from the wire bytes. Mounted first, and
-// scoped to the Slack path only so every other route's body-parsing is
-// untouched.
-app.use('/api/slack', express.raw({ type: '*/*' }), (req, res, next) => {
-  req.rawBody = req.body; // a Buffer, from express.raw() above
-  next();
-});
-// handleWebhookPost is a hoisted function declaration defined further down
-// this file — safe to reference here since this code only ever RUNS at
-// require-time, after every top-level declaration has already been hoisted.
-const mountSlackRoutes = require('./shared/routes/slack-interactions.routes');
-app.use('/api/slack', mountSlackRoutes(handleWebhookPost));
+// Slack Ingestion Gateway (Strangler Fig)
+// Encapsulates raw body capture & HMAC signature verification.
+// Mounted BEFORE global express.json() to guarantee wire-byte fidelity.
+// Note: handleWebhookPost is a hoisted function declaration, safely referenced here at require-time.
+app.use('/api/slack', createSlackRouter({ dispatch: handleWebhookPost }));
 
 app.use(express.json());
 
@@ -281,26 +274,16 @@ async function trackBroadcastReply(userId) {
   }
 }
 
-/**
- * Webhook verification endpoint (GET)
- */
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  console.log('Webhook verification request received');
-  console.log('Mode:', mode);
-  console.log('Token:', token);
-
-  if (mode === 'subscribe' && token === constants.WEBHOOK_VERIFY_TOKEN) {
-    console.log('Webhook verified successfully!');
-    res.status(200).send(challenge);
-  } else {
-    console.log('Webhook verification failed');
-    res.status(403).send('Forbidden');
-  }
-});
+// WhatsApp Ingestion Gateway (Strangler Fig)
+// Handles GET verification handshake and POST incoming message ingestion.
+// encapsulateIngress is off: dedup, the inbound limits and the reaction/typing
+// indicator stay in handleWebhookPost, where the limits must run before the
+// reaction is sent.
+app.use('/webhook', createWhatsAppRouter({
+  dispatch: handleWebhookPost,
+  handleBroadcastStatus: handleBroadcastStatusWebhook,
+  encapsulateIngress: false,
+}));
 
 /**
  * Webhook endpoint to receive messages (POST).
@@ -1706,7 +1689,7 @@ async function handleWebhookPost(req, res) {
   }, { send: sendText, lang: () => senderLang })); // End of runWithCorrelation
 }
 
-app.post('/webhook', handleWebhookPost);
+// Note: POST /webhook is now handled by WhatsApp Gateway router mounted above
 
 /**
  * Handle document messages (classroom audio or lesson plan uploads for coaching)

@@ -91,8 +91,12 @@ function load(account) {
   jest.doMock('../../bot/shared/handlers/image-message.handler', () => Images);
 
   const { app } = require('../../bot/whatsapp-bot');
+  // POST /webhook is served by the WhatsApp gateway router (bot/gateway/), so
+  // the live route sits one level down, inside that mounted router.
   const router = app.router || app._router;
-  const layer = router.stack.find((l) => l.route && l.route.path === '/webhook' && l.route.methods.post);
+  const isWebhookPost = (l) => l.route && [].concat(l.route.path).includes('/webhook') && l.route.methods.post;
+  const layer = router.stack.find(isWebhookPost)
+    || router.stack.flatMap((l) => (l.handle && Array.isArray(l.handle.stack) ? l.handle.stack : [])).find(isWebhookPost);
   handleWebhookPost = layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
