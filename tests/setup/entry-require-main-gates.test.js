@@ -21,6 +21,7 @@ const ROOT = path.resolve(__dirname, '..', '..');
 // `node X.js` behaviour is identical) but makes the file safe to require.
 const GATED_ENTRIES = [
   'bot/whatsapp-bot.js',
+  'bot/gateway/server.js',
   'bot/workers/sqs-worker.js',
   'bot/workers/stale-session.worker.js',
   'bot/workers/teacher-nudges.worker.js',
@@ -46,6 +47,7 @@ describe('Entry-point require.main gates (entry-gating)', () => {
   it('every gated entry exports the start function', () => {
     const exportsByFile = {
       'bot/whatsapp-bot.js':           /module\.exports\s*=\s*\{[^}]*startServer/,
+      'bot/gateway/server.js':         /module\.exports\s*=\s*\{[^}]*startServer/,
       'bot/workers/sqs-worker.js':     /module\.exports\s*=\s*\{[^}]*startWorker/,
       'bot/workers/stale-session.worker.js': /module\.exports\s*=\s*\{[^}]*main/,
       'bot/workers/teacher-nudges.worker.js': /module\.exports\s*=\s*\{[^}]*main/,

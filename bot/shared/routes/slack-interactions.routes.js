@@ -24,7 +24,6 @@
  */
 
 const express = require('express');
-const router = express.Router();
 const SlackSignatureService = require('../services/slack-signature.service');
 const { logToFile } = require('../utils/logger');
 const { makeEventsHandler, makeInteractionsHandler, makeSlashCommandHandler } = require('../services/messaging/inbound/slack-events.adapter');
@@ -144,6 +143,7 @@ function pausedChannel(req, res) {
 }
 
 function mount(dispatch) {
+  const router = express.Router();
   const { isChannelSwitchedOff } = require('../config/feature-availability');
   if (isChannelSwitchedOff('slack', process.env)) {
     for (const path of ['/events', '/interactions', '/commands']) router.post(path, pausedChannel);

@@ -42,6 +42,7 @@ const PortalInternalEndpoint = require('./shared/routes/portal-internal-endpoint
 
 // Import Ingress Gateway (Strangler Fig)
 const { createSlackRouter, createWhatsAppRouter } = require('./gateway');
+const { createQueueDispatch } = require('./gateway/webhook.routes');
 
 // Maps an additive-channel identifier ("slack:U…", "mtx:1555…") to the
 // (channel, channelUserId) pair user_channels expects, or null for a bare
@@ -279,8 +280,10 @@ async function trackBroadcastReply(userId) {
 // encapsulateIngress is off: dedup, the inbound limits and the reaction/typing
 // indicator stay in handleWebhookPost, where the limits must run before the
 // reaction is sent.
+// GATEWAY_QUEUE_MODE=true: the gateway acks Meta at once and queues the message
+// instead; bot/workers/inbound-message.worker.js runs handleWebhookPost on it.
 app.use('/webhook', createWhatsAppRouter({
-  dispatch: handleWebhookPost,
+  dispatch: process.env.GATEWAY_QUEUE_MODE === 'true' ? createQueueDispatch() : handleWebhookPost,
   handleBroadcastStatus: handleBroadcastStatusWebhook,
   encapsulateIngress: false,
 }));
@@ -406,7 +409,7 @@ async function handleWebhookPost(req, res) {
     }
 
     // Check if already processed (Redis-backed duplicate detection)
-    const alreadyProcessed = await SessionService.isProcessed(message.id);
+    const alreadyProcessed = req.__skipDuplicateCheck ? false : await SessionService.isProcessed(message.id);
     if (alreadyProcessed) {
       logToFile('⚠️  Duplicate message detected and skipped', {
         messageId: message.id,
@@ -418,7 +421,9 @@ async function handleWebhookPost(req, res) {
     }
 
     // Mark as processed
-    await SessionService.markAsProcessed(message.id);
+    if (!req.__skipDuplicateCheck) {
+      await SessionService.markAsProcessed(message.id);
+    }
 
     // Public-deployment limits (shared/services/limits/), before the user
     // lookup and before anything can reach a model. A sender over the
@@ -2154,4 +2159,4 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, startServer };
+module.exports = { app, startServer, handleWebhookPost };
